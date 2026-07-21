@@ -16,8 +16,9 @@ Rationale:
    in FOCUS `bot/`, the upstream-agnostic parts are the majority — the Feishu
    transport layer, cards, RuntimeLoop, binding/stores, the group-chat domain,
    service_manager, the install system. What is truly bound to codex is only
-   the adapter layer, about 1400 lines (`adapters/codex_app_server.py` +
-   `codex_protocol/client.py`). Choosing Python = replacing those 1400 lines +
+   the adapter layer, about 1.5k lines (977 + 559, measured 2026-07-21;
+   `adapters/codex_app_server.py` +
+   `codex_protocol/client.py`). Choosing Python = replacing those ~1.5k lines +
    revising contracts to kap semantics; choosing TS = rewriting all the other
    38k lines.
 2. **The fork-and-embed route has been disproven.** OKbot proved that the cost

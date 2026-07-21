@@ -10,11 +10,10 @@ the docs, or both.
 
 ## 当前状态
 
-仓库处于规划期，全部文档为**草案（draft)**。2026-07-21 完成首轮对齐，
-各文档的「待对齐」已转为「已对齐」记录；下一步是 spike 验证
-(`docs/verification/spike-checklist.md`)，通过后文档转 active、代码开工。
-转 active 后，contracts/、architecture/、decisions/ 即视为 active
-repository facts。
+第 0 里程碑（spike 验证）已于 2026-07-21 对 **kimi 0.28.1** 全部通过
+（结果见 `docs/verification/spike-results.md`)。contracts/、
+architecture/、decisions/ 已转为 **active** repository facts——与代码
+不一致即 contract gap。业务代码可以开工。
 
 ## Document Types
 
@@ -34,7 +33,7 @@ repository facts。
 Status guidance:
 
 - treat `contracts/`, `architecture/`, and `decisions/` as active repository
-  facts（转 active 后）
+  facts
 - treat `verification/` as validation support
 - treat `research/` as evidence; 若其中事实与上游最新代码冲突，以上游代码为准
 - treat local notes under `docs/_work/` as working material
@@ -68,6 +67,8 @@ Status guidance:
 
 - [`spike-checklist.md`](./verification/spike-checklist.zh-CN.md)
   - 第 0 里程碑：业务代码开工前必须通过的上游实测清单
+- [`spike-results.md`](./verification/spike-results.zh-CN.md)
+  - 第 0 里程碑结果（2026-07-21 通过，kimi 0.28.1)：各项实测观察、上游漂移修正、已折入合同/架构的设计调整
 
 ### Research
 
@@ -87,6 +88,7 @@ Status guidance:
 | 多个飞书会话同时操作同一 session 时行为是什么？谁在独占写入？ | [`concurrency-model.md`](./decisions/concurrency-model.zh-CN.md) |
 | MVP 做什么、不做什么？新功能怎么获准进入？ | [`mvp-scope.md`](./contracts/mvp-scope.zh-CN.md) |
 | 开工前要实测验证上游的哪些行为？ | [`spike-checklist.md`](./verification/spike-checklist.zh-CN.md) |
+| spike 实测观察到什么、修正了哪些文档事实？ | [`spike-results.md`](./verification/spike-results.zh-CN.md) |
 | 为什么不做 memory / ASR / 设备控制？ | [`okbot-vs-focus.md`](./research/okbot-vs-focus.zh-CN.md), [`mvp-scope.md`](./contracts/mvp-scope.zh-CN.md) |
 
 ## Language

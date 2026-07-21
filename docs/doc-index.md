@@ -10,13 +10,11 @@ the docs, or both.
 
 ## Current Status
 
-The repository is in the planning phase; all documents are **drafts**. The
-first alignment round completed on 2026-07-21, and each document's "open
-questions" have been converted into "aligned" records; the next step is spike
-validation (`docs/verification/spike-checklist.md`). Once it passes, the
-documents turn active and code work begins. After the transition to active,
-contracts/, architecture/, and decisions/ are treated as active repository
-facts.
+Milestone 0 (spike validation) passed on 2026-07-21 against **kimi 0.28.1**
+(results: `docs/verification/spike-results.md`). `contracts/`,
+`architecture/`, and `decisions/` are **active** repository facts — any
+inconsistency between them and the code is a contract gap. Code work may
+begin.
 
 ## Document Types
 
@@ -36,7 +34,7 @@ facts.
 Status guidance:
 
 - treat `contracts/`, `architecture/`, and `decisions/` as active repository
-  facts (after the transition to active)
+  facts
 - treat `verification/` as validation support
 - treat `research/` as evidence; if its facts conflict with the latest
   upstream code, the upstream code wins
@@ -71,6 +69,8 @@ Status guidance:
 
 - [`spike-checklist.md`](./verification/spike-checklist.md)
   - Milestone 0: the upstream hands-on validation checklist that must pass before business code work starts
+- [`spike-results.md`](./verification/spike-results.md)
+  - Milestone 0 results (passed 2026-07-21, kimi 0.28.1): per-item observations, upstream drift corrections, and the design adjustments folded into contracts/architecture
 
 ### Research
 
@@ -90,6 +90,7 @@ Status guidance:
 | What happens when multiple Feishu chats operate on the same session at once? Who holds exclusive write? | [`concurrency-model.md`](./decisions/concurrency-model.md) |
 | What does the MVP do and not do? How does a new feature get admitted? | [`mvp-scope.md`](./contracts/mvp-scope.md) |
 | Which upstream behaviors must be validated hands-on before work starts? | [`spike-checklist.md`](./verification/spike-checklist.md) |
+| What did the spike observe, and which doc facts did it correct? | [`spike-results.md`](./verification/spike-results.md) |
 | Why no memory / ASR / device control? | [`okbot-vs-focus.md`](./research/okbot-vs-focus.md), [`mvp-scope.md`](./contracts/mvp-scope.md) |
 
 ## Language

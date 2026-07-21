@@ -1,9 +1,10 @@
 # MVP Feature Contract (Draft)
 
-> Status: draft (first alignment round completed 2026-07-21). This document
+> Status: **active** (first alignment round + spike validation completed
+> 2026-07-21; see `docs/verification/spike-results.md`). This document
 > defines what the KITE MVP does, what it does not do, and the failure mode of
-> each behavior. After the transition to active, any inconsistency between
-> code behavior and this document is a contract gap.
+> each behavior. Any inconsistency between code behavior and this document is
+> a contract gap.
 
 ## 1. Carrying-Capacity Gate
 
@@ -30,13 +31,14 @@ If it cannot answer, cut the requirement. No exceptions.
 | Automatic session creation on first use | first message of an unbound chat: create a session with its cwd (the instance `default_working_dir`) and bind it |
 | Approval card | approval.requested → three-button card (approve / reject / reject with feedback) → REST response → card patch to freeze |
 | question form card | question.requested → option-button card (answer via buttons, numbered reply as fallback); auto-dismiss on timeout |
-| `/new` | unbind the current session, create a new session and bind it |
+| `/new` | unbind the current session, create a new session and bind it; the old session is kept as-is (not archived; upstream has no delete) |
 | `/sessions` | list sessions visible on kap-server (title/cwd/busy), switch binding via buttons |
 | `/switch <id>` | switch the binding to an existing session (auto-attached) |
 | `/detach` / `/attach` | pause/resume Feishu push for the current binding; the binding itself is kept |
-| `/mode <auto\|yolo\|plan>` | read/write the binding-level permission mode; carried explicitly on every prompt |
+| `/mode <auto\|manual\|yolo>` | read/write the binding-level permission mode (kap `permission_mode`); carried explicitly on every prompt |
+| `/plan [on\|off]` | read/toggle the binding-level plan mode (kap `plan_mode`, orthogonal to permission mode); carried explicitly on every prompt |
 | `/status` | show binding, session, work state, queue status |
-| `/abort` | abort the active prompt; only available to that prompt's initiator and admins |
+| `/abort` | abort the active prompt; only available to that prompt's initiator and admins; aborting an already-finished prompt gets upstream 40402 (not pending) → show "already finished", do not transition the card to failed (spike S2) |
 | `/help` | command navigation |
 | `kitectl` | config / service (start/stop, status, log) / binding (list) / session (list, status) / prompt send |
 
@@ -85,7 +87,8 @@ explicitly; "best-effort" silent degradation is forbidden:
    "already handled", card freezes.
 5. Prompt REST returns a business error code → the execution card transitions
    directly to terminal (failed), showing the upstream msg.
-6. kited restart → binding/permission mode/cursor restored from the store;
+6. kited restart → binding/permission mode/plan mode/cursor restored from the
+   store;
    in-memory prompt ownership is rebuilt best-effort from `GET .../prompts` +
    snapshot; approval cards that cannot be rebuilt are explicitly expired
    (card patched to "expired, please re-initiate or handle locally").
@@ -95,9 +98,9 @@ explicitly; "best-effort" silent degradation is forbidden:
 
 ## 5. Permissions and Identity
 
-- The first user to talk to the bot is registered as admin (an init token is
-  generated at install time, flow modeled on FOCUS); the admin set is stored
-  in the instance config.
+- The first admin registers by sending `/init <token>` to the bot (the init
+  token is generated at install time, flow modeled on FOCUS); the admin set is
+  stored in the instance config.
 - The MVP has only two levels: **admin** (all commands + `kitectl`) and
   **non-admin** (cannot use, except `/help`). An allowlist (multi-user) is a
   Phase 2 candidate.
@@ -127,3 +130,10 @@ explicitly; "best-effort" silent degradation is forbidden:
 4. Admin registration uses the FOCUS-style init token flow (a token is
    generated at install time, and `/init <token>` in Feishu registers the
    first admin).
+5. `/mode` enum corrected to upstream `auto/manual/yolo` (evidence:
+   `packages/protocol/src/rest/prompt.ts:41`); `plan` is not a
+   `permission_mode` value but the separate boolean `plan_mode`, exposed as
+   `/plan [on|off]` (corrected against upstream code, 2026-07-21).
+6. Spike Milestone 0 passed on kimi 0.28.1 (2026-07-21;
+   `docs/verification/spike-results.md`); the `/abort` row now covers the
+   observed 40402 re-abort behavior.

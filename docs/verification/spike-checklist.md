@@ -7,7 +7,7 @@
 
 ## General Conventions
 
-- Environment: the kimi-code version used during verification (backfill the result here: `____`; recorded only as the "verified version", not a lock-in — see kite-design §10); `kimi web
+- Environment: the kimi-code version used during verification (**kimi 0.28.1**, verified 2026-07-21; recorded only as the "verified version", not a lock-in — see kite-design §10); `kimi web
   --no-open` launched on local loopback with an isolated temporary `KIMI_CODE_HOME`.
 - Form: pure scripts (Python standard library + websockets, or plain curl + wscat); no business
   code enters the repo; scripts may be kept under `scripts/spike/`.
@@ -32,7 +32,7 @@
   whether abort-queued is supported; queue state after steer.
 - **Pass criteria**: behavior is deterministic and mappable onto KITE's card state machine; no event
   that cannot be attributed to a prompt_id may appear.
-- **Impact**: mvp-scope §3 concurrency behavior, whether `/abort` enters the MVP (alignment-pending item 1).
+- **Impact**: mvp-scope §3 concurrency behavior; validates the card state machine mapping for `/abort` (already in the MVP, aligned 2026-07-21).
 
 ## S3. Durable Replay Window and Epoch Semantics
 
@@ -54,7 +54,7 @@
   graceful SIGTERM shutdown, and port/instance-registry leftovers after an abnormal exit.
 - **Pass criteria**: launch/shutdown/conflict/rotation all work end to end without manual intervention; the instance registry does not
   mislead later discovery.
-- **Impact**: `docs/architecture/kite-design.md` §2 process shape; the alignment-pending item "choose one of the two launch methods".
+- **Impact**: `docs/architecture/kite-design.md` §2 process shape; validates the chosen launch method (`kimi web --no-open`, aligned 2026-07-21).
 
 ## S5. Snapshot Rebuild of an In-Progress Session
 
@@ -71,5 +71,4 @@
 
 - **Verify**: run a set of representative prompts (writing code, installing dependencies, web search) and count
   the frequency and shape of question.requested.
-- **Pass criteria**: no hard criteria; the output feeds mvp-scope alignment-pending item 2 (whether the question form
-  stays in the MVP).
+- **Pass criteria**: no hard criteria; the output is design input for the question card layout (the question form is already in the MVP, aligned 2026-07-21).

@@ -1,6 +1,6 @@
 # KITE Overall Architecture Design (Draft)
 
-> Status: draft (first alignment round completed 2026-07-21). Once this turns active, any inconsistency between this document and the code is a contract gap.
+> Status: **active** (first alignment round + spike validation completed 2026-07-21; see `docs/verification/spike-results.md`). Any inconsistency between this document and the code is a contract gap.
 
 ## 1. Goals and Non-goals
 
@@ -101,13 +101,24 @@ before the code changes.
 **Durable first, volatile later.**
 
 - The sole driver of MVP card updates is durable events
-  (turn.started / tool.call.* / turn.ended / prompt.* / approval.* /
-  question.* / session.work_changed). There are no unreliable events on this
-  path.
+  (turn.started / tool.call.* / turn.ended / prompt.aborted / prompt.steered /
+  approval.* / question.* / session.work_changed). There are no unreliable
+  events on this path. `prompt.submitted` / `prompt.completed` are
+  schema-defined but have **no producer** in agent-core-v2 (spike S2):
+  submission is acknowledged by the REST response; completion is observed via
+  `turn.ended` / `prompt.aborted`.
 - Disconnect-compensation discipline is concentrated in one place in the
   adapter: resubscribe with the `{seq, epoch}` cursor → on `resync_required`
   or window overflow → rebuild from a REST snapshot → refresh cards wholesale
-  from the rebuilt result.
+  from the rebuilt result. Spike S3 nuances the adapter must honor:
+  a `resync_required` frame may arrive **before** the subscribe ack (buffer
+  frames while awaiting acks); subscribing to a cold session right after a
+  kap-server restart yields an unexplained `resync_required` (lazy
+  activation) — warm the session with a resume-backed REST call
+  (`GET .../prompts`) before subscribing; the journal survives restarts with
+  the same epoch (the epoch rotates only on journal corruption).
+- Cursor source of truth: WS subscribe acks and snapshot `as_of_seq`. REST
+  `session.last_seq` is a hardcoded placeholder 0 (spike S3) — never use it.
 - WS has no heartbeat: the adapter implements stale detection (proactively
   reconnect when no frame of any kind arrives for N seconds).
 - **Volatile streaming** (assistant.delta per-token patch) is an independent
@@ -136,12 +147,13 @@ Carry over FOCUS experience, rewritten to kap event semantics:
 ## 7. Persistence
 
 - All JSON files + atomic write (tmp + rename) + file locks; no SQLite.
-- stores: binding store (chat ↔ session, attached, permission mode), terminal
-  result store, event cursor store (per-session `{seq, epoch}`), attachment
-  staging store (later).
+- stores: binding store (chat ↔ session, attached, permission mode, plan
+  mode), terminal result store, event cursor store (per-session
+  `{seq, epoch}`), attachment staging store (later).
 - Binding-level **permission mode** (mapping to kap `permission_mode`:
-  auto/yolo/plan) is persisted; once written to disk it **does not drift with
-  the instance default**, and every prompt carries it explicitly (kap natively
+  auto/manual/yolo) and **plan mode** (kap `plan_mode`, a separate boolean)
+  are persisted; once written to disk they **do not drift with
+  the instance default**, and every prompt carries them explicitly (kap natively
   supports per-prompt override, which happens to implement FOCUS's "reapply
   explicitly every turn" contract).
 - Session metadata on the kimi-code side (id, cwd, title, history) has
@@ -181,7 +193,8 @@ FOCUS's wrapper design; the command names `kite` (local entrypoint) and `kcode`
   hinder KITE's own evolution; keep the freedom to start over at any time.
 - At install/startup, detect the upstream version; when it differs from the
   "verified version", **warn but do not block**. Current verified version:
-  backfill after the spike passes (`____`).
+  **kimi 0.28.1** (spike passed 2026-07-21;
+  `docs/verification/spike-results.md`).
 - CI guardrail: snapshot-diff `/openapi.json` and the WS operation catalog
   pulled from the target kap-server, and run adapter contract tests (loopback
   against a real kap-server). The snapshot diff is a **drift-awareness**
@@ -208,3 +221,6 @@ FOCUS's wrapper design; the command names `kite` (local entrypoint) and `kcode`
    option to enable `--host` exposure is deferred to Phase 2 (when enabled, it
    must also prompt to set `KIMI_CODE_PASSWORD` and warn about the no-TLS
    risk).
+6. Spike Milestone 0 passed on kimi 0.28.1 (2026-07-21;
+   `docs/verification/spike-results.md`); its findings are folded into §5
+   (event consumption) and §10 (verified version).

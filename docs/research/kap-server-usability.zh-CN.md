@@ -9,7 +9,7 @@
 
 作为 KITE 的共享后端，kap-server 的 API 面覆盖度已足够支撑完整桥接闭环
 （REST 写入 + WS 订阅 + 审批/表单响应）。它非常年轻（0.0.2,2026-07-12 首个
-commit)，无稳定性承诺，需要版本钉死 + 快照 diff 护栏。
+commit)，无稳定性承诺，需要版本跟随（不钉死，见 `docs/architecture/kite-design.md` §10)+ 快照 diff 护栏。
 
 ## 1. 生命周期与部署形态
 
@@ -215,3 +215,34 @@ commit)，无稳定性承诺，需要版本钉死 + 快照 diff 护栏。
 - 移动端适配:viewport-fit=cover;≤640px 单栏 mobile shell
   (`useIsMobile.ts` + `components/mobile/` 三组件);CHANGELOG 有移动专项
   条目(0.28.0 mobile permission sheet 等)。
+
+---
+
+## Spike 修正（2026-07-21,kimi 0.28.1)
+
+由执行 `docs/verification/spike-checklist.md` 发现（详见
+`docs/verification/spike-results.md`)。本节与上文冲突时，以本节为准。
+
+1. `sessionEventBroadcaster.ts` 移至
+   `src/transport/ws/v1/sessionEventBroadcaster.ts`。
+2. steer 线上 URL 为单冒号 `POST /sessions/{id}/prompts:steer`;§2 中
+   `prompts::steer` 是路由注册拼法，调用返回 40001。
+3. REST `session.last_seq` 是硬编码占位 0
+   (`routes/sessions.ts:1069`)；真实 journal seq 只能从 WS ack cursor
+   或 snapshot `as_of_seq` 获得。
+4. 对已完成 prompt 重复 abort 返回 **40402**（记录已从队列移除）;
+   40903 幂等路径在 0.28.1 中疑似为死代码。
+5. 服务重启后对冷 session 订阅返回无解释的 `resync_required`（经
+   `ISessionLifecycleService.get` 惰性激活，非 `resume`)；先触一条
+   resume 语义的 REST 路由可规避。单纯重启从不轮换 epoch(journal
+   JSONL 保留）;epoch 仅在 journal 损坏时轮换。
+6. `prompt.submitted` / `prompt.completed` 在 agent-core-v2 中**无生产
+   者**（仅 schema 定义），线上从不出现；归因用 REST submit ack +
+   `prompt.aborted` / `prompt.steered` + `turn.*`。
+7. 重放窗口（1000）仅为构造参数——运行时无 CLI/env 可配;
+   `resync_required` 帧可能**先于** subscribe ack 到达（等 ack 期间须
+   缓存帧）。
+8. 供给：隔离 `KIMI_CODE_HOME` 的模型配置来自 `KIMI_MODEL_NAME` /
+   `KIMI_MODEL_API_KEY` / `KIMI_MODEL_BASE_URL` env 覆盖层，且经 REST
+   创建的 session 不继承覆盖层 `defaultModel`——每个 prompt 显式传
+   `model`。

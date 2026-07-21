@@ -1,6 +1,6 @@
 # KITE 总体架构设计（草案）
 
-> 状态：草案（2026-07-21 首轮对齐完成）。转 active 后，本文与代码不一致即 contract gap。
+> 状态：**active**(2026-07-21 首轮对齐 + spike 验证完成，见 `docs/verification/spike-results.md`)。本文与代码不一致即 contract gap。
 
 ## 1. 目标与非目标
 
@@ -87,10 +87,20 @@ gate。登记在 `docs/decisions/concurrency-model.md`，等产品证明需要�
 **durable 优先，volatile 后补。**
 
 - MVP 卡片更新的唯一驱动是 durable 事件
-  （turn.started / tool.call.* / turn.ended / prompt.* / approval.* /
-  question.* / session.work_changed)。这条路径没有不可靠事件。
+  （turn.started / tool.call.* / turn.ended / prompt.aborted / prompt.steered /
+  approval.* / question.* / session.work_changed)。这条路径没有不可靠事件。
+  `prompt.submitted` / `prompt.completed` 仅有 schema 定义，agent-core-v2
+  **无生产者**(spike S2)：提交由 REST 响应确认；完成经
+  `turn.ended` / `prompt.aborted` 观察。
 - 断线补偿纪律集中在适配层一处：带 `{seq, epoch}` cursor 重订阅 →
   `resync_required` 或超窗 → REST snapshot 重建 → 卡片按重建结果整体刷新。
+  适配层须处理的 spike S3 细节：`resync_required` 帧可能**先于**
+  subscribe ack 到达（等 ack 期间须缓存帧）；服务重启后对冷 session
+  订阅会收到无解释的 `resync_required`（惰性激活）——订阅前先用
+  resume 语义的 REST 调用（`GET .../prompts`）预热 session;journal
+  跨重启保留同一 epoch(epoch 仅在 journal 损坏时轮换）。
+- cursor 事实源：WS subscribe ack 与 snapshot `as_of_seq`。REST 的
+  `session.last_seq` 是硬编码占位 0(spike S3)——禁用。
 - WS 无心跳：适配层实现 stale 检测（超过 N 秒无任何帧即主动重连）。
 - **volatile 流式**(assistant.delta 逐字 patch）是独立增强，Phase 2 再做；
   届时用 offset 缺口检测，缺一口即落入 snapshot 重建路径，不自己猜。
@@ -113,11 +123,12 @@ gate。登记在 `docs/decisions/concurrency-model.md`，等产品证明需要�
 ## 7. 持久化
 
 - 全部 JSON 文件 + 原子写（tmp + rename)+ 文件锁；不用 SQLite。
-- stores:binding store(chat ↔ session、attached、permission mode)、
-  终态结果 store、事件 cursor store（每 session 的 `{seq, epoch}`)、
+- stores:binding store(chat ↔ session、attached、permission mode、plan
+  mode)、终态结果 store、事件 cursor store（每 session 的 `{seq, epoch}`)、
   附件 staging store（后期）。
-- binding 级 **permission mode**（对应 kap `permission_mode`:auto/yolo/plan)
-  持久化，落盘后**不随实例默认漂移**，每个 prompt 显式携带（kap 的
+- binding 级 **permission mode**（对应 kap `permission_mode`:auto/manual/yolo)
+  与 **plan mode**（kap `plan_mode`，独立的布尔字段）持久化，落盘后
+  **不随实例默认漂移**，每个 prompt 显式携带（kap 的
   per-prompt override 原生支持，正好落实 FOCUS"每 turn 显式重新应用"
   的合同）。
 - kimi-code 侧的 session 元数据（id、cwd、title、历史）以
@@ -152,7 +163,8 @@ gate。登记在 `docs/decisions/concurrency-model.md`，等产品证明需要�
   不指望长期停留在一个旧版本上——那反而不利于 KITE 的后续演进；保留
   随时重来的自由度。
 - 安装/启动时检测上游版本，与"已验证版本"不符时**警告但不阻止运行**。
-  当前已验证版本：spike 通过后回填（`____`)。
+  当前已验证版本：**kimi 0.28.1**(2026-07-21 spike 通过；
+  `docs/verification/spike-results.md`)。
 - CI 护栏：对目标 kap-server 拉取 `/openapi.json` 与 WS 操作目录做快照
   diff，并跑适配层合同测试（loopback 真实 kap-server)。快照 diff 是
   **漂移感知**手段；发现漂移后在适配层内显式适配，并更新已验证版本。
@@ -172,3 +184,6 @@ gate。登记在 `docs/decisions/concurrency-model.md`，等产品证明需要�
 5. LAN 暴露：默认 loopback；是否提供 `kitectl` 配置项开启 `--host` 暴露
    推迟到 Phase 2 再议（开启时必须同时提示设置 `KIMI_CODE_PASSWORD`
    与无 TLS 风险）。
+6. Spike 第 0 里程碑在 kimi 0.28.1 上通过（2026-07-21;
+   `docs/verification/spike-results.md`)；其发现已折入 §5（事件消费）与
+   §10（已验证版本）。

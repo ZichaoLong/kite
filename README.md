@@ -14,10 +14,9 @@ KITE 把飞书机器人接到 kimi-code 的共享后端（kap-server）上，让
 
 ## 当前状态
 
-**规划期**。代码尚未开工，仓库当前只有文档。开工前需完成：
-
-1. 文档对齐（各文档末尾的「待对齐」小节）
-2. 上游 spike 验证（`docs/verification/spike-checklist.md`，全部通过后才写业务代码）
+**Milestone 0 完成**:spike 验证已于 2026-07-21 全部通过（kimi 0.28.1，结果见
+`docs/verification/spike-results.md`),`contracts/`、`architecture/`、`decisions/`
+已转 active，业务代码可以开工。
 
 ## 文档入口
 

@@ -9,7 +9,7 @@
 
 As KITE's shared backend, kap-server's API surface coverage is already sufficient to support a complete bridge loop
 (REST writes + WS subscription + approval/form responses). It is very young (0.0.2, first
-commit on 2026-07-12), carries no stability guarantees, and requires version pinning + snapshot diff guardrails.
+commit on 2026-07-12), carries no stability guarantees, and calls for version tracking (follow, don't pin — see `docs/architecture/kite-design.md` §10) + snapshot diff guardrails.
 
 ## 1. Lifecycle and Deployment Shape
 
@@ -219,3 +219,37 @@ See `docs/verification/spike-checklist.md`.
 - Mobile adaptation: viewport-fit=cover; ≤640px single-column mobile shell
   (`useIsMobile.ts` + three components under `components/mobile/`); the CHANGELOG has mobile-specific
   entries (0.28.0 mobile permission sheet etc.).
+
+---
+
+## Spike Corrections (2026-07-21, kimi 0.28.1)
+
+Found by executing `docs/verification/spike-checklist.md` (details:
+`docs/verification/spike-results.md`). Where this section conflicts with the
+body above, this section wins.
+
+1. `sessionEventBroadcaster.ts` moved →
+   `src/transport/ws/v1/sessionEventBroadcaster.ts`.
+2. Steer URL on the wire is single-colon `POST /sessions/{id}/prompts:steer`;
+   the `prompts::steer` spelling in §2 is the route-registration form and
+   returns 40001 when called.
+3. REST `session.last_seq` is a hardcoded placeholder 0
+   (`routes/sessions.ts:1069`); the real journal seq is only available from
+   WS ack cursors or snapshot `as_of_seq`.
+4. Re-aborting a finished prompt returns **40402** (the record is dropped
+   from the queue); the 40903 idempotent path appears dead in 0.28.1.
+5. Subscribing to a cold session right after a server restart returns an
+   unexplained `resync_required` (lazy activation via
+   `ISessionLifecycleService.get`, not `resume`); touching a resume-backed
+   REST route first avoids it. Restart alone never rotates the epoch
+   (journal JSONL preserved); the epoch rotates only on journal corruption.
+6. `prompt.submitted` / `prompt.completed` have **no producer** in
+   agent-core-v2 (schema-defined only) and never appear on the wire; use the
+   REST submit ack + `prompt.aborted` / `prompt.steered` + `turn.*`.
+7. The replay window (1000) is a constructor option only — not configurable
+   via CLI/env at runtime; a `resync_required` frame may arrive **before**
+   the subscribe ack (buffer frames while awaiting acks).
+8. Provisioning: an isolated `KIMI_CODE_HOME` gets model config from the
+   `KIMI_MODEL_NAME` / `KIMI_MODEL_API_KEY` / `KIMI_MODEL_BASE_URL` env
+   overlay, and REST-created sessions do not inherit the overlay
+   `defaultModel` — pass `model` explicitly per prompt.

@@ -1,7 +1,8 @@
 # MVP 功能合同（草案）
 
-> 状态：草案（2026-07-21 首轮对齐完成）。本文定义 KITE MVP 做什么、不做什么、每个行为的
-> 失败模式。转 active 后，代码行为与本文不一致即 contract gap。
+> 状态：**active**(2026-07-21 首轮对齐 + spike 验证完成，见
+> `docs/verification/spike-results.md`)。本文定义 KITE MVP 做什么、不做什么、每个行为的
+> 失败模式。代码行为与本文不一致即 contract gap。
 
 ## 1. 功能承载力门槛
 
@@ -25,13 +26,14 @@
 | 首次自动建 session | 未绑定会话的首条消息：以其 cwd（实例 `default_working_dir`）建 session 并绑定 |
 | 审批卡片 | approval.requested → 三键卡（批准/拒绝/拒绝并反馈）→ REST 响应 → 卡片 patch 定格 |
 | question 表单卡 | question.requested → 选项按钮卡（按钮作答，编号回复兜底）；超时自动 dismiss |
-| `/new` | 解绑当前 session，建新 session 并绑定 |
+| `/new` | 解绑当前 session，建新 session 并绑定；旧 session 原样保留（不 archive；上游无 delete) |
 | `/sessions` | 列出 kap-server 上可见 session（标题/cwd/busy)，按钮切换绑定 |
 | `/switch <id>` | 切换 binding 到既有 session（自动 attached) |
 | `/detach` / `/attach` | 暂停/恢复当前 binding 的飞书推送，binding 本身保留 |
-| `/mode <auto\|yolo\|plan>` | 读写 binding 级 permission mode；每个 prompt 显式携带 |
+| `/mode <auto\|manual\|yolo>` | 读写 binding 级 permission mode（kap `permission_mode`)；每个 prompt 显式携带 |
+| `/plan [on\|off]` | 查看/切换 binding 级 plan mode（kap `plan_mode`，与 permission mode 正交）；每个 prompt 显式携带 |
 | `/status` | 展示 binding、session、work state、排队情况 |
-| `/abort` | 中断 active prompt；仅该 prompt 发起者与管理员可用 |
+| `/abort` | 中断 active prompt；仅该 prompt 发起者与管理员可用；对已完成 prompt 再 abort 得上游 40402(not pending)→ 提示"已结束"，执行卡不转失败（spike S2) |
 | `/help` | 命令导航 |
 | `kitectl` | config / service（启停、status、log)/ binding(list)/ session(list、status)/ prompt send |
 
@@ -68,7 +70,8 @@
 3. `resync_required`（超窗/epoch 变更）→ snapshot 重建，同第 2 条。
 4. 审批/表单响应 REST 返回幂等冲突（40902) → 提示"已被处理"，卡片定格。
 5. prompt REST 返回业务错误码 → 执行卡直接转终态（失败），展示上游 msg。
-6. kited 重启 → binding/permission mode/cursor 从 store 恢复；内存中的
+6. kited 重启 → binding/permission mode/plan mode/cursor 从 store 恢复；
+   内存中的
    prompt 归属尽量从 `GET .../prompts` + snapshot 重建；建不回的审批卡
    显式过期（卡片 patch 为"已失效，请重新发起或本地处理")。
 7. session 在上游被 archive → 下一条消息报错并提示 `/sessions` 切换，
@@ -76,8 +79,8 @@
 
 ## 5. 权限与身份
 
-- 首个与机器人对话的用户登记为管理员（安装时生成 init token，流程仿
-  FOCUS)；管理员集合存实例配置。
+- 首个管理员通过在飞书内发送 `/init <token>` 登记（init token 安装时
+  生成，流程仿 FOCUS)；管理员集合存实例配置。
 - MVP 只有两级：**管理员**（全部命令 + `kitectl`）与**非管理员**（不可
   使用，`/help` 除外）。允许名单（多用户）是 Phase 2 候选。
 - binding 级 permission mode 默认 `auto`;`yolo` 需要管理员显式设置，
@@ -100,3 +103,10 @@
 3. `/sessions` MVP 一页 + 按最近活跃排序；session 数增长后再议分页。
 4. 管理员登记采用 FOCUS 式 init token 流程（安装时生成 token，飞书内
    `/init <token>` 登记首个管理员）。
+5. `/mode` 枚举按上游修正为 `auto/manual/yolo`（证据：
+   `packages/protocol/src/rest/prompt.ts:41`）；`plan` 不是
+   `permission_mode` 取值，而是独立的 `plan_mode` 布尔字段，以
+   `/plan [on|off]` 暴露（2026-07-21 对照上游代码修正）。
+6. Spike 第 0 里程碑在 kimi 0.28.1 上通过（2026-07-21;
+   `docs/verification/spike-results.md`);`/abort` 行已补充实测的 40402
+   重复 abort 行为。

@@ -7,7 +7,7 @@
 
 ## 通用约定
 
-- 环境：验证时所用 kimi-code 版本（结果回填：`____`；仅作"已验证版本"记录，不构成锁定，见 kite-design §10)，`kimi web
+- 环境：验证时所用 kimi-code 版本（**kimi 0.28.1**,2026-07-21 验证；仅作"已验证版本"记录，不构成锁定，见 kite-design §10)，`kimi web
   --no-open` 本地 loopback 拉起，独立临时 `KIMI_CODE_HOME`。
 - 形态：纯脚本（Python 标准库 + websockets，或直接 curl + wscat)，不入库
   业务代码；脚本可放 `scripts/spike/` 留存。
@@ -32,7 +32,7 @@
   abort queued 是否支持；steer 后队列状态。
 - **通过标准**：行为确定且可映射到 KITE 的卡片状态机；不允许出现无法
   归因到 prompt_id 的事件。
-- **影响**:mvp-scope §3 并发行为、`/abort` 是否进 MVP（待对齐 1)。
+- **影响**:mvp-scope §3 并发行为；验证 `/abort` 的卡片状态机映射（已进 MVP,2026-07-21 对齐）。
 
 ## S3. durable 重放窗口与 epoch 语义
 
@@ -53,7 +53,7 @@
   SIGTERM 优雅关停、异常退出后的端口/实例注册表残留。
 - **通过标准**：拉起/关停/冲突/轮换全链路无需人工干预；实例注册表不
   误导后续发现。
-- **影响**:`kite-design.md` §2 进程形态；待对齐项"拉起方式二选一"。
+- **影响**:`kite-design.md` §2 进程形态；验证已选定的拉起方式（`kimi web --no-open`,2026-07-21 对齐）。
 
 ## S5. snapshot 重建进行中 session
 
@@ -70,5 +70,4 @@
 
 - **验证**：跑一组代表性 prompt（写代码、装依赖、联网搜索），统计
   question.requested 出现频率与形态。
-- **通过标准**：无硬性标准；产出用于 mvp-scope 待对齐 2(question 表单
-  是否留在 MVP)。
+- **通过标准**：无硬性标准；产出作为 question 表单卡布局的设计输入（question 表单已进 MVP,2026-07-21 对齐）。
