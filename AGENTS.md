@@ -111,3 +111,11 @@ Keep repository facts out of this file.
 - **架构蓝本**:FOCUS(`~/llm/focus`)。复用其上游无关资产（飞书传输层、卡片、RuntimeLoop、stores、service 管理）时，按 KITE 词汇（session/agent/prompt/approval/question）重命名，不保留 codex 术语。
 - **上游版本跟随，不钉死**（2026-07-21 对齐）：不指望长期停留在一个旧 kimi-code 版本上；CI 必须有 kap-server OpenAPI 快照 diff 护栏感知漂移；安装/启动做版本检测，与已验证版本不符时警告但不阻止运行。
 - **安装纪律**（沿用 FOCUS）：不使用 `pip install .` / `pip install -e .`；唯一支持的安装路径是仓库提供的 install 脚本。
+
+## 工程命令
+
+- 安装：仅 `install.sh`（受管 venv + 包装脚本；服务注册待 `kitectl service` 落地，见 `docs/architecture/kite-design.md` §9）。
+- 测试：`python3 -m pytest -q`（无 kimi 时合同测试自动跳过）；真实 kap-server 合同测试：`python3 -m pytest tests/test_kap_contract.py -q`（需 `kimi` 在 PATH）。
+- 上游漂移护栏：`python3 scripts/ci/kap_snapshot_diff.py --spawn`（需 kimi，见 `kite-design.md` §10）；CI 中为 `workflow_dispatch`（`.github/workflows/kap-snapshot.yml`）。
+- 文档检查：`bash scripts/check-docs.sh`（CI:`.github/workflows/docs.yml`）；单测 CI:`.github/workflows/tests.yml`。
+- 布局：扁平 `kite/` 包（仿 FOCUS `bot/`；适配层 `kite/adapters/` 是唯一允许感知 kap schema 的地方）、`tests/`、`scripts/spike/`（M0 验证脚本）、`scripts/ci/`。

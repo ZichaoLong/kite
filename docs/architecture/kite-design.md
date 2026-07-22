@@ -146,7 +146,11 @@ Carry over FOCUS experience, rewritten to kap event semantics:
 
 ## 7. Persistence
 
-- All JSON files + atomic write (tmp + rename) + file locks; no SQLite.
+- All JSON files + atomic write (tmp + rename); no SQLite. Write
+  serialization: single writer (kited) with in-process locks — FOCUS's proven
+  discipline; advisory file locks only where a file may be written across
+  processes. Atomic rename makes cross-process reads (e.g., `kitectl`) safe
+  without locks.
 - stores: binding store (chat ↔ session, attached, permission mode, plan
   mode), terminal result store, event cursor store (per-session
   `{seq, epoch}`), attachment staging store (later).

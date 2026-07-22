@@ -122,7 +122,10 @@ gate。登记在 `docs/decisions/concurrency-model.md`，等产品证明需要�
 
 ## 7. 持久化
 
-- 全部 JSON 文件 + 原子写（tmp + rename)+ 文件锁；不用 SQLite。
+- 全部 JSON 文件 + 原子写（tmp + rename)；不用 SQLite。写串行化：单写者
+  (kited)+ 进程内锁（FOCUS 已验证的纪律）；仅在文件可能跨进程写入时
+  使用劝告式文件锁。原子 rename 使跨进程读（如 `kitectl`）无需锁也
+  安全。
 - stores:binding store(chat ↔ session、attached、permission mode、plan
   mode)、终态结果 store、事件 cursor store（每 session 的 `{seq, epoch}`)、
   附件 staging store（后期）。

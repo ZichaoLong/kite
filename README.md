@@ -14,9 +14,11 @@ KITE 把飞书机器人接到 kimi-code 的共享后端（kap-server）上，让
 
 ## 当前状态
 
-**Milestone 0 完成**:spike 验证已于 2026-07-21 全部通过（kimi 0.28.1，结果见
+**M1 进行中**：第 0 里程碑（spike）已于 2026-07-21 通过（kimi 0.28.1，结果见
 `docs/verification/spike-results.md`),`contracts/`、`architecture/`、`decisions/`
-已转 active，业务代码可以开工。
+已转 active。已完成：仓库骨架与安装器（`install.sh`)、FOCUS 原语/stores/RuntimeLoop
+移植、service_manager、kap 适配层与 `kited`/`kitectl session` 最小竖切（171 tests)。
+进行中：飞书传输层与应用层（需飞书自建应用凭证联调）。
 
 ## 文档入口
 
