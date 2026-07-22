@@ -158,6 +158,55 @@ class PromptQueueState:
 
 
 @dataclass(frozen=True, slots=True)
+class ApprovalRequestView:
+    """The pending-approval projection the rebuild path needs (wire
+    ``approvalRequestSchema``; see kap-server ``routes/approvals.toWireApproval``).
+
+    ``detail`` is a plain-text salient field extracted from
+    ``tool_input_display`` (command/path/query/url/summary, kind-prefixed);
+    presentation is the application layer's job.
+    """
+
+    approval_id: str
+    turn_id: int | None
+    tool_call_id: str
+    tool_name: str
+    action: str
+    detail: str
+
+
+@dataclass(frozen=True, slots=True)
+class QuestionOptionView:
+    """One wire question option (id synthesized upstream: ``opt_<q>_<o>``)."""
+
+    option_id: str
+    label: str
+    description: str
+
+
+@dataclass(frozen=True, slots=True)
+class QuestionItemView:
+    """One wire question item (``q_<index>``) with its selectable options."""
+
+    item_id: str
+    question: str
+    header: str
+    options: tuple[QuestionOptionView, ...]
+    multi_select: bool
+    allow_other: bool
+
+
+@dataclass(frozen=True, slots=True)
+class QuestionRequestView:
+    """The pending-question projection the rebuild path needs (wire
+    ``questionRequestSchema``; see kap-server ``routes/questions.toWireQuestion``)."""
+
+    question_id: str
+    turn_id: int | None
+    items: tuple[QuestionItemView, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class SessionSnapshot:
     """The rebuild watermark + work state from ``GET .../snapshot``."""
 
@@ -169,6 +218,9 @@ class SessionSnapshot:
     in_flight: bool
     pending_approval_ids: tuple[str, ...]
     pending_question_ids: tuple[str, ...]
+    in_flight_turn_id: int | None = None
+    pending_approvals: tuple[ApprovalRequestView, ...] = ()
+    pending_questions: tuple[QuestionRequestView, ...] = ()
 
     @property
     def cursor(self) -> EventCursor:
@@ -203,6 +255,282 @@ class ResyncRequest:
     reason: str | None
     current_seq: int | None
     epoch: str | None
+
+
+# ---------------------------------------------------------------------------
+# Typed durable events (the outbound path consumes ONLY these)
+# ---------------------------------------------------------------------------
+#
+# ``KapEvent.payload`` is the raw protocol event dict; reading its keys is
+# schema knowledge and therefore lives here. ``normalize_durable_event`` maps
+# the durable slice of the v1 event catalog (kite-design.md §5) onto the typed
+# dataclasses below; volatile and unknown types normalize to None. Upstream
+# field facts (packages/protocol/src/events.ts + the kap-server interaction
+# synthesis in transport/ws/v1/sessionEventBroadcaster.ts):
+#
+# - core agent events use camelCase (turnId / toolCallId / promptId /
+#   activePromptId / promptIds);
+# - approval/question events are synthesized from the interaction kernel and
+#   use the REST wire projections (snake_case: approval_id / question_id /
+#   turn_id / tool_call_id);
+# - turn.started carries NO prompt id — prompt attribution is the receiver's
+#   job (kap prompt FIFO: the turn belongs to the active prompt);
+# - question resolution arrives as event.question.answered or
+#   event.question.dismissed; both fold into QuestionResolved.
+
+
+@dataclass(frozen=True, slots=True)
+class TurnStarted:
+    session_id: str
+    turn_id: int
+    prompt_text: str
+    origin_kind: str
+
+
+@dataclass(frozen=True, slots=True)
+class TurnEnded:
+    session_id: str
+    turn_id: int
+    reason: str  # completed | cancelled | failed | blocked
+    error_message: str
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCallStarted:
+    session_id: str
+    turn_id: int
+    tool_call_id: str
+    name: str
+    description: str
+    detail: str  # salient field from the display payload, kind-prefixed
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCallResult:
+    session_id: str
+    turn_id: int
+    tool_call_id: str
+    is_error: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PromptAborted:
+    session_id: str
+    prompt_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class PromptSteered:
+    session_id: str
+    active_prompt_id: str
+    prompt_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovalRequested:
+    session_id: str
+    approval_id: str
+    turn_id: int | None
+    tool_call_id: str
+    tool_name: str
+    action: str
+    detail: str
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovalResolved:
+    session_id: str
+    approval_id: str
+    decision: str  # approved | rejected | cancelled
+    feedback: str
+
+
+@dataclass(frozen=True, slots=True)
+class QuestionRequested:
+    session_id: str
+    question_id: str
+    turn_id: int | None
+    items: tuple[QuestionItemView, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class QuestionResolved:
+    session_id: str
+    question_id: str
+    dismissed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class SessionWorkChanged:
+    session_id: str
+    busy: bool
+    pending_interaction: str | None
+    last_turn_reason: str | None
+
+
+DurableEvent = (
+    TurnStarted
+    | TurnEnded
+    | ToolCallStarted
+    | ToolCallResult
+    | PromptAborted
+    | PromptSteered
+    | ApprovalRequested
+    | ApprovalResolved
+    | QuestionRequested
+    | QuestionResolved
+    | SessionWorkChanged
+)
+
+
+def normalize_durable_event(event: KapEvent) -> DurableEvent | None:
+    """Map a normalized KapEvent to a typed durable event.
+
+    Returns None for volatile types, unknown types, events without a session
+    id, and malformed payloads (logged; a bad frame must not kill the stream
+    and must never be guessed at).
+    """
+    if event.volatile or not event.session_id:
+        return None
+    payload = event.payload
+    if not isinstance(payload, dict):
+        if event.type in _DURABLE_EVENT_TYPES:
+            logger.warning("durable event %s with non-dict payload dropped", event.type)
+        return None
+    session_id = event.session_id
+    try:
+        if event.type == "turn.started":
+            turn_id = _optional_non_negative_int(payload.get("turnId"))
+            if turn_id is None:
+                raise ValueError("turnId missing")
+            origin = payload.get("origin") if isinstance(payload.get("origin"), dict) else {}
+            return TurnStarted(
+                session_id=session_id,
+                turn_id=turn_id,
+                prompt_text=str(payload.get("prompt") or ""),
+                origin_kind=str(origin.get("kind") or ""),
+            )
+        if event.type == "turn.ended":
+            turn_id = _optional_non_negative_int(payload.get("turnId"))
+            if turn_id is None:
+                raise ValueError("turnId missing")
+            error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+            return TurnEnded(
+                session_id=session_id,
+                turn_id=turn_id,
+                reason=str(payload.get("reason") or ""),
+                error_message=str(error.get("message") or ""),
+            )
+        if event.type == "tool.call.started":
+            turn_id = _optional_non_negative_int(payload.get("turnId"))
+            tool_call_id = _optional_str(payload.get("toolCallId"))
+            if turn_id is None or not tool_call_id:
+                raise ValueError("turnId/toolCallId missing")
+            return ToolCallStarted(
+                session_id=session_id,
+                turn_id=turn_id,
+                tool_call_id=tool_call_id,
+                name=str(payload.get("name") or ""),
+                description=str(payload.get("description") or ""),
+                detail=_tool_display_detail(payload.get("display")),
+            )
+        if event.type == "tool.result":
+            turn_id = _optional_non_negative_int(payload.get("turnId"))
+            tool_call_id = _optional_str(payload.get("toolCallId"))
+            if turn_id is None or not tool_call_id:
+                raise ValueError("turnId/toolCallId missing")
+            return ToolCallResult(
+                session_id=session_id,
+                turn_id=turn_id,
+                tool_call_id=tool_call_id,
+                is_error=bool(payload.get("isError")),
+            )
+        if event.type == "prompt.aborted":
+            prompt_id = _optional_str(payload.get("promptId"))
+            if not prompt_id:
+                raise ValueError("promptId missing")
+            return PromptAborted(session_id=session_id, prompt_id=prompt_id)
+        if event.type == "prompt.steered":
+            prompt_ids = tuple(
+                pid for pid in (_optional_str(item) for item in _as_list(payload.get("promptIds"))) if pid
+            )
+            return PromptSteered(
+                session_id=session_id,
+                active_prompt_id=str(payload.get("activePromptId") or ""),
+                prompt_ids=prompt_ids,
+            )
+        if event.type == "event.approval.requested":
+            view = _parse_approval_request(payload)
+            if view is None:
+                raise ValueError("approval payload missing required fields")
+            return ApprovalRequested(
+                session_id=session_id,
+                approval_id=view.approval_id,
+                turn_id=view.turn_id,
+                tool_call_id=view.tool_call_id,
+                tool_name=view.tool_name,
+                action=view.action,
+                detail=view.detail,
+            )
+        if event.type == "event.approval.resolved":
+            approval_id = _optional_str(payload.get("approval_id"))
+            if not approval_id:
+                raise ValueError("approval_id missing")
+            return ApprovalResolved(
+                session_id=session_id,
+                approval_id=approval_id,
+                decision=str(payload.get("decision") or ""),
+                feedback=str(payload.get("feedback") or ""),
+            )
+        if event.type == "event.question.requested":
+            view = _parse_question_request(payload)
+            if view is None:
+                raise ValueError("question payload missing required fields")
+            return QuestionRequested(
+                session_id=session_id,
+                question_id=view.question_id,
+                turn_id=view.turn_id,
+                items=view.items,
+            )
+        if event.type in ("event.question.answered", "event.question.dismissed"):
+            question_id = _optional_str(payload.get("question_id"))
+            if not question_id:
+                raise ValueError("question_id missing")
+            return QuestionResolved(
+                session_id=session_id,
+                question_id=question_id,
+                dismissed=event.type == "event.question.dismissed",
+            )
+        if event.type == "event.session.work_changed":
+            return SessionWorkChanged(
+                session_id=session_id,
+                busy=bool(payload.get("busy")),
+                pending_interaction=_optional_str(payload.get("pending_interaction")),
+                last_turn_reason=_optional_str(payload.get("last_turn_reason")),
+            )
+    except ValueError as exc:
+        logger.warning("durable event %s dropped: %s", event.type, exc)
+        return None
+    return None
+
+
+# Durable types the outbound path recognizes (for drop logging).
+_DURABLE_EVENT_TYPES = frozenset(
+    {
+        "turn.started",
+        "turn.ended",
+        "tool.call.started",
+        "tool.result",
+        "prompt.aborted",
+        "prompt.steered",
+        "event.approval.requested",
+        "event.approval.resolved",
+        "event.question.requested",
+        "event.question.answered",
+        "event.question.dismissed",
+        "event.session.work_changed",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -474,15 +802,31 @@ class KapRestClient:
         if not isinstance(data, dict):
             raise KapTransportError("snapshot: unexpected data shape")
         session = data.get("session") if isinstance(data.get("session"), dict) else {}
+        in_flight_turn = data.get("in_flight_turn")
         return SessionSnapshot(
             as_of_seq=_non_negative_int(data.get("as_of_seq")),
             epoch=str(data.get("epoch") or ""),
             busy=bool(session.get("busy")),
             pending_interaction=_optional_str(session.get("pending_interaction")),
             current_prompt_id=_optional_str(session.get("current_prompt_id")),
-            in_flight=isinstance(data.get("in_flight_turn"), dict),
+            in_flight=isinstance(in_flight_turn, dict),
             pending_approval_ids=_collect_ids(data.get("pending_approvals"), "approval_id"),
             pending_question_ids=_collect_ids(data.get("pending_questions"), "question_id"),
+            in_flight_turn_id=(
+                _optional_non_negative_int(in_flight_turn.get("turn_id"))
+                if isinstance(in_flight_turn, dict)
+                else None
+            ),
+            pending_approvals=tuple(
+                view
+                for view in (_parse_approval_request(item) for item in _as_list(data.get("pending_approvals")))
+                if view is not None
+            ),
+            pending_questions=tuple(
+                view
+                for view in (_parse_question_request(item) for item in _as_list(data.get("pending_questions")))
+                if view is not None
+            ),
         )
 
     def shutdown(self) -> None:
@@ -1128,6 +1472,16 @@ def _optional_str(value: Any) -> str | None:
     return None
 
 
+def _optional_non_negative_int(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _as_list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
+
+
 def _non_negative_int(value: Any) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise KapTransportError(f"expected a non-negative integer, got {value!r}")
@@ -1178,6 +1532,100 @@ def _parse_wire_cursor(raw: Any) -> EventCursor | None:
     if not isinstance(epoch, str) or not epoch:
         return None
     return EventCursor(seq=seq, epoch=epoch)
+
+
+def _tool_display_detail(display: Any) -> str:
+    """Salient plain-text field from a ToolInputDisplay payload.
+
+    Returns "<kind>: <field>" (or "<field>" / "") — a neutral extraction, not
+    presentation (protocol/display.ts ToolInputDisplaySchema).
+    """
+    if not isinstance(display, dict):
+        return ""
+    kind = str(display.get("kind") or "")
+    if kind == "command":
+        return str(display.get("command") or "")
+    if kind == "file_io":
+        operation = str(display.get("operation") or "")
+        path = str(display.get("path") or "")
+        return f"{operation} {path}".strip()
+    if kind == "diff":
+        return str(display.get("path") or "")
+    if kind == "search":
+        return str(display.get("query") or "")
+    if kind == "url_fetch":
+        return str(display.get("url") or "")
+    if kind == "agent_call":
+        return str(display.get("agent_name") or "")
+    if kind == "skill_call":
+        name = str(display.get("skill_name") or "")
+        args = str(display.get("args") or "")
+        return f"{name} {args}".strip()
+    if kind == "task":
+        return str(display.get("description") or "")
+    if kind == "task_stop":
+        return str(display.get("task_description") or "")
+    if kind == "plan_review":
+        return str(display.get("plan") or "")
+    if kind == "goal_start":
+        return str(display.get("objective") or "")
+    if kind == "generic":
+        return str(display.get("summary") or "")
+    return ""
+
+
+def _parse_approval_request(raw: Any) -> ApprovalRequestView | None:
+    """Parse one wire approvalRequestSchema item (requested event or snapshot)."""
+    if not isinstance(raw, dict):
+        return None
+    approval_id = _optional_str(raw.get("approval_id"))
+    if not approval_id:
+        return None
+    return ApprovalRequestView(
+        approval_id=approval_id,
+        turn_id=_optional_non_negative_int(raw.get("turn_id")),
+        tool_call_id=str(raw.get("tool_call_id") or ""),
+        tool_name=str(raw.get("tool_name") or ""),
+        action=str(raw.get("action") or ""),
+        detail=_tool_display_detail(raw.get("tool_input_display")),
+    )
+
+
+def _parse_question_request(raw: Any) -> QuestionRequestView | None:
+    """Parse one wire questionRequestSchema item (requested event or snapshot)."""
+    if not isinstance(raw, dict):
+        return None
+    question_id = _optional_str(raw.get("question_id"))
+    if not question_id:
+        return None
+    items: list[QuestionItemView] = []
+    for raw_item in _as_list(raw.get("questions")):
+        if not isinstance(raw_item, dict):
+            continue
+        options = tuple(
+            QuestionOptionView(
+                option_id=str(option.get("id") or ""),
+                label=str(option.get("label") or ""),
+                description=str(option.get("description") or ""),
+            )
+            for option in _as_list(raw_item.get("options"))
+            if isinstance(option, dict) and _optional_str(option.get("id"))
+        )
+        items.append(
+            QuestionItemView(
+                item_id=str(raw_item.get("id") or ""),
+                question=str(raw_item.get("question") or ""),
+                header=str(raw_item.get("header") or ""),
+                options=options,
+                multi_select=bool(raw_item.get("multi_select")),
+                allow_other=bool(raw_item.get("allow_other", True)),
+            )
+        )
+    return QuestionRequestView(
+        question_id=question_id,
+        turn_id=_optional_non_negative_int(raw.get("turn_id")),
+        items=tuple(items),
+    )
 
 
 def _parse_event_frame(frame: dict[str, Any]) -> KapEvent | None:

@@ -1,0 +1,1201 @@
+"""Outbound event pipeline contract tests.
+
+Fakes stand in for the Feishu transport (records sends/patches), the kap REST
+client (scriptable prompts/snapshot/interactions), and timers (manual fire).
+A real BindingStore / TerminalResultStore / EventCursorStore in a temp dir and
+a real RuntimeLoop are used, so the loop-serialization discipline is exercised
+for real. Events are fed as wire-shaped KapEvent payloads so the adapter's
+durable-event normalization is covered end to end.
+"""
+
+from __future__ import annotations
+
+import json
+import pathlib
+import re
+import tempfile
+import unittest
+
+from kite import cards
+from kite.adapters.kap_server import (
+    ApprovalRequestView,
+    KapError,
+    KapEvent,
+    KapTransportError,
+    PromptQueueState,
+    QuestionItemView,
+    QuestionOptionView,
+    QuestionRequestView,
+    ResyncRequest,
+    SessionSnapshot,
+)
+from kite.event_pipeline import (
+    EventPipeline,
+    OutboundAppHandler,
+    SwappableKapRest,
+    TimerHandle,
+    WsSubscriptionHook,
+)
+from kite.feishu_transport import CardAction, InboundMessage
+from kite.prompt_ownership import PromptOwnership
+from kite.runtime_loop import RuntimeLoop
+from kite.stores.binding_store import BindingStore
+from kite.stores.event_cursor_store import EventCursorStore
+from kite.stores.terminal_result_store import TerminalResultStore
+
+ADMIN_OPEN_ID = "ou_admin"
+OTHER_OPEN_ID = "ou_other_admin"
+CHAT_ID = "oc_chat"
+CHAT_ID_2 = "oc_chat_2"
+SESSION_ID = "s-1"
+INIT_TOKEN = "test-init-token"
+
+
+# ---------------------------------------------------------------------------
+# Fakes
+# ---------------------------------------------------------------------------
+
+
+class FakeTransport:
+    def __init__(self) -> None:
+        self.sent: list[dict] = []
+        self.patches: list[dict] = []
+        self.replies: list[dict] = []
+        self.fail_sends = False
+        self._counter = 0
+
+    def send_message_get_id(self, chat_id: str, msg_type: str, content: str):
+        if self.fail_sends:
+            return None
+        self._counter += 1
+        message_id = f"om_{self._counter}"
+        self.sent.append(
+            {
+                "chat_id": chat_id,
+                "msg_type": msg_type,
+                "content": json.loads(content),
+                "message_id": message_id,
+            }
+        )
+        return message_id
+
+    def patch_message(self, message_id: str, content: str) -> bool:
+        self.patches.append({"message_id": message_id, "content": json.loads(content)})
+        return True
+
+    def reply(self, chat_id: str, text: str, *, parent_message_id: str = "", reply_in_thread: bool = False) -> bool:
+        self.replies.append({"chat_id": chat_id, "text": text})
+        return True
+
+    def reply_card(self, chat_id: str, card: dict, *, parent_message_id: str = "", reply_in_thread: bool = False) -> None:
+        self.send_message_get_id(chat_id, "interactive", json.dumps(card))
+
+    # -- helpers --------------------------------------------------------------
+
+    def cards_to(self, chat_id: str) -> list[dict]:
+        return [item for item in self.sent if item["chat_id"] == chat_id]
+
+    def texts_to(self, chat_id: str) -> list[str]:
+        return [item["text"] for item in self.replies if item["chat_id"] == chat_id]
+
+    def patches_to(self, message_id: str) -> list[dict]:
+        return [item["content"] for item in self.patches if item["message_id"] == message_id]
+
+
+class FakeInteractionRest:
+    """Scriptable stand-in for the kap REST surface the pipeline uses."""
+
+    def __init__(self) -> None:
+        self.sessions: dict[str, dict] = {}
+        self.prompt_states: dict[str, PromptQueueState] = {}
+        self.snapshots: dict[str, object] = {}
+        self.assistant_text = "最终答复文本"
+        self.approval_resolutions: list[dict] = []
+        self.question_answers: list[dict] = []
+        self.dismissals: list[tuple[str, str]] = []
+        self.submissions: list[dict] = []
+        self.resolve_error: Exception | None = None
+        self.answer_error: Exception | None = None
+        self.dismiss_error: Exception | None = None
+        self.prompts_error: Exception | None = None
+        self.messages_error: Exception | None = None
+        self._prompt_counter = 0
+
+    # -- scripting helpers ----------------------------------------------------
+
+    def add_session(self, session_id: str, *, title: str = "测试会话") -> None:
+        self.sessions[session_id] = {
+            "id": session_id,
+            "title": title,
+            "busy": False,
+            "pending_interaction": None,
+            "archived": False,
+            "metadata": {"cwd": "/work"},
+        }
+
+    def set_prompts(self, session_id: str, *, active: str | None = None, queued: tuple[str, ...] = ()) -> None:
+        self.prompt_states[session_id] = PromptQueueState(
+            active_prompt_id=active, queued_prompt_ids=queued
+        )
+
+    # -- KapRestClient surface ------------------------------------------------
+
+    def call(self, method: str, path: str, body: object = None) -> object:
+        match = re.fullmatch(r"/sessions/([^/]+)", path)
+        if method == "GET" and match:
+            session = self.sessions.get(match.group(1))
+            if session is None:
+                raise KapError(40401, "session not found")
+            return session
+        match = re.fullmatch(r"/sessions/([^/]+)/messages", path.split("?")[0])
+        if method == "GET" and match:
+            if self.messages_error is not None:
+                raise self.messages_error
+            text = self.assistant_text
+            return {
+                "items": [
+                    {
+                        "id": "m-1",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": text}] if text else [],
+                    }
+                ]
+                if text
+                else [],
+                "has_more": False,
+            }
+        match = re.fullmatch(r"/sessions/([^/]+)/approvals/([^/]+)", path)
+        if method == "POST" and match:
+            if self.resolve_error is not None:
+                raise self.resolve_error
+            self.approval_resolutions.append(
+                {"session_id": match.group(1), "approval_id": match.group(2), "body": body}
+            )
+            return {"resolved": True, "resolved_at": "2026-01-01T00:00:00Z"}
+        match = re.fullmatch(r"/sessions/([^/]+)/questions/([^/]+):dismiss", path)
+        if method == "POST" and match:
+            if self.dismiss_error is not None:
+                raise self.dismiss_error
+            self.dismissals.append((match.group(1), match.group(2)))
+            # Upstream quirk: the dismiss success envelope carries 40909.
+            raise KapError(40909, "question dismissed")
+        match = re.fullmatch(r"/sessions/([^/]+)/questions/([^/]+)", path)
+        if method == "POST" and match:
+            if self.answer_error is not None:
+                raise self.answer_error
+            self.question_answers.append(
+                {"session_id": match.group(1), "question_id": match.group(2), "body": body}
+            )
+            return {"resolved": True, "resolved_at": "2026-01-01T00:00:00Z"}
+        match = re.fullmatch(r"/sessions/([^/]+)/prompts", path)
+        if method == "POST" and match:
+            self._prompt_counter += 1
+            prompt_id = f"p-new-{self._prompt_counter}"
+            self.submissions.append(
+                {"session_id": match.group(1), "body": body, "prompt_id": prompt_id}
+            )
+            return {
+                "prompt_id": prompt_id,
+                "user_message_id": f"um-{prompt_id}",
+                "status": "running",
+                "content": [],
+                "created_at": "2026-01-01T00:00:00Z",
+            }
+        raise AssertionError(f"unexpected kap call: {method} {path}")
+
+    def get(self, path: str) -> object:
+        return self.call("GET", path)
+
+    def post(self, path: str, body: object = None) -> object:
+        return self.call("POST", path, body)
+
+    def list_sessions(self) -> list:
+        return []
+
+    def get_prompts(self, session_id: str) -> PromptQueueState:
+        if self.prompts_error is not None:
+            raise self.prompts_error
+        return self.prompt_states.get(session_id, PromptQueueState(None, ()))
+
+    def get_snapshot(self, session_id: str) -> SessionSnapshot:
+        snapshot = self.snapshots.get(session_id)
+        if snapshot is None:
+            raise KapError(40401, "session not found")
+        if isinstance(snapshot, Exception):
+            raise snapshot
+        return snapshot
+
+
+class ManualTimer(TimerHandle):
+    def __init__(self, delay: float, callback) -> None:
+        self.delay = delay
+        self.callback = callback
+        self.cancelled = False
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+    def fire(self) -> None:
+        if not self.cancelled:
+            self.callback()
+
+
+class ManualTimerFactory:
+    def __init__(self) -> None:
+        self.created: list[ManualTimer] = []
+
+    def __call__(self, delay: float, callback) -> ManualTimer:
+        timer = ManualTimer(delay, callback)
+        self.created.append(timer)
+        return timer
+
+    @property
+    def live(self) -> list[ManualTimer]:
+        return [timer for timer in self.created if not timer.cancelled]
+
+    def fire(self, index: int = -1) -> None:
+        self.created[index].fire()
+
+
+class FakeWsClient:
+    def __init__(self) -> None:
+        self.subscriptions: list[str] = []
+
+    def subscribe(self, session_id: str):
+        self.subscriptions.append(session_id)
+        return {}
+
+
+# ---------------------------------------------------------------------------
+# Harness
+# ---------------------------------------------------------------------------
+
+
+def kap_event(type_: str, payload: dict, *, session_id: str = SESSION_ID, seq: int = 1) -> KapEvent:
+    return KapEvent(
+        type=type_,
+        session_id=session_id,
+        seq=seq,
+        epoch="e1",
+        volatile=False,
+        offset=None,
+        timestamp="2026-01-01T00:00:00Z",
+        payload=payload,
+    )
+
+
+def turn_started(*, turn_id: int = 1, prompt: str = "做点事", session_id: str = SESSION_ID) -> KapEvent:
+    return kap_event(
+        "turn.started",
+        {"type": "turn.started", "turnId": turn_id, "origin": {"kind": "user"}, "prompt": prompt},
+        session_id=session_id,
+    )
+
+
+def approval_requested(
+    *, approval_id: str = "a-1", turn_id: int = 1, session_id: str = SESSION_ID
+) -> KapEvent:
+    return kap_event(
+        "event.approval.requested",
+        {
+            "approval_id": approval_id,
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "tool_call_id": "tc-1",
+            "tool_name": "Bash",
+            "action": "execute",
+            "tool_input_display": {"kind": "command", "command": "rm -rf build/"},
+            "created_at": "2026-01-01T00:00:00Z",
+            "expires_at": "2026-01-02T00:00:00Z",
+        },
+        session_id=session_id,
+    )
+
+
+def question_requested(
+    *, question_id: str = "q-1", turn_id: int = 1, session_id: str = SESSION_ID
+) -> KapEvent:
+    return kap_event(
+        "event.question.requested",
+        {
+            "question_id": question_id,
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "questions": [
+                {
+                    "id": "q_0",
+                    "question": "部署到哪个环境？",
+                    "header": "环境",
+                    "options": [
+                        {"id": "opt_0_0", "label": "开发", "description": "dev"},
+                        {"id": "opt_0_1", "label": "生产"},
+                    ],
+                    "allow_other": True,
+                }
+            ],
+            "created_at": "2026-01-01T00:00:00Z",
+        },
+        session_id=session_id,
+    )
+
+
+def make_snapshot(
+    *,
+    as_of_seq: int = 10,
+    epoch: str = "e1",
+    busy: bool = True,
+    pending_interaction: str | None = None,
+    current_prompt_id: str | None = None,
+    in_flight: bool = False,
+    turn_id: int | None = None,
+    pending_approvals: tuple[ApprovalRequestView, ...] = (),
+    pending_questions: tuple[QuestionRequestView, ...] = (),
+) -> SessionSnapshot:
+    return SessionSnapshot(
+        as_of_seq=as_of_seq,
+        epoch=epoch,
+        busy=busy,
+        pending_interaction=pending_interaction,
+        current_prompt_id=current_prompt_id,
+        in_flight=in_flight,
+        pending_approval_ids=tuple(view.approval_id for view in pending_approvals),
+        pending_question_ids=tuple(view.question_id for view in pending_questions),
+        in_flight_turn_id=turn_id,
+        pending_approvals=pending_approvals,
+        pending_questions=pending_questions,
+    )
+
+
+def make_message(
+    text: str,
+    *,
+    sender: str = ADMIN_OPEN_ID,
+    chat_id: str = CHAT_ID,
+    message_id: str = "om_in_1",
+) -> InboundMessage:
+    return InboundMessage(
+        message_id=message_id,
+        chat_id=chat_id,
+        chat_type="p2p",
+        msg_type="text",
+        text=text,
+        sender_open_id=sender,
+        sender_user_id="u_1",
+        sender_type="user",
+        bot_mentioned=False,
+        mentions=[],
+        thread_id="",
+        root_id="",
+        parent_id="",
+        create_time=0,
+    )
+
+
+def make_card_action(
+    value: dict,
+    *,
+    operator: str = ADMIN_OPEN_ID,
+    chat_id: str = CHAT_ID,
+) -> CardAction:
+    return CardAction(
+        operator_open_id=operator,
+        operator_user_id="u_1",
+        chat_id=chat_id,
+        message_id="om_card_action",
+        value=value,
+    )
+
+
+class PipelineTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.data_dir = pathlib.Path(self._tmp.name)
+        self.store = BindingStore(self.data_dir)
+        self.terminal_store = TerminalResultStore(self.data_dir)
+        self.cursor_store = EventCursorStore(self.data_dir)
+        self.transport = FakeTransport()
+        self.rest = FakeInteractionRest()
+        self.rest.add_session(SESSION_ID)
+        self.loop = RuntimeLoop(name="test-loop")
+        self.addCleanup(self.loop.stop)
+        self.timers = ManualTimerFactory()
+        self.ownership = PromptOwnership()
+        self.pipeline = EventPipeline(
+            transport=self.transport,
+            rest=self.rest,
+            binding_store=self.store,
+            terminal_store=self.terminal_store,
+            ownership=self.ownership,
+            runtime_loop=self.loop,
+            cursor_store=self.cursor_store,
+            approval_timeout_seconds=300,
+            question_timeout_seconds=300,
+            timer_factory=self.timers,
+        )
+        self.handler = OutboundAppHandler(
+            event_pipeline=self.pipeline,
+            transport=self.transport,
+            rest=self.rest,
+            binding_store=self.store,
+            runtime_loop=self.loop,
+            config={
+                "admin_open_ids": [ADMIN_OPEN_ID, OTHER_OPEN_ID],
+                "default_working_dir": "/work",
+            },
+            init_token=INIT_TOKEN,
+            prompt_ownership=self.ownership,
+            persist_admins=lambda ids: None,
+        )
+
+    # -- helpers ---------------------------------------------------------------
+
+    def flush(self) -> None:
+        """Wait until every queued loop task has run."""
+        self.loop.call(lambda: None)
+
+    def bind(self, chat_id: str = CHAT_ID, session_id: str = SESSION_ID, *, attached: bool = True) -> None:
+        self.store.save(
+            chat_id,
+            {
+                "session_id": session_id,
+                "attached": attached,
+                "permission_mode": "auto",
+                "plan_mode": False,
+            },
+        )
+
+    def feed(self, event: KapEvent) -> None:
+        self.pipeline.handle_event(event)
+        self.flush()
+
+    def start_prompt(
+        self,
+        *,
+        chat_id: str = CHAT_ID,
+        prompt_id: str = "p-1",
+        turn_id: int = 1,
+        prompt: str = "做点事",
+    ) -> str:
+        """Drive turn.started; returns the execution card message id."""
+        self.rest.set_prompts(SESSION_ID, active=prompt_id)
+        self.feed(turn_started(turn_id=turn_id, prompt=prompt))
+        sent = self.transport.cards_to(chat_id)
+        assert sent, "expected an execution card"
+        return sent[-1]["message_id"]
+
+
+# ---------------------------------------------------------------------------
+# turn.* / tool.call.* -> execution card lifecycle
+# ---------------------------------------------------------------------------
+
+
+class ExecutionCardTests(PipelineTestCase):
+    def test_turn_started_creates_card_in_every_attached_chat(self) -> None:
+        self.bind(CHAT_ID)
+        self.bind(CHAT_ID_2)
+        self.rest.set_prompts(SESSION_ID, active="p-1", queued=("p-2",))
+
+        self.feed(turn_started(prompt="写个脚本"))
+
+        for chat_id in (CHAT_ID, CHAT_ID_2):
+            sent = self.transport.cards_to(chat_id)
+            self.assertEqual(len(sent), 1)
+            content = json.dumps(sent[0]["content"], ensure_ascii=False)
+            self.assertIn("写个脚本", content)
+            self.assertIn("还有 1 条 prompt 排队中", content)
+
+    def test_detached_and_unbound_chats_get_no_card(self) -> None:
+        self.bind(CHAT_ID, attached=False)
+        self.bind(CHAT_ID_2)
+        self.rest.set_prompts(SESSION_ID, active="p-1")
+
+        self.feed(turn_started())
+
+        self.assertEqual(self.transport.cards_to(CHAT_ID), [])
+        self.assertEqual(len(self.transport.cards_to(CHAT_ID_2)), 1)
+
+    def test_turn_started_without_active_prompt_creates_no_card(self) -> None:
+        self.bind(CHAT_ID)
+        self.rest.set_prompts(SESSION_ID, active=None)
+
+        self.feed(turn_started())
+
+        self.assertEqual(self.transport.cards_to(CHAT_ID), [])
+
+    def test_tool_events_patch_only_the_anchor_card(self) -> None:
+        self.bind(CHAT_ID)
+        message_id = self.start_prompt()
+
+        self.feed(
+            kap_event(
+                "tool.call.started",
+                {
+                    "turnId": 1,
+                    "toolCallId": "tc-1",
+                    "name": "Bash",
+                    "display": {"kind": "command", "command": "ls -la"},
+                },
+            )
+        )
+        patches = self.transport.patches_to(message_id)
+        self.assertEqual(len(patches), 1)
+        self.assertIn("Bash", json.dumps(patches[0], ensure_ascii=False))
+        self.assertIn("ls -la", json.dumps(patches[0], ensure_ascii=False))
+
+        # An event for another turn/prompt must not touch the anchored card.
+        self.feed(
+            kap_event(
+                "tool.call.started",
+                {"turnId": 99, "toolCallId": "tc-x", "name": "Edit"},
+            )
+        )
+        self.assertEqual(len(self.transport.patches_to(message_id)), 1)
+
+        self.feed(
+            kap_event("tool.result", {"turnId": 1, "toolCallId": "tc-1", "isError": False})
+        )
+        patches = self.transport.patches_to(message_id)
+        self.assertEqual(len(patches), 2)
+        self.assertIn("✅", json.dumps(patches[-1], ensure_ascii=False))
+
+        self.feed(
+            kap_event(
+                "tool.call.started",
+                {"turnId": 1, "toolCallId": "tc-2", "name": "Bash", "display": {"kind": "command", "command": "false"}},
+            )
+        )
+        self.feed(
+            kap_event("tool.result", {"turnId": 1, "toolCallId": "tc-2", "isError": True})
+        )
+        self.assertIn("❌", json.dumps(self.transport.patches_to(message_id)[-1], ensure_ascii=False))
+
+    def test_turn_ended_sends_terminal_card_and_freezes_execution_card(self) -> None:
+        self.bind(CHAT_ID)
+        message_id = self.start_prompt()
+
+        self.feed(kap_event("turn.ended", {"turnId": 1, "reason": "completed"}))
+
+        sent = self.transport.cards_to(CHAT_ID)
+        self.assertEqual(len(sent), 2)  # execution card + terminal card
+        terminal = sent[-1]["content"]
+        rendered = json.dumps(terminal, ensure_ascii=False)
+        self.assertIn("最终答复文本", rendered)
+        # The execution card was patched to frozen-done.
+        patches = self.transport.patches_to(message_id)
+        self.assertEqual(len(patches), 1)
+        self.assertIn("已结束", json.dumps(patches[0], ensure_ascii=False))
+        # The terminal text is persisted for /last-style reads.
+        records = self.terminal_store.list_all()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].final_reply_text, "最终答复文本")
+        self.assertEqual(records[0].session_id, SESSION_ID)
+        # The anchor is gone: later prompt-scoped events touch nothing.
+        self.feed(
+            kap_event(
+                "tool.call.started",
+                {"turnId": 1, "toolCallId": "tc-late", "name": "Bash"},
+            )
+        )
+        self.assertEqual(len(self.transport.patches_to(message_id)), 1)
+
+    def test_turn_ended_failed_uses_upstream_error_text(self) -> None:
+        self.bind(CHAT_ID)
+        self.start_prompt()
+
+        self.feed(
+            kap_event(
+                "turn.ended",
+                {
+                    "turnId": 1,
+                    "reason": "failed",
+                    "error": {"code": "provider.api_error", "message": "上游模型报错", "retryable": False},
+                },
+            )
+        )
+
+        terminal = self.transport.cards_to(CHAT_ID)[-1]["content"]
+        rendered = json.dumps(terminal, ensure_ascii=False)
+        self.assertIn("失败", rendered)
+        self.assertIn("上游模型报错", rendered)
+
+    def test_prompt_aborted_produces_aborted_terminal_card(self) -> None:
+        self.bind(CHAT_ID)
+        self.start_prompt()
+
+        self.feed(kap_event("prompt.aborted", {"promptId": "p-1", "abortedAt": "2026-01-01T00:00:00Z"}))
+
+        terminal = self.transport.cards_to(CHAT_ID)[-1]["content"]
+        self.assertIn("已中止", json.dumps(terminal, ensure_ascii=False))
+
+    def test_terminal_is_idempotent_across_abort_and_turn_end(self) -> None:
+        self.bind(CHAT_ID)
+        self.start_prompt()
+
+        self.feed(kap_event("prompt.aborted", {"promptId": "p-1", "abortedAt": "2026-01-01T00:00:00Z"}))
+        self.feed(kap_event("turn.ended", {"turnId": 1, "reason": "cancelled"}))
+
+        # Exactly one terminal card despite two terminal-class events.
+        self.assertEqual(len(self.transport.cards_to(CHAT_ID)), 2)
+
+    def test_queue_abort_refreshes_queue_depth_on_running_card(self) -> None:
+        self.bind(CHAT_ID)
+        message_id = self.start_prompt()
+        self.rest.set_prompts(SESSION_ID, active="p-1", queued=("p-2",))
+        self.pipeline.handle_event(kap_event("prompt.steered", {"activePromptId": "p-1", "promptIds": ["p-2"]}))
+        self.flush()
+        self.assertIn(
+            "还有 1 条 prompt 排队中",
+            json.dumps(self.transport.patches_to(message_id)[-1], ensure_ascii=False),
+        )
+
+        self.rest.set_prompts(SESSION_ID, active="p-1", queued=())
+        self.feed(kap_event("prompt.aborted", {"promptId": "p-2", "abortedAt": "2026-01-01T00:00:00Z"}))
+
+        # No terminal card for the queued prompt; the running card was patched.
+        self.assertEqual(len(self.transport.cards_to(CHAT_ID)), 1)
+        self.assertNotIn(
+            "排队中",
+            json.dumps(self.transport.patches_to(message_id)[-1], ensure_ascii=False),
+        )
+
+    def test_work_changed_tracks_session_work_state(self) -> None:
+        self.feed(
+            kap_event(
+                "event.session.work_changed",
+                {"busy": True, "pending_interaction": "approval"},
+            )
+        )
+        busy, pending = self.loop.call(self.pipeline.work_state_of, SESSION_ID)
+        self.assertTrue(busy)
+        self.assertEqual(pending, "approval")
+
+        self.feed(
+            kap_event(
+                "event.session.work_changed",
+                {"busy": False, "pending_interaction": "none", "last_turn_reason": "completed"},
+            )
+        )
+        busy, pending = self.loop.call(self.pipeline.work_state_of, SESSION_ID)
+        self.assertFalse(busy)
+        self.assertEqual(pending, "none")
+
+
+# ---------------------------------------------------------------------------
+# approval.* lifecycle
+# ---------------------------------------------------------------------------
+
+
+class ApprovalTests(PipelineTestCase):
+    def _start_and_request_approval(self, *, certainty: str = "certain") -> str:
+        self.bind(CHAT_ID)
+        self.bind(CHAT_ID_2)
+        message_id = self.start_prompt()
+        if certainty == "certain":
+            self.ownership.record("p-1", CHAT_ID)
+        elif certainty == "best_effort":
+            self.ownership.record_best_effort("p-1", CHAT_ID)
+        self.feed(approval_requested())
+        return message_id
+
+    def test_approval_card_goes_to_owner_only_others_get_notice(self) -> None:
+        self._start_and_request_approval()
+
+        owner_cards = self.transport.cards_to(CHAT_ID)
+        approval_card = owner_cards[-1]["content"]
+        rendered = json.dumps(approval_card, ensure_ascii=False)
+        self.assertIn("审批请求", rendered)
+        self.assertIn("Bash", rendered)
+        self.assertIn("rm -rf build/", rendered)
+        self.assertIn("批准", rendered)
+        # The other attached chat gets the read-only notice, not the approval
+        # card (its only card is the broadcast execution card, §3).
+        other_cards = self.transport.cards_to(CHAT_ID_2)
+        self.assertEqual(len(other_cards), 1)
+        self.assertNotIn("审批请求", json.dumps(other_cards[0]["content"], ensure_ascii=False))
+        notices = self.transport.texts_to(CHAT_ID_2)
+        self.assertEqual(len(notices), 1)
+        self.assertIn("等待 `p-1` 号 prompt 的发起者处理审批", notices[0])
+        # The timeout timer is running.
+        self.assertEqual(len(self.timers.live), 1)
+        self.assertEqual(self.timers.live[0].delay, 300)
+
+    def test_best_effort_ownership_gets_expired_card_no_timer(self) -> None:
+        self._start_and_request_approval(certainty="best_effort")
+
+        card = self.transport.cards_to(CHAT_ID)[-1]["content"]
+        rendered = json.dumps(card, ensure_ascii=False)
+        self.assertIn("已过期", rendered)
+        self.assertNotIn("批准", rendered)
+        self.assertEqual(self.timers.live, [])
+
+    def test_unknown_ownership_expires_to_all_attached_chats(self) -> None:
+        self._start_and_request_approval(certainty="unknown")
+
+        for chat_id in (CHAT_ID, CHAT_ID_2):
+            card = self.transport.cards_to(chat_id)[-1]["content"]
+            self.assertIn("已过期", json.dumps(card, ensure_ascii=False))
+        self.assertEqual(self.timers.live, [])
+
+    def test_external_resolution_freezes_card_and_cancels_timer(self) -> None:
+        self._start_and_request_approval()
+        card_message_id = self.transport.cards_to(CHAT_ID)[-1]["message_id"]
+
+        self.feed(
+            kap_event(
+                "event.approval.resolved",
+                {"approval_id": "a-1", "decision": "approved", "resolved_at": "2026-01-01T00:00:00Z"},
+            )
+        )
+
+        patches = self.transport.patches_to(card_message_id)
+        self.assertEqual(len(patches), 1)
+        self.assertIn("已批准", json.dumps(patches[0], ensure_ascii=False))
+        self.assertEqual(self.timers.live, [])
+
+    def test_approve_button_resolves_and_freezes(self) -> None:
+        self._start_and_request_approval()
+
+        response = self.handler.on_card_action(
+            make_card_action(
+                {
+                    "action": cards.ACTION_APPROVAL_RESOLVE,
+                    "decision": cards.APPROVAL_DECISION_APPROVED,
+                    "approval_id": "a-1",
+                    "prompt_id": "p-1",
+                }
+            )
+        )
+
+        self.assertEqual(
+            self.rest.approval_resolutions,
+            [{"session_id": SESSION_ID, "approval_id": "a-1", "body": {"decision": "approved"}}],
+        )
+        self.assertIsNotNone(response.card)
+        self.assertIn("已批准", json.dumps(response.card, ensure_ascii=False))
+        self.assertEqual(self.timers.live, [])
+        # A repeated click inside the idempotency window is a notice, not an error.
+        second = self.handler.on_card_action(
+            make_card_action(
+                {
+                    "action": cards.ACTION_APPROVAL_RESOLVE,
+                    "decision": cards.APPROVAL_DECISION_APPROVED,
+                    "approval_id": "a-1",
+                    "prompt_id": "p-1",
+                }
+            )
+        )
+        self.assertEqual(second.toast, cards.APPROVAL_ALREADY_PROCESSED_NOTICE)
+        self.assertEqual(len(self.rest.approval_resolutions), 1)
+
+    def test_40902_on_resolve_freezes_card_with_notice(self) -> None:
+        self._start_and_request_approval()
+        self.rest.resolve_error = KapError(40902, "approval a-1 already resolved")
+
+        response = self.handler.on_card_action(
+            make_card_action(
+                {
+                    "action": cards.ACTION_APPROVAL_RESOLVE,
+                    "decision": cards.APPROVAL_DECISION_REJECTED,
+                    "approval_id": "a-1",
+                    "prompt_id": "p-1",
+                }
+            )
+        )
+
+        self.assertEqual(response.toast, cards.APPROVAL_ALREADY_PROCESSED_NOTICE)
+        self.assertIsNotNone(response.card)
+        self.assertIn("已处理", json.dumps(response.card, ensure_ascii=False))
+
+    def test_reject_with_feedback_two_step_flow(self) -> None:
+        self._start_and_request_approval()
+        card_message_id = self.transport.cards_to(CHAT_ID)[-1]["message_id"]
+
+        response = self.handler.on_card_action(
+            make_card_action(
+                {
+                    "action": cards.ACTION_APPROVAL_REJECT_WITH_FEEDBACK,
+                    "approval_id": "a-1",
+                    "prompt_id": "p-1",
+                }
+            )
+        )
+        self.assertIn("反馈", response.toast or "")
+
+        # Text from a different admin in the same chat is NOT claimed as feedback.
+        self.handler.on_message(make_message("这句话不该被认领", sender=OTHER_OPEN_ID))
+        self.assertEqual(self.rest.approval_resolutions, [])
+
+        self.handler.on_message(make_message("不要删除构建目录", sender=ADMIN_OPEN_ID))
+
+        self.assertEqual(
+            self.rest.approval_resolutions,
+            [
+                {
+                    "session_id": SESSION_ID,
+                    "approval_id": "a-1",
+                    "body": {"decision": "rejected", "feedback": "不要删除构建目录"},
+                }
+            ],
+        )
+        patches = self.transport.patches_to(card_message_id)
+        self.assertIn("已拒绝", json.dumps(patches[-1], ensure_ascii=False))
+        self.assertIn("不要删除构建目录", json.dumps(patches[-1], ensure_ascii=False))
+        self.assertIn("已拒绝并提交反馈", self.transport.texts_to(CHAT_ID)[-1])
+
+    def test_timeout_auto_rejects_and_notifies_initiator(self) -> None:
+        self._start_and_request_approval()
+        card_message_id = self.transport.cards_to(CHAT_ID)[-1]["message_id"]
+
+        self.timers.fire(0)
+        self.flush()
+
+        # Never auto-approve: the resolution is a rejection.
+        self.assertEqual(
+            self.rest.approval_resolutions,
+            [{"session_id": SESSION_ID, "approval_id": "a-1", "body": {"decision": "rejected"}}],
+        )
+        patch = json.dumps(self.transport.patches_to(card_message_id)[-1], ensure_ascii=False)
+        self.assertIn("已过期", patch)
+        self.assertIn("已自动拒绝", patch)
+        notice = self.transport.texts_to(CHAT_ID)[-1]
+        self.assertIn("已自动拒绝", notice)
+        self.assertIn("不会自动批准", notice)
+
+    def test_resolution_after_timeout_is_ignored(self) -> None:
+        self._start_and_request_approval()
+        card_message_id = self.transport.cards_to(CHAT_ID)[-1]["message_id"]
+        self.timers.fire(0)
+        self.flush()
+        patches_before = len(self.transport.patches_to(card_message_id))
+
+        self.feed(
+            kap_event(
+                "event.approval.resolved",
+                {"approval_id": "a-1", "decision": "approved", "resolved_at": "2026-01-01T00:00:00Z"},
+            )
+        )
+        self.assertEqual(len(self.transport.patches_to(card_message_id)), patches_before)
+
+
+# ---------------------------------------------------------------------------
+# question.* lifecycle (MVP text pass-through)
+# ---------------------------------------------------------------------------
+
+
+class QuestionTests(PipelineTestCase):
+    def _start_and_request_question(self) -> None:
+        self.bind(CHAT_ID)
+        self.bind(CHAT_ID_2)
+        self.start_prompt()
+        self.ownership.record("p-1", CHAT_ID)
+        self.feed(question_requested())
+
+    def test_question_text_goes_to_owner_only_others_get_notice(self) -> None:
+        self._start_and_request_question()
+
+        texts = self.transport.texts_to(CHAT_ID)
+        self.assertEqual(len(texts), 1)
+        self.assertIn("部署到哪个环境？", texts[0])
+        self.assertIn("1. 开发", texts[0])
+        self.assertIn("2. 生产", texts[0])
+        self.assertIn("回复选项编号", texts[0])
+        notices = self.transport.texts_to(CHAT_ID_2)
+        self.assertEqual(len(notices), 1)
+        self.assertIn("等待 `p-1` 号 prompt 的发起者处理", notices[0])
+        self.assertEqual(len(self.timers.live), 1)
+
+    def test_numbered_reply_is_answered_over_rest(self) -> None:
+        self._start_and_request_question()
+
+        self.handler.on_message(make_message("2"))
+
+        self.assertEqual(
+            self.rest.question_answers,
+            [
+                {
+                    "session_id": SESSION_ID,
+                    "question_id": "q-1",
+                    "body": {"answers": {"q_0": {"kind": "single", "option_id": "opt_0_1"}}},
+                }
+            ],
+        )
+        self.assertIn("已提交回答", self.transport.texts_to(CHAT_ID)[-1])
+        # The follow-up resolved event clears the pending question + timer.
+        self.feed(
+            kap_event("event.question.answered", {"question_id": "q-1", "answers": {}, "resolved_at": "2026-01-01T00:00:00Z"})
+        )
+        self.assertEqual(self.timers.live, [])
+
+    def test_other_text_reply(self) -> None:
+        self._start_and_request_question()
+
+        self.handler.on_message(make_message("其他：先发灰度环境"))
+
+        self.assertEqual(
+            self.rest.question_answers[-1]["body"],
+            {"answers": {"q_0": {"kind": "other", "text": "先发灰度环境"}}},
+        )
+
+    def test_out_of_range_reply_is_consumed_with_guidance(self) -> None:
+        self._start_and_request_question()
+
+        self.handler.on_message(make_message("9"))
+
+        self.assertEqual(self.rest.question_answers, [])
+        self.assertIn("无法识别回答", self.transport.texts_to(CHAT_ID)[-1])
+
+    def test_unrelated_text_still_becomes_a_prompt(self) -> None:
+        self._start_and_request_question()
+
+        self.handler.on_message(make_message("顺便帮我看下日志"))
+
+        self.assertEqual(self.rest.question_answers, [])
+        self.assertEqual(len(self.rest.submissions), 1)
+        self.assertIn("已提交", self.transport.texts_to(CHAT_ID)[-1])
+
+    def test_timeout_auto_dismisses_with_notice(self) -> None:
+        self._start_and_request_question()
+
+        self.timers.fire(0)
+        self.flush()
+
+        self.assertEqual(self.rest.dismissals, [(SESSION_ID, "q-1")])
+        self.assertIn("已自动关闭", self.transport.texts_to(CHAT_ID)[-1])
+
+    def test_unknown_ownership_gets_expired_notice(self) -> None:
+        self.bind(CHAT_ID)
+        self.start_prompt()
+        # No ownership recorded.
+        self.feed(question_requested())
+
+        texts = self.transport.texts_to(CHAT_ID)
+        self.assertEqual(len(texts), 1)
+        self.assertIn("已过期", texts[0])
+        self.assertEqual(self.timers.live, [])
+
+
+# ---------------------------------------------------------------------------
+# Snapshot rebuild (resync + restart recovery)
+# ---------------------------------------------------------------------------
+
+
+class RebuildTests(PipelineTestCase):
+    def test_resync_rebuild_refreshes_card_and_adopts_cursor(self) -> None:
+        self.bind(CHAT_ID)
+        message_id = self.start_prompt()
+        self.rest.snapshots[SESSION_ID] = make_snapshot(
+            as_of_seq=42,
+            current_prompt_id="p-1",
+            in_flight=True,
+            turn_id=1,
+        )
+
+        self.pipeline.handle_resync_required(
+            __import__("kite.adapters.kap_server", fromlist=["ResyncRequest"]).ResyncRequest(
+                session_id=SESSION_ID, reason="buffer_overflow", current_seq=42, epoch="e1"
+            )
+        )
+        self.flush()
+
+        cursor = self.cursor_store.get(SESSION_ID)
+        self.assertIsNotNone(cursor)
+        self.assertEqual((cursor.seq, cursor.epoch), (42, "e1"))
+        # The in-flight card was refreshed wholesale (patched in place).
+        self.assertTrue(self.transport.patches_to(message_id))
+        busy, _ = self.loop.call(self.pipeline.work_state_of, SESSION_ID)
+        self.assertTrue(busy)
+
+    def test_rebuild_failure_freezes_card_as_unknown(self) -> None:
+        self.bind(CHAT_ID)
+        message_id = self.start_prompt()
+        self.rest.snapshots[SESSION_ID] = KapTransportError("connection refused")
+
+        self.pipeline.handle_resync_required(
+            __import__("kite.adapters.kap_server", fromlist=["ResyncRequest"]).ResyncRequest(
+                session_id=SESSION_ID, reason=None, current_seq=None, epoch=None
+            )
+        )
+        self.flush()
+
+        patches = self.transport.patches_to(message_id)
+        self.assertEqual(len(patches), 1)
+        rendered = json.dumps(patches[0], ensure_ascii=False)
+        self.assertIn("状态未知", rendered)
+        self.assertIn("kitectl session status", rendered)
+        # The cursor was NOT adopted and the anchor is gone (never patched again).
+        self.assertIsNone(self.cursor_store.get(SESSION_ID))
+        self.feed(
+            kap_event(
+                "tool.call.started",
+                {"turnId": 1, "toolCallId": "tc-1", "name": "Bash"},
+            )
+        )
+        self.assertEqual(len(self.transport.patches_to(message_id)), 1)
+
+    def test_startup_recovery_reanchors_in_flight_card(self) -> None:
+        # kited restart: no in-memory anchors, ownership rebuilt best-effort.
+        self.bind(CHAT_ID)
+        self.ownership.record_best_effort("p-9", CHAT_ID)
+        self.rest.set_prompts(SESSION_ID, active="p-9", queued=("p-10",))
+        self.rest.snapshots[SESSION_ID] = make_snapshot(
+            current_prompt_id="p-9",
+            in_flight=True,
+            turn_id=7,
+        )
+
+        self.pipeline.startup_recovery([SESSION_ID])
+        self.flush()
+
+        sent = self.transport.cards_to(CHAT_ID)
+        self.assertEqual(len(sent), 1)
+        rendered = json.dumps(sent[0]["content"], ensure_ascii=False)
+        self.assertIn("执行中", rendered)
+        self.assertIn("还有 1 条 prompt 排队中", rendered)
+
+    def test_unrebuildable_approval_is_expired_after_restart(self) -> None:
+        # §4.6: ownership rebuilt best-effort can never route an approval card.
+        self.bind(CHAT_ID)
+        self.ownership.record_best_effort("p-9", CHAT_ID)
+        self.rest.set_prompts(SESSION_ID, active="p-9")
+        self.rest.snapshots[SESSION_ID] = make_snapshot(
+            current_prompt_id="p-9",
+            in_flight=True,
+            turn_id=7,
+            pending_interaction="approval",
+            pending_approvals=(
+                ApprovalRequestView(
+                    approval_id="a-old",
+                    turn_id=7,
+                    tool_call_id="tc-1",
+                    tool_name="Bash",
+                    action="execute",
+                    detail="rm -rf /",
+                ),
+            ),
+        )
+
+        self.pipeline.startup_recovery([SESSION_ID])
+        self.flush()
+
+        cards_sent = self.transport.cards_to(CHAT_ID)
+        self.assertEqual(len(cards_sent), 2)  # re-anchored execution card + expired card
+        expired = json.dumps(cards_sent[-1]["content"], ensure_ascii=False)
+        self.assertIn("已过期", expired)
+        self.assertIn("KITE 重启后无法确认该审批的发起者", expired)
+        self.assertEqual(self.timers.live, [])
+        self.assertEqual(self.rest.approval_resolutions, [])
+
+    def test_rebuild_routes_tracked_approval_when_ownership_certain(self) -> None:
+        # Runtime resync (no restart): the prompt was submitted by this
+        # process, so a missed approval.requested can still be routed.
+        self.bind(CHAT_ID)
+        self.start_prompt()
+        self.ownership.record("p-1", CHAT_ID)
+        self.rest.snapshots[SESSION_ID] = make_snapshot(
+            current_prompt_id="p-1",
+            in_flight=True,
+            turn_id=1,
+            pending_interaction="approval",
+            pending_approvals=(
+                ApprovalRequestView(
+                    approval_id="a-2",
+                    turn_id=1,
+                    tool_call_id="tc-9",
+                    tool_name="Write",
+                    action="write",
+                    detail="/tmp/x",
+                ),
+            ),
+        )
+
+        self.pipeline.handle_resync_required(
+            __import__("kite.adapters.kap_server", fromlist=["ResyncRequest"]).ResyncRequest(
+                session_id=SESSION_ID, reason="buffer_overflow", current_seq=None, epoch=None
+            )
+        )
+        self.flush()
+
+        approval_card = self.transport.cards_to(CHAT_ID)[-1]["content"]
+        rendered = json.dumps(approval_card, ensure_ascii=False)
+        self.assertIn("审批请求", rendered)
+        self.assertIn("Write", rendered)
+        self.assertEqual(len(self.timers.live), 1)
+
+    def test_rebuild_freezes_tracked_approval_resolved_elsewhere(self) -> None:
+        self.bind(CHAT_ID)
+        self.start_prompt()
+        self.ownership.record("p-1", CHAT_ID)
+        self.feed(approval_requested())
+        card_message_id = self.transport.cards_to(CHAT_ID)[-1]["message_id"]
+        # The approval is gone upstream (resolved via the web UI while the
+        # event stream was broken).
+        self.rest.snapshots[SESSION_ID] = make_snapshot(
+            current_prompt_id="p-1",
+            in_flight=True,
+            turn_id=1,
+        )
+
+        self.pipeline.handle_resync_required(
+            __import__("kite.adapters.kap_server", fromlist=["ResyncRequest"]).ResyncRequest(
+                session_id=SESSION_ID, reason="epoch_changed", current_seq=None, epoch=None
+            )
+        )
+        self.flush()
+
+        patches = self.transport.patches_to(card_message_id)
+        self.assertEqual(len(patches), 1)
+        self.assertIn("已处理", json.dumps(patches[0], ensure_ascii=False))
+        self.assertEqual(self.timers.live, [])
+
+    def test_snapshot_cursor_never_moves_backwards(self) -> None:
+        from kite.stores.event_cursor_store import EventCursor
+
+        self.bind(CHAT_ID)
+        self.cursor_store.set(SESSION_ID, EventCursor(seq=50, epoch="e1"))
+        self.rest.snapshots[SESSION_ID] = make_snapshot(as_of_seq=42)
+
+        self.pipeline.startup_recovery([SESSION_ID])
+        self.flush()
+
+        cursor = self.cursor_store.get(SESSION_ID)
+        self.assertEqual((cursor.seq, cursor.epoch), (50, "e1"))
+
+
+# ---------------------------------------------------------------------------
+# Small wiring units
+# ---------------------------------------------------------------------------
+
+
+class WiringTests(PipelineTestCase):
+    def test_swappable_rest_fails_closed_until_set(self) -> None:
+        proxy = SwappableKapRest()
+        with self.assertRaises(KapTransportError):
+            proxy.get_prompts(SESSION_ID)
+        proxy.set_client(self.rest)
+        self.assertEqual(proxy.get_prompts(SESSION_ID), PromptQueueState(None, ()))
+
+    def test_ws_hook_defers_when_no_client_and_subscribes_when_set(self) -> None:
+        hook = WsSubscriptionHook()
+        hook("s-1")  # no client yet: logged, not raised
+        ws = FakeWsClient()
+        hook.set_client(ws)
+        hook("s-1")
+        self.assertEqual(ws.subscriptions, ["s-1"])
+
+    def test_shutdown_cancels_all_timers(self) -> None:
+        self.bind(CHAT_ID)
+        self.start_prompt()
+        self.ownership.record("p-1", CHAT_ID)
+        self.feed(approval_requested())
+        self.feed(question_requested())
+        self.assertEqual(len(self.timers.live), 2)
+
+        self.pipeline.shutdown()
+        self.flush()
+
+        self.assertEqual(self.timers.live, [])
+
+
+if __name__ == "__main__":
+    unittest.main()

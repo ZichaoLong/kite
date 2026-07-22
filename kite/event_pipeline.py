@@ -1,0 +1,1579 @@
+"""Outbound path: kap durable events -> Feishu cards and pushes.
+
+Implements the outbound half of the MVP contract
+(docs/architecture/kite-design.md §5-6, docs/contracts/mvp-scope.md §3-4):
+
+- turn.started creates one single-anchor execution card per attached chat
+  bound to the session (prompt attribution comes from kap's prompt FIFO: the
+  turn belongs to the active prompt, learned via ``GET .../prompts`` — the
+  wire event carries no prompt id); tool.call.* and queue-depth changes patch
+  only the anchor-matching card; turn.ended / prompt.aborted send a separate
+  terminal card (text persisted in the terminal result store) and freeze the
+  execution card.
+- approval.requested routes by prompt ownership: a certain owner gets the
+  three-button card, other attached chats get a read-only notice, and a
+  best-effort/unknown owner gets an explicitly expired card (fail-closed,
+  §4.6 — never routed on a guess). approval.resolved from ANY client freezes
+  the card. An approval unanswered for ``approval_timeout_seconds`` is
+  resolved to upstream as rejected and the initiator is notified — never
+  auto-approved (§3).
+- question.requested is the MVP text pass-through: numbered options to the
+  owner chat; numbered replies are claimed via ``try_handle_interaction_reply``
+  and answered over REST; timeout auto-dismisses with a notice.
+- resync_required / startup recovery rebuilds from REST snapshot + prompts
+  and refreshes work state / queue / in-flight cards wholesale; a failed
+  rebuild freezes the session's execution cards as "状态未知" with a
+  `kitectl session status` hint and never guesses (§4.2-4.3).
+
+Threading: every mutation runs on the RuntimeLoop. WS callbacks
+(``handle_event`` / ``handle_resync_required``), timer callbacks, and kited's
+startup recovery all hop onto the loop; blocking REST inside handlers follows
+the same pattern as the inbound path (app_handler).
+
+Only normalized adapter types are consumed here; kap wire schema knowledge
+stays in kite/adapters/kap_server.py. The few REST paths the adapter does not
+type (approval/question resolve, dismiss, messages) live in
+``KapInteractionOps`` below — same discipline as app_handler.KapSessionOps.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+import threading
+import time
+import urllib.parse
+from dataclasses import dataclass, field
+from typing import Any, Callable, Mapping, Optional, Sequence
+
+from kite import cards
+from kite.adapters.kap_server import (
+    ApprovalRequested,
+    ApprovalResolved,
+    DurableEvent,
+    KapError,
+    KapEvent,
+    KapTransportError,
+    PromptAborted,
+    PromptSteered,
+    QuestionItemView,
+    QuestionRequested,
+    QuestionResolved,
+    ResyncRequest,
+    SessionSnapshot,
+    SessionWorkChanged,
+    ToolCallResult,
+    ToolCallStarted,
+    TurnEnded,
+    TurnStarted,
+    normalize_durable_event,
+)
+from kite.app_handler import AppHandler, KapSessionOps
+from kite.cards import ExecutionCardAnchor
+from kite.feishu_transport import CardAction, CardActionResponse, InboundMessage
+from kite.prompt_ownership import CERTAINTY_CERTAIN, PromptOwnership
+from kite.runtime_loop import RuntimeLoop
+from kite.stores.binding_store import BindingStore, StoredBinding
+from kite.stores.event_cursor_store import EventCursorStore
+from kite.stores.terminal_result_store import TerminalResultRecord, TerminalResultStore
+
+logger = logging.getLogger("kite.outbound")
+
+# kap business error codes this path depends on (upstream
+# packages/kap-server/src/protocol/error-codes.ts).
+KAP_ERROR_ALREADY_RESOLVED = 40902
+KAP_ERROR_APPROVAL_NOT_FOUND = 40404
+KAP_ERROR_QUESTION_NOT_FOUND = 40405
+# Upstream quirk: a successful question dismiss replies with code 40909
+# (QUESTION_DISMISSED is the *success* envelope, routes/questions.ts).
+KAP_ERROR_QUESTION_DISMISSED = 40909
+
+_MAX_TOOL_LINES = 30
+_LATEST_ASSISTANT_PAGE_SIZE = 5
+
+_KAP_UNREACHABLE_TOAST = "无法连接 kap-server，操作未完成，请稍后再试。"
+
+
+def _quote(value: str) -> str:
+    return urllib.parse.quote(value, safe="")
+
+
+# ---------------------------------------------------------------------------
+# REST ops for the interaction slice (paths/payload keys live only here)
+# ---------------------------------------------------------------------------
+
+
+class KapInteractionOps:
+    """Typed view of the kap approval/question/messages REST surface.
+
+    Same discipline as app_handler.KapSessionOps: envelope unwrapping and
+    KapError/KapTransportError semantics stay in the adapter's KapRestClient;
+    only wire paths and payload keys live here on the application side.
+    """
+
+    def __init__(self, rest: Any) -> None:
+        self._rest = rest
+
+    def resolve_approval(
+        self,
+        session_id: str,
+        approval_id: str,
+        *,
+        decision: str,
+        feedback: str = "",
+    ) -> None:
+        body: dict[str, Any] = {"decision": decision}
+        if feedback:
+            body["feedback"] = feedback
+        self._rest.call(
+            "POST",
+            f"/sessions/{_quote(session_id)}/approvals/{_quote(approval_id)}",
+            body,
+        )
+
+    def answer_question(
+        self,
+        session_id: str,
+        question_id: str,
+        answers: Mapping[str, Any],
+    ) -> None:
+        self._rest.call(
+            "POST",
+            f"/sessions/{_quote(session_id)}/questions/{_quote(question_id)}",
+            {"answers": dict(answers)},
+        )
+
+    def dismiss_question(self, session_id: str, question_id: str) -> None:
+        try:
+            self._rest.call(
+                "POST",
+                f"/sessions/{_quote(session_id)}/questions/{_quote(question_id)}:dismiss",
+            )
+        except KapError as exc:
+            # The dismiss success envelope carries code 40909 (upstream
+            # quirk); anything else is a real error.
+            if exc.code != KAP_ERROR_QUESTION_DISMISSED:
+                raise
+
+    def latest_assistant_text(self, session_id: str) -> str:
+        """The text of the most recent assistant message (terminal card body).
+
+        Durable turn.ended carries no final text; the transcript is the source
+        of truth. Returns "" when there is nothing to show.
+        """
+        data = self._rest.get(
+            f"/sessions/{_quote(session_id)}/messages?"
+            f"role=assistant&page_size={_LATEST_ASSISTANT_PAGE_SIZE}"
+        )
+        if not isinstance(data, dict):
+            raise KapTransportError("messages: unexpected data shape")
+        items = data.get("items")
+        if not isinstance(items, list):
+            raise KapTransportError("messages: unexpected data shape")
+        for message in reversed(items):
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            parts = [
+                str(part.get("text") or "")
+                for part in message.get("content") or []
+                if isinstance(part, dict) and part.get("type") == "text"
+            ]
+            text = "\n".join(part for part in parts if part).strip()
+            if text:
+                return text
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# Timer abstraction (real timers in kited; manual timers in tests)
+# ---------------------------------------------------------------------------
+
+
+class TimerHandle:
+    """Cancel-able handle returned by the timer factory."""
+
+    def cancel(self) -> None:  # pragma: no cover - interface
+        raise NotImplementedError
+
+
+class _ThreadingTimerHandle(TimerHandle):
+    def __init__(self, timer: threading.Timer) -> None:
+        self._timer = timer
+
+    def cancel(self) -> None:
+        self._timer.cancel()
+
+
+def _threading_timer_factory(delay_seconds: float, callback: Callable[[], None]) -> TimerHandle:
+    timer = threading.Timer(delay_seconds, callback)
+    timer.daemon = True
+    timer.start()
+    return _ThreadingTimerHandle(timer)
+
+
+# ---------------------------------------------------------------------------
+# Pipeline state
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class _ExecutionCardState:
+    """The one current execution card of a chat (design §6 single anchor)."""
+
+    anchor: ExecutionCardAnchor
+    session_title: str
+    prompt_text: str
+    started_at: float  # monotonic
+    queue_length: int = 0
+    tool_lines: list[str] = field(default_factory=list)
+    open_tools: dict[str, int] = field(default_factory=dict)  # tool_call_id -> line index
+
+
+@dataclass(slots=True)
+class _SessionState:
+    """Per-session tracked facts (work state axis + attribution tables)."""
+
+    busy: bool = False
+    pending_interaction: Optional[str] = None
+    last_turn_reason: Optional[str] = None
+    title: Optional[str] = None  # None = not fetched yet
+    turn_prompts: dict[int, str] = field(default_factory=dict)  # turn_id -> prompt_id
+    active_prompt_id: Optional[str] = None
+    queue_depth: int = 0
+
+
+@dataclass(slots=True)
+class _PendingApproval:
+    approval_id: str
+    session_id: str
+    prompt_id: str
+    owner_chat_id: str
+    card_message_id: str  # "" when the card send failed (timer still runs)
+    timer: Optional[TimerHandle]
+    resolved: bool = False
+
+
+@dataclass(slots=True)
+class _PendingQuestion:
+    question_id: str
+    session_id: str
+    prompt_id: str
+    owner_chat_id: str
+    items: tuple[QuestionItemView, ...]
+    timer: Optional[TimerHandle]
+
+
+@dataclass(slots=True)
+class _PendingFeedback:
+    """Reject-with-feedback step 2: the next plain text from this user."""
+
+    approval_id: str
+    chat_id: str
+    operator_open_id: str
+
+
+class _InvalidReply(Exception):
+    """The text looked like an interaction reply but did not parse."""
+
+
+# ---------------------------------------------------------------------------
+# The pipeline
+# ---------------------------------------------------------------------------
+
+
+class EventPipeline:
+    """Durable kap events -> application actions (all mutations on the loop)."""
+
+    def __init__(
+        self,
+        *,
+        transport: Any,
+        rest: Any,
+        binding_store: BindingStore,
+        terminal_store: TerminalResultStore,
+        ownership: PromptOwnership,
+        runtime_loop: RuntimeLoop,
+        cursor_store: Optional[EventCursorStore] = None,
+        approval_timeout_seconds: int = cards.DEFAULT_APPROVAL_TIMEOUT_SECONDS,
+        question_timeout_seconds: int = cards.DEFAULT_QUESTION_TIMEOUT_SECONDS,
+        timer_factory: Callable[[float, Callable[[], None]], TimerHandle] = _threading_timer_factory,
+        monotonic: Callable[[], float] = time.monotonic,
+        on_snapshot_rebuilt: Optional[Callable[[str, SessionSnapshot], None]] = None,
+    ) -> None:
+        self._transport = transport
+        self._rest = rest
+        self._ops = KapInteractionOps(rest)
+        self._session_ops = KapSessionOps(rest)
+        self._binding_store = binding_store
+        self._terminal_store = terminal_store
+        self._ownership = ownership
+        self._loop = runtime_loop
+        self._cursor_store = cursor_store
+        self._approval_timeout = int(approval_timeout_seconds)
+        self._question_timeout = int(question_timeout_seconds)
+        self._timer_factory = timer_factory
+        self._monotonic = monotonic
+        self._on_snapshot_rebuilt = on_snapshot_rebuilt
+
+        self._cards: dict[str, _ExecutionCardState] = {}  # chat_id -> current card
+        self._sessions: dict[str, _SessionState] = {}
+        self._approvals: dict[str, _PendingApproval] = {}
+        self._questions: dict[str, _PendingQuestion] = {}
+        self._pending_feedback: dict[tuple[str, str], _PendingFeedback] = {}
+        self._shutdown = False
+
+    # ------------------------------------------------------------------
+    # Entry points (any thread; hop onto the RuntimeLoop)
+    # ------------------------------------------------------------------
+
+    def handle_event(self, event: KapEvent) -> None:
+        """WS on_event callback: normalize, then dispatch on the loop."""
+        durable = normalize_durable_event(event)
+        if durable is None:
+            return
+        self._loop.submit(self._dispatch, durable)
+
+    def handle_resync_required(self, request: ResyncRequest) -> None:
+        """WS on_resync_required callback: snapshot rebuild on the loop."""
+        self._loop.submit(self._rebuild_session, request.session_id, "resync")
+
+    def startup_recovery(self, session_ids: Sequence[str]) -> None:
+        """kited restart recovery (§4.6): rebuild every bound session from a
+        snapshot so in-flight cards are re-anchored and pending approvals that
+        cannot be rebuilt are explicitly expired."""
+        for session_id in session_ids:
+            self._loop.submit(self._rebuild_session, session_id, "startup")
+
+    def shutdown(self) -> None:
+        """Cancel all pending timers (kited clean shutdown)."""
+        self._loop.submit(self._shutdown_impl)
+
+    # ------------------------------------------------------------------
+    # Introspection (loop-thread state; read via loop.call by tests/kitectl)
+    # ------------------------------------------------------------------
+
+    def work_state_of(self, session_id: str) -> tuple[bool, Optional[str]]:
+        """(busy, pending_interaction) as tracked from work_changed/snapshots."""
+        session = self._sessions.get(session_id)
+        if session is None:
+            return False, None
+        return session.busy, session.pending_interaction
+
+    def set_snapshot_rebuilt_hook(
+        self, hook: Optional[Callable[[str, SessionSnapshot], None]]
+    ) -> None:
+        """Observability hook fired after every successful snapshot rebuild."""
+        self._on_snapshot_rebuilt = hook
+
+    # ------------------------------------------------------------------
+    # Dispatch (RuntimeLoop thread)
+    # ------------------------------------------------------------------
+
+    def _dispatch(self, event: DurableEvent) -> None:
+        if self._shutdown:
+            return
+        try:
+            if isinstance(event, TurnStarted):
+                self._turn_started(event)
+            elif isinstance(event, TurnEnded):
+                self._turn_ended(event)
+            elif isinstance(event, ToolCallStarted):
+                self._tool_call_started(event)
+            elif isinstance(event, ToolCallResult):
+                self._tool_call_result(event)
+            elif isinstance(event, PromptAborted):
+                self._prompt_aborted(event)
+            elif isinstance(event, PromptSteered):
+                self._prompt_steered(event)
+            elif isinstance(event, ApprovalRequested):
+                self._approval_requested(event)
+            elif isinstance(event, ApprovalResolved):
+                self._approval_resolved(event)
+            elif isinstance(event, QuestionRequested):
+                self._question_requested(event)
+            elif isinstance(event, QuestionResolved):
+                self._question_resolved(event)
+            elif isinstance(event, SessionWorkChanged):
+                self._work_changed(event)
+        except Exception:
+            logger.exception("outbound dispatch failed for %r", event)
+
+    def _session(self, session_id: str) -> _SessionState:
+        session = self._sessions.get(session_id)
+        if session is None:
+            session = _SessionState()
+            self._sessions[session_id] = session
+        return session
+
+    # ------------------------------------------------------------------
+    # turn.* / tool.call.* -> execution cards
+    # ------------------------------------------------------------------
+
+    def _turn_started(self, event: TurnStarted) -> None:
+        session = self._session(event.session_id)
+        queue = self._fetch_queue(event.session_id)
+        if queue is not None:
+            session.queue_depth = queue.queue_depth
+            session.active_prompt_id = queue.active_prompt_id
+        prompt_id = queue.active_prompt_id if queue else None
+        if not prompt_id:
+            # The turn cannot be attributed to a prompt; kap FIFO says the
+            # active prompt owns it, so no active prompt means this turn is
+            # not prompt-driven (e.g. a system trigger). Never guess a card
+            # into existence.
+            logger.warning(
+                "turn.started without an active prompt session=%s turn=%s; no card created",
+                event.session_id,
+                event.turn_id,
+            )
+            return
+        session.turn_prompts[event.turn_id] = prompt_id
+        session.busy = True
+        title = self._session_title(event.session_id)
+        logger.info(
+            "prompt started session_id=%s prompt_id=%s turn=%s",
+            event.session_id,
+            prompt_id,
+            event.turn_id,
+        )
+        for chat_id, _binding in self._attached_chats(event.session_id):
+            self._create_execution_card(
+                chat_id, event.session_id, prompt_id, event.prompt_text, title, session.queue_depth
+            )
+
+    def _create_execution_card(
+        self,
+        chat_id: str,
+        session_id: str,
+        prompt_id: str,
+        prompt_text: str,
+        session_title: str,
+        queue_length: int,
+    ) -> None:
+        stale = self._cards.get(chat_id)
+        if stale is not None:
+            # One current card per chat. A stale anchor means its prompt's
+            # terminal event was missed; kap FIFO guarantees it ended. Freeze
+            # it as done (no fabricated terminal card) and replace it.
+            logger.warning(
+                "replacing stale execution card chat=%s prompt=%s",
+                chat_id,
+                stale.anchor.prompt_id,
+            )
+            self._freeze_card_done(stale)
+        card = cards.build_execution_card(
+            session_title=session_title,
+            session_id=session_id,
+            prompt_text=prompt_text,
+            queue_length=queue_length,
+        )
+        message_id = self._send_card(chat_id, card)
+        if not message_id:
+            logger.error("execution card send failed chat=%s prompt=%s", chat_id, prompt_id)
+            return
+        self._cards[chat_id] = _ExecutionCardState(
+            anchor=ExecutionCardAnchor(
+                chat_id=chat_id,
+                session_id=session_id,
+                prompt_id=prompt_id,
+                card_message_id=message_id,
+            ),
+            session_title=session_title,
+            prompt_text=prompt_text,
+            started_at=self._monotonic(),
+            queue_length=queue_length,
+        )
+
+    def _tool_call_started(self, event: ToolCallStarted) -> None:
+        session = self._sessions.get(event.session_id)
+        prompt_id = session.turn_prompts.get(event.turn_id) if session else None
+        if not prompt_id:
+            return
+        line = self._render_tool_line("⏳", event.name, event.detail or event.description)
+        for state in self._cards_for_prompt(event.session_id, prompt_id):
+            if len(state.tool_lines) >= _MAX_TOOL_LINES:
+                continue
+            state.open_tools[event.tool_call_id] = len(state.tool_lines)
+            state.tool_lines.append(line)
+            self._patch_execution_card(state)
+
+    def _tool_call_result(self, event: ToolCallResult) -> None:
+        session = self._sessions.get(event.session_id)
+        prompt_id = session.turn_prompts.get(event.turn_id) if session else None
+        if not prompt_id:
+            return
+        marker = "❌" if event.is_error else "✅"
+        for state in self._cards_for_prompt(event.session_id, prompt_id):
+            index = state.open_tools.pop(event.tool_call_id, None)
+            if index is None or index >= len(state.tool_lines):
+                continue
+            state.tool_lines[index] = marker + state.tool_lines[index][1:]
+            self._patch_execution_card(state)
+
+    @staticmethod
+    def _render_tool_line(marker: str, name: str, detail: str) -> str:
+        name = str(name or "").strip() or "tool"
+        detail = " ".join(str(detail or "").split())
+        if len(detail) > 120:
+            detail = detail[:119] + "…"
+        return f"{marker} `{name}` {detail}".rstrip()
+
+    def _turn_ended(self, event: TurnEnded) -> None:
+        session = self._sessions.get(event.session_id)
+        prompt_id = session.turn_prompts.pop(event.turn_id, None) if session else None
+        if session is not None and session.active_prompt_id == prompt_id:
+            session.active_prompt_id = None
+        if not prompt_id:
+            return
+        if event.reason == "completed":
+            outcome = cards.TERMINAL_COMPLETED
+            text = self._fetch_terminal_text(event.session_id)
+        elif event.reason == "cancelled":
+            outcome = cards.TERMINAL_ABORTED
+            text = ""
+        else:
+            outcome = cards.TERMINAL_FAILED
+            text = event.error_message
+        self._finish_prompt(event.session_id, prompt_id, outcome, text)
+        self._refresh_queue_depth(event.session_id)
+
+    def _prompt_aborted(self, event: PromptAborted) -> None:
+        # Covers both active and queued aborts (spike S2). Queued prompts have
+        # no card; the queue refresh below is their only visible effect.
+        self._finish_prompt(event.session_id, event.prompt_id, cards.TERMINAL_ABORTED, "")
+        self._ownership.forget(event.prompt_id)
+        self._refresh_queue_depth(event.session_id)
+
+    def _prompt_steered(self, event: PromptSteered) -> None:
+        # No steer surface in the MVP; only the queue shape changed.
+        logger.info(
+            "prompt steered session=%s active=%s merged=%s",
+            event.session_id,
+            event.active_prompt_id,
+            event.prompt_ids,
+        )
+        self._refresh_queue_depth(event.session_id)
+
+    def _finish_prompt(
+        self,
+        session_id: str,
+        prompt_id: str,
+        outcome: str,
+        text: str,
+    ) -> None:
+        states = self._cards_for_prompt(session_id, prompt_id)
+        for state in states:
+            self._send_terminal_and_freeze(state, outcome, text)
+            del self._cards[state.anchor.chat_id]
+        if states:
+            logger.info(
+                "prompt ended session_id=%s prompt_id=%s outcome=%s",
+                session_id,
+                prompt_id,
+                outcome,
+            )
+        self._ownership.forget(prompt_id)
+
+    def _send_terminal_and_freeze(
+        self, state: _ExecutionCardState, outcome: str, text: str
+    ) -> None:
+        anchor = state.anchor
+        result_id = anchor.prompt_id
+        checksum = cards.terminal_result_checksum(text)
+        terminal_card = cards.build_terminal_card(
+            outcome=outcome,  # type: ignore[arg-type]
+            text=text,
+            terminal_result_id=result_id,
+            checksum=checksum,
+        )
+        terminal_message_id = self._send_card(anchor.chat_id, terminal_card)
+        self._freeze_card_done(state)
+        if terminal_message_id and text:
+            self._terminal_store.upsert(
+                TerminalResultRecord(
+                    message_id=terminal_message_id,
+                    execution_message_id=anchor.card_message_id,
+                    final_reply_text=text,
+                    recorded_at=time.time(),
+                    terminal_result_id=result_id,
+                    session_id=anchor.session_id,
+                    checksum=checksum,
+                )
+            )
+
+    def _freeze_card_done(self, state: _ExecutionCardState) -> None:
+        card = cards.build_execution_card(
+            session_title=state.session_title,
+            session_id=state.anchor.session_id,
+            prompt_text=state.prompt_text,
+            state=cards.EXECUTION_STATE_FROZEN_DONE,
+            elapsed_seconds=self._elapsed(state),
+            queue_length=0,
+            tool_lines=state.tool_lines,
+        )
+        self._patch_card(state.anchor.card_message_id, card)
+
+    def _fetch_terminal_text(self, session_id: str) -> str:
+        try:
+            return self._ops.latest_assistant_text(session_id)
+        except (KapError, KapTransportError) as exc:
+            # The terminal card still goes out (with the builder's fallback
+            # text); losing the final reply body must not lose the result.
+            logger.warning("terminal text fetch failed session=%s: %s", session_id, exc)
+            return ""
+
+    def _fetch_queue(self, session_id: str):
+        try:
+            return self._session_ops.get_prompts(session_id)
+        except (KapError, KapTransportError) as exc:
+            logger.warning("prompts fetch failed session=%s: %s", session_id, exc)
+            return None
+
+    def _refresh_queue_depth(self, session_id: str) -> None:
+        queue = self._fetch_queue(session_id)
+        if queue is None:
+            return
+        session = self._session(session_id)
+        session.queue_depth = queue.queue_depth
+        if queue.active_prompt_id:
+            session.active_prompt_id = queue.active_prompt_id
+        for state in list(self._cards.values()):
+            if state.anchor.session_id != session_id:
+                continue
+            state.queue_length = queue.queue_depth
+            self._patch_execution_card(state)
+
+    def _work_changed(self, event: SessionWorkChanged) -> None:
+        session = self._session(event.session_id)
+        session.busy = event.busy
+        session.pending_interaction = event.pending_interaction
+        if event.last_turn_reason:
+            session.last_turn_reason = event.last_turn_reason
+
+    # ------------------------------------------------------------------
+    # approval.* -> approval cards, read-only notices, timeouts
+    # ------------------------------------------------------------------
+
+    def _approval_requested(self, event: ApprovalRequested) -> None:
+        if event.approval_id in self._approvals:
+            return  # replayed duplicate
+        prompt_id = self._attribute_prompt(event.session_id, event.turn_id)
+        if prompt_id is None:
+            logger.warning(
+                "approval %s cannot be attributed to a prompt; expiring", event.approval_id
+            )
+            self._send_approval_expired(event.session_id, None, reason="无法确定所属 prompt")
+            return
+        self._route_approval(
+            session_id=event.session_id,
+            approval_id=event.approval_id,
+            prompt_id=prompt_id,
+            tool_name=event.tool_name,
+            action=event.action,
+            detail=event.detail,
+        )
+
+    def _attribute_prompt(self, session_id: str, turn_id: Optional[int]) -> Optional[str]:
+        """turn_id -> prompt_id, with kap FIFO fallbacks. None = unattributable."""
+        session = self._session(session_id)
+        if turn_id is not None and turn_id in session.turn_prompts:
+            return session.turn_prompts[turn_id]
+        if session.active_prompt_id:
+            return session.active_prompt_id
+        queue = self._fetch_queue(session_id)
+        if queue is not None and queue.active_prompt_id:
+            session.active_prompt_id = queue.active_prompt_id
+            return queue.active_prompt_id
+        return None
+
+    def _route_approval(
+        self,
+        *,
+        session_id: str,
+        approval_id: str,
+        prompt_id: str,
+        tool_name: str,
+        action: str,
+        detail: str,
+    ) -> None:
+        entry = self._ownership.entry_of(prompt_id)
+        attached = dict(self._attached_chats(session_id))
+        owner_chat = entry.chat_id if entry is not None else ""
+        if entry is None or entry.certainty != CERTAINTY_CERTAIN or owner_chat not in attached:
+            # Fail-closed (§4.6): never route an actionable approval card on a
+            # best-effort guess; close it out as expired instead.
+            if entry is not None and entry.certainty == CERTAINTY_CERTAIN:
+                reason = "该审批的发起聊天当前不可达"
+            elif entry is not None:
+                reason = "KITE 重启后无法确认该审批的发起者"
+            else:
+                reason = "无法确定该审批的发起者"
+            targets = [owner_chat] if owner_chat in attached else list(attached)
+            self._send_approval_expired(session_id, targets, reason=reason, prompt_id=prompt_id)
+            return
+        card = cards.build_approval_card(
+            approval_id=approval_id,
+            prompt_id=prompt_id,
+            tool_name=tool_name,
+            action=action,
+            detail=detail,
+            timeout_seconds=self._approval_timeout,
+        )
+        message_id = self._send_card(owner_chat, card)
+        if not message_id:
+            logger.error(
+                "approval card send failed chat=%s approval=%s", owner_chat, approval_id
+            )
+        timer = self._start_timer(
+            self._approval_timeout, self._approval_timed_out, approval_id
+        )
+        self._approvals[approval_id] = _PendingApproval(
+            approval_id=approval_id,
+            session_id=session_id,
+            prompt_id=prompt_id,
+            owner_chat_id=owner_chat,
+            card_message_id=message_id or "",
+            timer=timer,
+        )
+        logger.info(
+            "approval requested session_id=%s prompt_id=%s approval_id=%s owner=%s",
+            session_id,
+            prompt_id,
+            approval_id,
+            owner_chat,
+        )
+        notice = f"⏳ 该会话有一个审批待处理：等待 `{prompt_id}` 号 prompt 的发起者处理审批。"
+        for chat_id in attached:
+            if chat_id != owner_chat:
+                self._send_text(chat_id, notice)
+
+    def _send_approval_expired(
+        self,
+        session_id: str,
+        chat_ids: Optional[Sequence[str]],
+        *,
+        reason: str,
+        prompt_id: str = "",
+    ) -> None:
+        card = cards.build_approval_expired_card(reason=reason)
+        targets = list(chat_ids) if chat_ids is not None else [
+            chat_id for chat_id, _ in self._attached_chats(session_id)
+        ]
+        for chat_id in targets:
+            self._send_card(chat_id, card)
+        logger.info(
+            "approval expired card posted session=%s prompt=%s targets=%s",
+            session_id,
+            prompt_id or "-",
+            targets,
+        )
+
+    def _approval_resolved(self, event: ApprovalResolved) -> None:
+        """Freeze the card everywhere (resolution may come from any client,
+        e.g. the web UI — spike S1 broadcasts approval.resolved to all)."""
+        pending = self._approvals.pop(event.approval_id, None)
+        if pending is None:
+            return
+        self._cancel_timer(pending)
+        if pending.card_message_id:
+            self._patch_card(
+                pending.card_message_id,
+                cards.build_approval_resolved_card(
+                    decision=event.decision, feedback=event.feedback
+                ),
+            )
+        logger.info(
+            "approval resolved session_id=%s approval_id=%s decision=%s",
+            event.session_id,
+            event.approval_id,
+            event.decision,
+        )
+
+    def _approval_timed_out(self, approval_id: str) -> None:
+        pending = self._approvals.get(approval_id)
+        if pending is None or pending.resolved:
+            return
+        self._approvals.pop(approval_id, None)
+        try:
+            self._ops.resolve_approval(
+                pending.session_id, approval_id, decision=cards.APPROVAL_DECISION_REJECTED
+            )
+        except KapError as exc:
+            if exc.code in (KAP_ERROR_ALREADY_RESOLVED, KAP_ERROR_APPROVAL_NOT_FOUND):
+                # Resolved (or dropped) upstream meanwhile: freeze as handled.
+                if pending.card_message_id:
+                    self._patch_card(
+                        pending.card_message_id,
+                        cards.build_approval_resolved_card(decision=""),
+                    )
+                return
+            logger.warning("approval timeout resolve failed %s: %s", approval_id, exc)
+            self._approvals[approval_id] = pending
+            return
+        except KapTransportError as exc:
+            # kap is unreachable: keep tracking — the approval is still
+            # pending upstream and the card buttons still work; the timeout
+            # does not retry (one-shot), but a later approval.resolved event
+            # or snapshot rebuild closes the card out.
+            logger.warning("approval timeout resolve unreachable %s: %s", approval_id, exc)
+            self._approvals[approval_id] = pending
+            return
+        # Never auto-approve (§3): timeout = rejected + explicit notification.
+        if pending.card_message_id:
+            self._patch_card(
+                pending.card_message_id,
+                cards.build_approval_expired_card(reason="超时未处理，已自动拒绝"),
+            )
+        self._send_text(
+            pending.owner_chat_id,
+            f"⏰ 审批 `{approval_id}` 超过 {self._approval_timeout // 60} 分钟未处理，"
+            "已自动拒绝（KITE 不会自动批准）。",
+        )
+        logger.info(
+            "approval timed out and rejected session_id=%s approval_id=%s",
+            pending.session_id,
+            approval_id,
+        )
+
+    # ------------------------------------------------------------------
+    # Approval card actions + reject-with-feedback (AppHandler seams)
+    # ------------------------------------------------------------------
+
+    def handle_approval_action(self, action: CardAction) -> CardActionResponse:
+        """Approval card buttons (AppHandler E3 seam; runs on the loop)."""
+        name = str(action.value.get("action") or "")
+        approval_id = str(action.value.get("approval_id") or "").strip()
+        pending = self._approvals.get(approval_id)
+        if not approval_id or pending is None or pending.resolved:
+            return CardActionResponse(toast=cards.APPROVAL_ALREADY_PROCESSED_NOTICE)
+        if pending.owner_chat_id != action.chat_id:
+            logger.warning(
+                "approval action from foreign chat approval=%s chat=%s",
+                approval_id,
+                action.chat_id,
+            )
+            return CardActionResponse(toast="该审批只能由发起聊天处理。", toast_type="error")
+        if name == cards.ACTION_APPROVAL_RESOLVE:
+            decision = str(action.value.get("decision") or "").strip()
+            if decision not in (
+                cards.APPROVAL_DECISION_APPROVED,
+                cards.APPROVAL_DECISION_REJECTED,
+            ):
+                return CardActionResponse(toast="未知的审批操作。", toast_type="error")
+            return self._resolve_approval_from_card(pending, decision)
+        if name == cards.ACTION_APPROVAL_REJECT_WITH_FEEDBACK:
+            self._pending_feedback[(action.chat_id, action.operator_open_id)] = _PendingFeedback(
+                approval_id=approval_id,
+                chat_id=action.chat_id,
+                operator_open_id=action.operator_open_id,
+            )
+            return CardActionResponse(
+                toast="请直接回复一段文字作为拒绝反馈（你的下一条消息将作为反馈提交）。"
+            )
+        return CardActionResponse()
+
+    def _resolve_approval_from_card(
+        self, pending: _PendingApproval, decision: str, *, feedback: str = ""
+    ) -> CardActionResponse:
+        try:
+            self._ops.resolve_approval(
+                pending.session_id, pending.approval_id, decision=decision, feedback=feedback
+            )
+        except KapError as exc:
+            if exc.code == KAP_ERROR_ALREADY_RESOLVED:
+                # §4.4: idempotency conflict -> "已被处理", card freezes.
+                self._close_approval(pending)
+                return CardActionResponse(
+                    card=cards.build_approval_resolved_card(decision=""),
+                    toast=cards.APPROVAL_ALREADY_PROCESSED_NOTICE,
+                )
+            return CardActionResponse(toast=f"审批处理失败：{exc.msg}", toast_type="error")
+        except KapTransportError:
+            return CardActionResponse(toast=_KAP_UNREACHABLE_TOAST, toast_type="error")
+        self._close_approval(pending)
+        label = "已批准" if decision == cards.APPROVAL_DECISION_APPROVED else "已拒绝"
+        return CardActionResponse(
+            card=cards.build_approval_resolved_card(decision=decision, feedback=feedback),
+            toast=f"{label}。",
+        )
+
+    def _close_approval(self, pending: _PendingApproval) -> None:
+        pending.resolved = True
+        self._approvals.pop(pending.approval_id, None)
+        self._cancel_timer(pending)
+
+    # ------------------------------------------------------------------
+    # question.* -> MVP text pass-through with numbered replies
+    # ------------------------------------------------------------------
+
+    def _question_requested(self, event: QuestionRequested) -> None:
+        if event.question_id in self._questions:
+            return  # replayed duplicate
+        prompt_id = self._attribute_prompt(event.session_id, event.turn_id)
+        if prompt_id is None:
+            logger.warning(
+                "question %s cannot be attributed to a prompt; expiring", event.question_id
+            )
+            self._send_question_expired(event.session_id, None)
+            return
+        entry = self._ownership.entry_of(prompt_id)
+        attached = dict(self._attached_chats(event.session_id))
+        owner_chat = entry.chat_id if entry is not None else ""
+        if entry is None or entry.certainty != CERTAINTY_CERTAIN or owner_chat not in attached:
+            targets = [owner_chat] if owner_chat in attached else list(attached)
+            self._send_question_expired(event.session_id, targets, prompt_id=prompt_id)
+            return
+        specs = tuple(_question_spec(item) for item in event.items)
+        self._send_text(
+            owner_chat,
+            cards.build_question_text(specs, timeout_seconds=self._question_timeout),
+        )
+        timer = self._start_timer(
+            self._question_timeout, self._question_timed_out, event.question_id
+        )
+        self._questions[event.question_id] = _PendingQuestion(
+            question_id=event.question_id,
+            session_id=event.session_id,
+            prompt_id=prompt_id,
+            owner_chat_id=owner_chat,
+            items=event.items,
+            timer=timer,
+        )
+        logger.info(
+            "question requested session_id=%s prompt_id=%s question_id=%s owner=%s",
+            event.session_id,
+            prompt_id,
+            event.question_id,
+            owner_chat,
+        )
+        notice = f"⏳ 该会话有一个问题待回答：等待 `{prompt_id}` 号 prompt 的发起者处理。"
+        for chat_id in attached:
+            if chat_id != owner_chat:
+                self._send_text(chat_id, notice)
+
+    def _send_question_expired(
+        self,
+        session_id: str,
+        chat_ids: Optional[Sequence[str]],
+        *,
+        prompt_id: str = "",
+    ) -> None:
+        targets = list(chat_ids) if chat_ids is not None else [
+            chat_id for chat_id, _ in self._attached_chats(session_id)
+        ]
+        for chat_id in targets:
+            self._send_text(
+                chat_id, "该问题已过期（KITE 无法确认发起者）。请在本地直接处理。"
+            )
+        logger.info(
+            "question expired notice posted session=%s prompt=%s targets=%s",
+            session_id,
+            prompt_id or "-",
+            targets,
+        )
+
+    def _question_resolved(self, event: QuestionResolved) -> None:
+        pending = self._questions.pop(event.question_id, None)
+        if pending is None:
+            return
+        if pending.timer is not None:
+            pending.timer.cancel()
+        logger.info(
+            "question resolved session_id=%s question_id=%s dismissed=%s",
+            event.session_id,
+            event.question_id,
+            event.dismissed,
+        )
+
+    def _question_timed_out(self, question_id: str) -> None:
+        pending = self._questions.pop(question_id, None)
+        if pending is None:
+            return
+        try:
+            self._ops.dismiss_question(pending.session_id, question_id)
+        except KapError as exc:
+            if exc.code in (KAP_ERROR_ALREADY_RESOLVED, KAP_ERROR_QUESTION_NOT_FOUND):
+                return  # handled upstream meanwhile
+            logger.warning("question dismiss failed %s: %s", question_id, exc)
+            return
+        except KapTransportError as exc:
+            # Keep tracking: the question is still pending upstream and the
+            # user can still answer it; a rebuild closes it out eventually.
+            logger.warning("question dismiss unreachable %s: %s", question_id, exc)
+            self._questions[question_id] = pending
+            return
+        self._send_text(
+            pending.owner_chat_id,
+            f"⏰ 问题 `{question_id}` 超过 {self._question_timeout // 60} 分钟未回复，已自动关闭。",
+        )
+
+    # ------------------------------------------------------------------
+    # Interaction replies (AppHandler E3 seam; runs on the loop)
+    # ------------------------------------------------------------------
+
+    def try_handle_interaction_reply(self, message: InboundMessage) -> bool:
+        """First claim on plain text: approval feedback, then question replies."""
+        feedback = self._pending_feedback.get((message.chat_id, message.sender_open_id))
+        if feedback is not None:
+            self._handle_feedback_reply(feedback, message.text.strip())
+            return True
+        question = self._question_for_chat(message.chat_id)
+        if question is None:
+            return False
+        try:
+            answers = _parse_question_reply(message.text, question.items)
+        except _InvalidReply as exc:
+            self._send_text(message.chat_id, f"无法识别回答：{exc}。请按问题里的编号格式回复。")
+            return True
+        if answers is None:
+            return False  # not a reply attempt; let it become a prompt
+        self._handle_question_answers(question, answers)
+        return True
+
+    def _question_for_chat(self, chat_id: str) -> Optional[_PendingQuestion]:
+        for pending in self._questions.values():
+            if pending.owner_chat_id == chat_id:
+                return pending
+        return None
+
+    def _handle_feedback_reply(self, feedback: _PendingFeedback, text: str) -> None:
+        pending = self._approvals.get(feedback.approval_id)
+        if pending is None or pending.resolved:
+            self._pending_feedback.pop((feedback.chat_id, feedback.operator_open_id), None)
+            self._send_text(feedback.chat_id, cards.APPROVAL_ALREADY_PROCESSED_NOTICE)
+            return
+        if not text:
+            self._send_text(feedback.chat_id, "反馈不能为空；请重新发送，或忽略以取消。")
+            return
+        try:
+            self._ops.resolve_approval(
+                pending.session_id,
+                pending.approval_id,
+                decision=cards.APPROVAL_DECISION_REJECTED,
+                feedback=text,
+            )
+        except KapError as exc:
+            if exc.code == KAP_ERROR_ALREADY_RESOLVED:
+                self._pending_feedback.pop((feedback.chat_id, feedback.operator_open_id), None)
+                self._close_approval(pending)
+                if pending.card_message_id:
+                    self._patch_card(
+                        pending.card_message_id,
+                        cards.build_approval_resolved_card(decision=""),
+                    )
+                self._send_text(feedback.chat_id, cards.APPROVAL_ALREADY_PROCESSED_NOTICE)
+            else:
+                self._send_text(feedback.chat_id, f"审批处理失败：{exc.msg}")
+            return
+        except KapTransportError:
+            # Keep the pending feedback so the user can retry (fail-closed).
+            self._send_text(feedback.chat_id, f"{_KAP_UNREACHABLE_TOAST}反馈未提交，请重新发送。")
+            return
+        self._pending_feedback.pop((feedback.chat_id, feedback.operator_open_id), None)
+        self._close_approval(pending)
+        if pending.card_message_id:
+            self._patch_card(
+                pending.card_message_id,
+                cards.build_approval_resolved_card(
+                    decision=cards.APPROVAL_DECISION_REJECTED, feedback=text
+                ),
+            )
+        self._send_text(feedback.chat_id, "已拒绝并提交反馈。")
+
+    def _handle_question_answers(
+        self, pending: _PendingQuestion, answers: Mapping[str, Any]
+    ) -> None:
+        try:
+            self._ops.answer_question(pending.session_id, pending.question_id, answers)
+        except KapError as exc:
+            if exc.code == KAP_ERROR_ALREADY_RESOLVED:
+                self._send_text(pending.owner_chat_id, "该问题已被处理。")
+                self._question_resolved(
+                    QuestionResolved(
+                        session_id=pending.session_id,
+                        question_id=pending.question_id,
+                        dismissed=False,
+                    )
+                )
+            else:
+                self._send_text(pending.owner_chat_id, f"提交回答失败：{exc.msg}")
+            return
+        except KapTransportError:
+            self._send_text(pending.owner_chat_id, f"{_KAP_UNREACHABLE_TOAST}回答未提交。")
+            return
+        self._send_text(pending.owner_chat_id, "已提交回答。")
+        # The matching event.question.answered closes the pending entry.
+
+    # ------------------------------------------------------------------
+    # Snapshot rebuild (resync + startup recovery)
+    # ------------------------------------------------------------------
+
+    def _rebuild_session(self, session_id: str, origin: str) -> None:
+        if not session_id or self._shutdown:
+            return
+        try:
+            snapshot = self._rest.get_snapshot(session_id)
+            queue = self._session_ops.get_prompts(session_id)
+        except (KapError, KapTransportError) as exc:
+            # §4.2/§4.3: freeze the session's cards as "状态未知" with a
+            # kitectl hint — never guess the state.
+            logger.error(
+                "snapshot rebuild failed (%s) session=%s: %s; freezing cards as unknown",
+                origin,
+                session_id,
+                exc,
+            )
+            self._freeze_session_unknown(session_id)
+            return
+        self._adopt_snapshot_cursor(session_id, snapshot)
+        self._apply_snapshot(session_id, snapshot, queue)
+        if self._on_snapshot_rebuilt is not None:
+            try:
+                self._on_snapshot_rebuilt(session_id, snapshot)
+            except Exception:
+                logger.exception("on_snapshot_rebuilt hook failed session=%s", session_id)
+        logger.info(
+            "session rebuilt (%s) session=%s as_of_seq=%d busy=%s",
+            origin,
+            session_id,
+            snapshot.as_of_seq,
+            snapshot.busy,
+        )
+
+    def _adopt_snapshot_cursor(self, session_id: str, snapshot: SessionSnapshot) -> None:
+        """snapshot.as_of_seq is a cursor source of truth (§5); never move the
+        stored cursor backwards (WS replay may already be ahead)."""
+        if self._cursor_store is None:
+            return
+        current = self._cursor_store.get(session_id)
+        incoming = snapshot.cursor
+        if (
+            current is not None
+            and current.epoch == incoming.epoch
+            and current.seq >= incoming.seq
+        ):
+            return
+        self._cursor_store.set(session_id, incoming)
+
+    def _apply_snapshot(self, session_id: str, snapshot: SessionSnapshot, queue: Any) -> None:
+        session = self._session(session_id)
+        session.busy = snapshot.busy
+        session.pending_interaction = snapshot.pending_interaction
+        session.queue_depth = queue.queue_depth
+        session.active_prompt_id = queue.active_prompt_id
+        session.title = None  # refetch lazily on next card build
+        current_prompt = snapshot.current_prompt_id or queue.active_prompt_id
+        if snapshot.in_flight and snapshot.in_flight_turn_id is not None and current_prompt:
+            session.turn_prompts[snapshot.in_flight_turn_id] = current_prompt
+
+        for chat_id, _binding in self._attached_chats(session_id):
+            state = self._cards.get(chat_id)
+            if snapshot.in_flight and current_prompt:
+                if state is not None and state.anchor.matches_prompt(current_prompt):
+                    # Wholesale refresh of the in-flight card.
+                    state.queue_length = queue.queue_depth
+                    self._patch_execution_card(state)
+                elif state is not None:
+                    # The anchored prompt is no longer in flight: it finished
+                    # while we were disconnected and its terminal event is
+                    # lost. kap FIFO says it ended; freeze as done, never
+                    # fabricate a terminal outcome.
+                    logger.warning(
+                        "anchored prompt %s no longer in flight after rebuild; freezing",
+                        state.anchor.prompt_id,
+                    )
+                    self._freeze_card_done(state)
+                    self._create_execution_card(
+                        chat_id,
+                        session_id,
+                        current_prompt,
+                        "",
+                        self._session_title(session_id),
+                        queue.queue_depth,
+                    )
+                else:
+                    self._create_execution_card(
+                        chat_id,
+                        session_id,
+                        current_prompt,
+                        "",
+                        self._session_title(session_id),
+                        queue.queue_depth,
+                    )
+            elif state is not None:
+                logger.warning(
+                    "session idle after rebuild; freezing anchored card prompt=%s",
+                    state.anchor.prompt_id,
+                )
+                self._freeze_card_done(state)
+                del self._cards[chat_id]
+
+        self._rebuild_approvals(session_id, snapshot)
+        self._rebuild_questions(session_id, snapshot)
+
+    def _rebuild_approvals(self, session_id: str, snapshot: SessionSnapshot) -> None:
+        session = self._session(session_id)
+        upstream_pending = {view.approval_id: view for view in snapshot.pending_approvals}
+        # Tracked cards whose approval is gone upstream: resolved elsewhere
+        # while disconnected -> freeze (decision unknown -> "已处理").
+        for approval_id, pending in list(self._approvals.items()):
+            if pending.session_id != session_id:
+                continue
+            if approval_id in upstream_pending:
+                continue
+            self._approvals.pop(approval_id, None)
+            self._cancel_timer(pending)
+            if pending.card_message_id:
+                self._patch_card(
+                    pending.card_message_id,
+                    cards.build_approval_resolved_card(decision=""),
+                )
+        # Untracked pending approvals (their requested event predates us or
+        # was lost): route when ownership is certain, expire otherwise (§4.6).
+        for view in upstream_pending.values():
+            if view.approval_id in self._approvals:
+                continue
+            prompt_id = (
+                session.turn_prompts.get(view.turn_id)
+                if view.turn_id is not None
+                else None
+            ) or session.active_prompt_id
+            if not prompt_id:
+                self._send_approval_expired(session_id, None, reason="无法确定所属 prompt")
+                continue
+            self._route_approval(
+                session_id=session_id,
+                approval_id=view.approval_id,
+                prompt_id=prompt_id,
+                tool_name=view.tool_name,
+                action=view.action,
+                detail=view.detail,
+            )
+
+    def _rebuild_questions(self, session_id: str, snapshot: SessionSnapshot) -> None:
+        session = self._session(session_id)
+        upstream_pending = {view.question_id: view for view in snapshot.pending_questions}
+        for question_id, pending in list(self._questions.items()):
+            if pending.session_id != session_id:
+                continue
+            if question_id in upstream_pending:
+                continue
+            self._questions.pop(question_id, None)
+            if pending.timer is not None:
+                pending.timer.cancel()
+        for view in upstream_pending.values():
+            if view.question_id in self._questions:
+                continue
+            prompt_id = (
+                session.turn_prompts.get(view.turn_id)
+                if view.turn_id is not None
+                else None
+            ) or session.active_prompt_id
+            if not prompt_id:
+                self._send_question_expired(session_id, None)
+                continue
+            self._question_requested(
+                QuestionRequested(
+                    session_id=session_id,
+                    question_id=view.question_id,
+                    turn_id=view.turn_id,
+                    items=view.items,
+                )
+            )
+
+    def _freeze_session_unknown(self, session_id: str) -> None:
+        for chat_id, state in list(self._cards.items()):
+            if state.anchor.session_id != session_id:
+                continue
+            card = cards.build_execution_card(
+                session_title=state.session_title,
+                session_id=session_id,
+                prompt_text=state.prompt_text,
+                state=cards.EXECUTION_STATE_FROZEN_UNKNOWN,
+                elapsed_seconds=self._elapsed(state),
+                queue_length=0,
+                tool_lines=state.tool_lines,
+            )
+            self._patch_card(state.anchor.card_message_id, card)
+            del self._cards[chat_id]
+
+    # ------------------------------------------------------------------
+    # Card/transport helpers
+    # ------------------------------------------------------------------
+
+    def _attached_chats(self, session_id: str) -> list[tuple[str, StoredBinding]]:
+        return [
+            (chat_id, binding)
+            for chat_id, binding in self._binding_store.load_all().items()
+            if binding["session_id"] == session_id and binding["attached"]
+        ]
+
+    def _cards_for_prompt(self, session_id: str, prompt_id: str) -> list[_ExecutionCardState]:
+        """Anchor rule (§6): an event may touch a card iff the anchor matches."""
+        return [
+            state
+            for state in self._cards.values()
+            if state.anchor.session_id == session_id and state.anchor.matches_prompt(prompt_id)
+        ]
+
+    def _session_title(self, session_id: str) -> str:
+        session = self._session(session_id)
+        if session.title is not None:
+            return session.title
+        try:
+            info = self._session_ops.get_session(session_id)
+            session.title = info.title
+        except (KapError, KapTransportError) as exc:
+            logger.warning("session title fetch failed session=%s: %s", session_id, exc)
+            session.title = ""
+        return session.title
+
+    def _elapsed(self, state: _ExecutionCardState) -> int:
+        return max(int(self._monotonic() - state.started_at), 0)
+
+    def _patch_execution_card(self, state: _ExecutionCardState) -> None:
+        card = cards.build_execution_card(
+            session_title=state.session_title,
+            session_id=state.anchor.session_id,
+            prompt_text=state.prompt_text,
+            state=cards.EXECUTION_STATE_RUNNING,
+            elapsed_seconds=self._elapsed(state),
+            queue_length=state.queue_length,
+            tool_lines=state.tool_lines,
+        )
+        self._patch_card(state.anchor.card_message_id, card)
+
+    def _send_card(self, chat_id: str, card: dict) -> str:
+        """Send a card; returns its message id ("" on failure)."""
+        try:
+            return str(
+                self._transport.send_message_get_id(chat_id, "interactive", json.dumps(card))
+                or ""
+            ).strip()
+        except Exception:
+            logger.exception("card send failed chat=%s", chat_id)
+            return ""
+
+    def _patch_card(self, message_id: str, card: dict) -> bool:
+        if not message_id:
+            return False
+        try:
+            return bool(self._transport.patch_message(message_id, json.dumps(card)))
+        except Exception:
+            logger.exception("card patch failed message=%s", message_id)
+            return False
+
+    def _send_text(self, chat_id: str, text: str) -> None:
+        try:
+            self._transport.reply(chat_id, text)
+        except Exception:
+            logger.exception("text send failed chat=%s", chat_id)
+
+    # ------------------------------------------------------------------
+    # Timers / lifecycle
+    # ------------------------------------------------------------------
+
+    def _start_timer(
+        self, delay_seconds: int, handler: Callable[[str], None], key: str
+    ) -> Optional[TimerHandle]:
+        if delay_seconds <= 0:
+            return None
+
+        def _fire() -> None:
+            try:
+                self._loop.submit(handler, key)
+            except Exception:  # loop closed during shutdown
+                logger.debug("timer fired after loop close: %s", key)
+
+        try:
+            return self._timer_factory(delay_seconds, _fire)
+        except Exception:
+            logger.exception("timer start failed for %s", key)
+            return None
+
+    @staticmethod
+    def _cancel_timer(pending: _PendingApproval) -> None:
+        if pending.timer is not None:
+            pending.timer.cancel()
+
+    def _shutdown_impl(self) -> None:
+        self._shutdown = True
+        for pending in self._approvals.values():
+            self._cancel_timer(pending)
+        for pending in self._questions.values():
+            if pending.timer is not None:
+                pending.timer.cancel()
+
+
+# ---------------------------------------------------------------------------
+# Question reply parsing (MVP numbered convention; see cards.build_question_text)
+# ---------------------------------------------------------------------------
+
+
+def _question_spec(item: QuestionItemView) -> cards.QuestionItemSpec:
+    return cards.QuestionItemSpec(
+        question=item.question,
+        header=item.header,
+        options=tuple(
+            cards.QuestionOptionSpec(label=option.label, description=option.description)
+            for option in item.options
+        ),
+        multi_select=item.multi_select,
+        allow_other=item.allow_other,
+    )
+
+
+_OTHER_PREFIX = re.compile(r"^其他\s*[:：]\s*(.+)$", re.S)
+_SINGLE_NUMBERS = re.compile(r"\d+(?:\s*[,，]\s*\d+)*")
+_MULTI_LINE = re.compile(r"(\d+)\s*[:：]\s*(\d+(?:\s*[,，]\s*\d+)*)")
+
+
+def _parse_question_reply(
+    text: str, items: tuple[QuestionItemView, ...]
+) -> Optional[dict[str, Any]]:
+    """Parse a numbered question reply into the kap answers payload.
+
+    Returns None when the text does not look like a reply attempt (it should
+    become a normal prompt); raises _InvalidReply when it looks like one but
+    fails validation. Single question: `1` / `1,3` / `其他：…`; multiple
+    questions: one `问题号:选项号` per line.
+    """
+    stripped = str(text or "").strip()
+    if not stripped or not items:
+        return None
+    other = _OTHER_PREFIX.match(stripped)
+    if other is not None:
+        if len(items) != 1:
+            raise _InvalidReply("多问题请按 `问题号:选项号` 逐行回复")
+        item = items[0]
+        if not item.allow_other:
+            raise _InvalidReply("该问题不支持自定义回答")
+        content = other.group(1).strip()
+        if not content:
+            raise _InvalidReply("自定义回答不能为空")
+        return {item.item_id: {"kind": "other", "text": content}}
+    if len(items) == 1:
+        if not _SINGLE_NUMBERS.fullmatch(stripped):
+            return None
+        numbers = [int(part) for part in re.split(r"[,，]", stripped)]
+        item = items[0]
+        return {item.item_id: _numbered_answer(item, numbers)}
+    answers: dict[str, Any] = {}
+    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    for line in lines:
+        match = _MULTI_LINE.fullmatch(line)
+        if match is None:
+            return None
+    for line in lines:
+        match = _MULTI_LINE.fullmatch(line)
+        assert match is not None
+        item_index = int(match.group(1))
+        if not (1 <= item_index <= len(items)):
+            raise _InvalidReply(f"问题号 {item_index} 超出范围（共 {len(items)} 个）")
+        numbers = [int(part) for part in re.split(r"[,，]", match.group(2))]
+        item = items[item_index - 1]
+        answers[item.item_id] = _numbered_answer(item, numbers)
+    return answers
+
+
+def _numbered_answer(item: QuestionItemView, numbers: Sequence[int]) -> dict[str, Any]:
+    options = item.options
+    if not options:
+        raise _InvalidReply("该问题没有可编号的选项")
+    for number in numbers:
+        if not (1 <= number <= len(options)):
+            raise _InvalidReply(f"选项 {number} 超出范围（共 {len(options)} 个）")
+    if len(numbers) == 1:
+        return {"kind": "single", "option_id": options[numbers[0] - 1].option_id}
+    if not item.multi_select:
+        raise _InvalidReply("该问题为单选，请只回复一个编号")
+    return {"kind": "multi", "option_ids": [options[n - 1].option_id for n in numbers]}
+
+
+# ---------------------------------------------------------------------------
+# AppHandler seam wiring
+# ---------------------------------------------------------------------------
+
+
+class OutboundAppHandler(AppHandler):
+    """AppHandler with the E3 seams wired to the outbound pipeline."""
+
+    def __init__(self, *, event_pipeline: EventPipeline, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._event_pipeline = event_pipeline
+
+    def handle_approval_action(self, action: CardAction) -> CardActionResponse:
+        return self._event_pipeline.handle_approval_action(action)
+
+    def try_handle_interaction_reply(self, message: InboundMessage) -> bool:
+        return self._event_pipeline.try_handle_interaction_reply(message)
+
+
+class SwappableKapRest:
+    """Thread-safe indirection over the current KapRestClient.
+
+    kited swaps the delegate on every kap-server incarnation (port/token
+    change), so the long-lived handler/pipeline never hold a stale client.
+    Before the first swap every call fails closed with KapTransportError.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._client: Any = None
+
+    def set_client(self, client: Any) -> None:
+        with self._lock:
+            self._client = client
+
+    def _current(self) -> Any:
+        with self._lock:
+            client = self._client
+        if client is None:
+            raise KapTransportError("kap-server 尚未就绪")
+        return client
+
+    def call(self, method: str, path: str, body: Any = None) -> Any:
+        return self._current().call(method, path, body)
+
+    def get(self, path: str) -> Any:
+        return self._current().get(path)
+
+    def post(self, path: str, body: Any = None) -> Any:
+        return self._current().post(path, body)
+
+    def list_sessions(self) -> Any:
+        return self._current().list_sessions()
+
+    def get_prompts(self, session_id: str) -> Any:
+        return self._current().get_prompts(session_id)
+
+    def get_snapshot(self, session_id: str) -> Any:
+        return self._current().get_snapshot(session_id)
+
+
+class WsSubscriptionHook:
+    """The on_session_bound hook: live-subscribe the CURRENT WS client.
+
+    kited swaps the delegate per kap incarnation; when no WS is up the
+    subscription is deferred to the startup resubscribe of persisted bindings
+    (the binding is already on disk by the time this hook fires).
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._ws: Any = None
+
+    def set_client(self, ws: Any) -> None:
+        with self._lock:
+            self._ws = ws
+
+    def __call__(self, session_id: str) -> None:
+        with self._lock:
+            ws = self._ws
+        if ws is None:
+            logger.info(
+                "no WS client yet; session %s will be subscribed at startup", session_id
+            )
+            return
+        ws.subscribe(session_id)
