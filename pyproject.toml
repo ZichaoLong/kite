@@ -1,0 +1,28 @@
+[project]
+name = "kite"
+dynamic = ["version"]
+description = "Bridge Feishu chats to kimi-code via kap-server."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "PyYAML>=6.0",
+  "websockets>=15.0",
+]
+
+[project.scripts]
+kited = "kite.kited:main"
+kitectl = "kite.kitectl:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["kite*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "kite.version.__version__"}
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
