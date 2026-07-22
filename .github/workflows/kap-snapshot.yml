@@ -1,0 +1,36 @@
+name: kap-snapshot
+
+# Upstream drift-awareness guardrail (docs/architecture/kite-design.md §10).
+# GitHub-hosted runners have no `kimi` binary, so this workflow is manual:
+# run it from a dev machine or a self-hosted runner where kimi-code is
+# installed (Actions → kap-snapshot → Run workflow).
+
+on:
+  workflow_dispatch:
+
+jobs:
+  snapshot-diff:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install runtime dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install PyYAML websockets
+
+      - name: Diff kap-server API surface against the checked-in snapshot
+        run: |
+          if command -v kimi >/dev/null 2>&1; then
+            python3 scripts/ci/kap_snapshot_diff.py --spawn
+          else
+            echo "::notice::kimi binary not available on this runner; skipping kap snapshot diff"
+          fi
