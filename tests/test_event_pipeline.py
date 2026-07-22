@@ -20,6 +20,7 @@ from kite import cards
 from kite.adapters.kap_server import (
     ApprovalRequestView,
     KapError,
+    KapErrorFrame,
     KapEvent,
     KapTransportError,
     PromptQueueState,
@@ -1195,6 +1196,80 @@ class WiringTests(PipelineTestCase):
         self.flush()
 
         self.assertEqual(self.timers.live, [])
+
+
+# ---------------------------------------------------------------------------
+# WS error frames -> terminal failure (fail-closed for dead-on-arrival prompts)
+# ---------------------------------------------------------------------------
+
+
+class ErrorFrameTests(PipelineTestCase):
+    def _error(
+        self,
+        *,
+        session_id: str | None = SESSION_ID,
+        code: str | None = "model.not_configured",
+        message: str = "Model not set",
+    ) -> KapErrorFrame:
+        return KapErrorFrame(
+            code=code,
+            message=message,
+            session_id=session_id,
+            agent_id="main",
+            retryable=False,
+        )
+
+    def test_error_frame_finishes_existing_card_as_failed(self) -> None:
+        self.bind(CHAT_ID)
+        self.ownership.record("p-1", CHAT_ID)
+        message_id = self.start_prompt()
+
+        self.pipeline.handle_error_frame(self._error())
+        self.flush()
+
+        sent = self.transport.cards_to(CHAT_ID)
+        self.assertEqual(len(sent), 2)  # execution card + failed terminal card
+        rendered = json.dumps(sent[-1]["content"], ensure_ascii=False)
+        self.assertIn("model.not_configured", rendered)
+        self.assertIn("Model not set", rendered)
+        # The execution card is frozen exactly once.
+        self.assertEqual(len(self.transport.patches_to(message_id)), 1)
+        # Ownership is dropped; a second frame for the same prompt re-attributes.
+        self.assertIsNone(self.ownership.owner_of("p-1"))
+
+    def test_error_frame_without_card_sends_standalone_terminal(self) -> None:
+        self.bind(CHAT_ID)
+        self.ownership.record("p-1", CHAT_ID)
+        # Active per the queue, but no turn.started yet -> no execution card.
+        self.rest.set_prompts(SESSION_ID, active="p-1")
+
+        self.pipeline.handle_error_frame(self._error())
+        self.flush()
+
+        sent = self.transport.cards_to(CHAT_ID)
+        self.assertEqual(len(sent), 1)  # standalone failed terminal card
+        rendered = json.dumps(sent[0]["content"], ensure_ascii=False)
+        self.assertIn("model.not_configured", rendered)
+        self.assertIsNone(self.ownership.owner_of("p-1"))
+
+    def test_error_frame_without_active_prompt_sends_text_notice(self) -> None:
+        self.bind(CHAT_ID)
+        self.rest.set_prompts(SESSION_ID, active=None)
+
+        self.pipeline.handle_error_frame(self._error())
+        self.flush()
+
+        self.assertEqual(self.transport.cards_to(CHAT_ID), [])
+        texts = self.transport.texts_to(CHAT_ID)
+        self.assertEqual(len(texts), 1)
+        self.assertIn("model.not_configured", texts[0])
+
+    def test_error_frame_without_session_is_log_only(self) -> None:
+        self.bind(CHAT_ID)
+        self.pipeline.handle_error_frame(self._error(session_id=None))
+        self.flush()
+        self.assertEqual(self.transport.cards_to(CHAT_ID), [])
+        self.assertEqual(self.transport.texts_to(CHAT_ID), [])
 
 
 if __name__ == "__main__":

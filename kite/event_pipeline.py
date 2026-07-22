@@ -53,6 +53,7 @@ from kite.adapters.kap_server import (
     ApprovalResolved,
     DurableEvent,
     KapError,
+    KapErrorFrame,
     KapEvent,
     KapTransportError,
     PromptAborted,
@@ -338,6 +339,12 @@ class EventPipeline:
         """WS on_resync_required callback: snapshot rebuild on the loop."""
         self._loop.submit(self._rebuild_session, request.session_id, "resync")
 
+    def handle_error_frame(self, error: KapErrorFrame) -> None:
+        """WS on_error_frame callback: surface a dead prompt as a failed
+        terminal result instead of leaving the submit ack hanging
+        (fail-closed, mvp-scope §4.5 spirit)."""
+        self._loop.submit(self._error_frame_impl, error)
+
     def startup_recovery(self, session_ids: Sequence[str]) -> None:
         """kited restart recovery (§4.6): rebuild every bound session from a
         snapshot so in-flight cards are re-anchored and pending approvals that
@@ -544,6 +551,49 @@ class EventPipeline:
         self._finish_prompt(event.session_id, event.prompt_id, cards.TERMINAL_ABORTED, "")
         self._ownership.forget(event.prompt_id)
         self._refresh_queue_depth(event.session_id)
+
+    def _error_frame_impl(self, error: KapErrorFrame) -> None:
+        """Terminal-fail the session's active prompt from a WS error frame.
+
+        The REST submit can succeed while the turn dies immediately
+        (e.g. ``model.not_configured``, observed live 2026-07-22); without
+        this the user is left with "已提交，正在执行" forever.
+        """
+        if self._shutdown:
+            return
+        session_id = error.session_id
+        if not session_id:
+            logger.error("kap error frame without session: %s %s", error.code, error.message)
+            return
+        text = f"上游错误 {error.code}: {error.message}" if error.code else error.message
+        prompt_id = self._attribute_prompt(session_id, None)
+        if prompt_id is None:
+            logger.error(
+                "kap error %s on session %s (no active prompt): %s",
+                error.code,
+                session_id,
+                error.message,
+            )
+            for chat_id, _binding in self._attached_chats(session_id):
+                self._send_text(chat_id, f"⚠️ {text}")
+            self._refresh_queue_depth(session_id)
+            return
+        states = self._cards_for_prompt(session_id, prompt_id)
+        if states:
+            self._finish_prompt(session_id, prompt_id, cards.TERMINAL_FAILED, text)
+        else:
+            # The prompt died before any execution card existed: send a
+            # standalone terminal card so the failure is still visible.
+            for chat_id, _binding in self._attached_chats(session_id):
+                self._send_card(
+                    chat_id,
+                    cards.build_terminal_card(
+                        outcome=cards.TERMINAL_FAILED,  # type: ignore[arg-type]
+                        text=text,
+                    ),
+                )
+            self._ownership.forget(prompt_id)
+        self._refresh_queue_depth(session_id)
 
     def _prompt_steered(self, event: PromptSteered) -> None:
         # No steer surface in the MVP; only the queue shape changed.

@@ -20,7 +20,9 @@
   `app/provider/configSection.ts` + `app/model/envOverlay.ts`)。此外，
   经 REST 创建的 session **不**继承覆盖层的 `defaultModel`——脚本对每个
   prompt 显式传 `model: "__kimi_env_model__"`。所用模型：
-  `kimi-for-coding`。
+  `kimi-for-coding`。实测补充（2026-07-22 联调）:REST 创建的 session 同样
+  不继承 `config.toml` 的 `default_model`——KITE 因此在每个 prompt 上显式
+  携带模型（解析顺序：`kap.model` 配置 → `config.toml` `default_model`)。
 
 ## S4. managed 子进程全流程——通过（6/6)
 

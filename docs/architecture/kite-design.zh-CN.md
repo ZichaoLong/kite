@@ -133,7 +133,10 @@ gate。登记在 `docs/decisions/concurrency-model.md`，等产品证明需要�
   与 **plan mode**（kap `plan_mode`，独立的布尔字段）持久化，落盘后
   **不随实例默认漂移**，每个 prompt 显式携带（kap 的
   per-prompt override 原生支持，正好落实 FOCUS"每 turn 显式重新应用"
-  的合同）。
+  的合同）。**模型**同样在每个 prompt 上显式携带——REST 创建的 session
+  既不继承 env 覆盖层也不继承 `config.toml` 的 `default_model`（见
+  spike-results §0)；解析顺序：`kap.model` 配置 → `config.toml`
+  `default_model`。
 - kimi-code 侧的 session 元数据（id、cwd、title、历史）以
   `~/.kimi-code` 为单一事实源；KITE 不复制、不 mirror。
 

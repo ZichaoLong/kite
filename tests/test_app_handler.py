@@ -506,6 +506,19 @@ class PromptSubmissionTests(AppHandlerTestCase):
         self.assertEqual(body["permission_mode"], "manual")
         self.assertIs(body["plan_mode"], True)
 
+    def test_model_is_carried_per_prompt_when_configured(self) -> None:
+        self.handler = self._make_handler(prompt_model="kimi-code/k3")
+        self.bind("s-1")
+        self.rest.add_session("s-1")
+        self.send("hello")
+        self.assertEqual(self.rest.submissions[0]["body"]["model"], "kimi-code/k3")
+
+    def test_model_omitted_when_not_configured(self) -> None:
+        self.bind("s-1")
+        self.rest.add_session("s-1")
+        self.send("hello")
+        self.assertNotIn("model", self.rest.submissions[0]["body"])
+
     def test_unknown_slash_command_points_to_help(self) -> None:
         self.send("/bogus stuff")
         self.assertIn("未知命令", self.transport.last_text())

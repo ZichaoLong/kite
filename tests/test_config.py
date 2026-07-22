@@ -152,6 +152,7 @@ class ConfigTests(unittest.TestCase):
         self.assertIsNone(settings.port)
         self.assertIsNone(settings.home)
         self.assertIsNone(settings.kimi_bin)
+        self.assertIsNone(settings.model)
         self.assertIsNone(settings.stale_seconds)
 
     def test_kap_settings_parses_full_section(self) -> None:
@@ -162,6 +163,7 @@ class ConfigTests(unittest.TestCase):
                     "port": 59000,
                     "home": "~/kap-home",
                     "kimi_bin": "/opt/kimi/bin/kimi",
+                    "model": "kimi-code/k3",
                     "stale_seconds": 30,
                     "reconnect_delay_seconds": 1.5,
                     "backoff_base_seconds": 2,
@@ -172,6 +174,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(settings.port, 59000)
         self.assertEqual(settings.home, "~/kap-home")
         self.assertEqual(settings.kimi_bin, "/opt/kimi/bin/kimi")
+        self.assertEqual(settings.model, "kimi-code/k3")
         self.assertEqual(settings.stale_seconds, 30.0)
         self.assertEqual(settings.reconnect_delay_seconds, 1.5)
         self.assertEqual(settings.backoff_base_seconds, 2.0)
@@ -184,6 +187,10 @@ class ConfigTests(unittest.TestCase):
             kap_settings({"kap": {"port": "58627"}})
         with self.assertRaisesRegex(ValueError, "kap.host"):
             kap_settings({"kap": {"host": "  "}})
+        with self.assertRaisesRegex(ValueError, "kap.model"):
+            kap_settings({"kap": {"model": "  "}})
+        with self.assertRaisesRegex(ValueError, "kap.model"):
+            kap_settings({"kap": {"model": 7}})
         with self.assertRaisesRegex(ValueError, "kap.stale_seconds"):
             kap_settings({"kap": {"stale_seconds": -1}})
         with self.assertRaisesRegex(ValueError, "kap must be a mapping"):

@@ -22,6 +22,10 @@
   `app/model/envOverlay.ts`). Additionally, sessions created via REST do
   **not** inherit the overlay `defaultModel` — the scripts pass
   `model: "__kimi_env_model__"` per prompt. Model used: `kimi-for-coding`.
+  Live finding (2026-07-22, joint debugging): REST-created sessions do not
+  inherit `config.toml`'s `default_model` either — KITE therefore carries an
+  explicit model on every prompt (resolution: `kap.model` config →
+  `config.toml` `default_model`).
 
 ## S4. Managed Subprocess Lifecycle — PASS (6/6)
 

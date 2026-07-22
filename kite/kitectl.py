@@ -362,6 +362,14 @@ def _cmd_binding_list(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _prompt_model() -> str | None:
+    """Model carried per prompt: kap.model, else config.toml default_model."""
+    config = kite_config.load_config_file("system")
+    kap = kite_config.kap_settings(config)
+    home = kap_server.resolve_kap_home(kap.home)
+    return kap_server.resolve_prompt_model(kap.model, home)
+
+
 def _cmd_prompt_send(args: argparse.Namespace) -> int:
     text = args.text
     if not text.strip():
@@ -386,7 +394,7 @@ def _cmd_prompt_send(args: argparse.Namespace) -> int:
     from kite.app_handler import KapSessionOps
 
     result = _checked(
-        lambda: KapSessionOps(client).submit_prompt(
+        lambda: KapSessionOps(client, model=_prompt_model()).submit_prompt(
             session_id,
             text,
             permission_mode=permission_mode,

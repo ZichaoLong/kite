@@ -173,7 +173,8 @@ class KapSettings:
           port: 58627            # requested port; the server may bump +1
           home: ~/.kimi-code     # KIMI_CODE_HOME for the managed child
           kimi_bin: null         # default: $KIMI_BIN or `kimi` from PATH
-          stale_seconds: 45      # WS reconnect when no frame for this long
+          model: null            # model carried per prompt; default: config.toml default_model
+          stale_seconds: 45      # WS probe (ping) when no frame for this long
           reconnect_delay_seconds: 2
           backoff_base_seconds: 1    # crash-restart backoff: base * 2^n
           backoff_cap_seconds: 30    # ... capped here
@@ -183,6 +184,7 @@ class KapSettings:
     port: int | None
     home: str | None
     kimi_bin: str | None
+    model: str | None
     stale_seconds: float | None
     reconnect_delay_seconds: float | None
     backoff_base_seconds: float | None
@@ -214,6 +216,10 @@ def kap_settings(config: Mapping[str, Any]) -> KapSettings:
     if kimi_bin is not None and (not isinstance(kimi_bin, str) or not kimi_bin.strip()):
         raise ValueError("kap.kimi_bin must be a non-empty string")
 
+    model = raw.get("model")
+    if model is not None and (not isinstance(model, str) or not model.strip()):
+        raise ValueError("kap.model must be a non-empty string")
+
     def _positive_seconds(key: str) -> float | None:
         value = raw.get(key)
         if value is None:
@@ -227,6 +233,7 @@ def kap_settings(config: Mapping[str, Any]) -> KapSettings:
         port=port,
         home=home.strip() if isinstance(home, str) else None,
         kimi_bin=kimi_bin.strip() if isinstance(kimi_bin, str) else None,
+        model=model.strip() if isinstance(model, str) else None,
         stale_seconds=_positive_seconds("stale_seconds"),
         reconnect_delay_seconds=_positive_seconds("reconnect_delay_seconds"),
         backoff_base_seconds=_positive_seconds("backoff_base_seconds"),

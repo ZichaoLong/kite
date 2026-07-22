@@ -137,8 +137,12 @@ class KapSessionOps:
     this class on the application side.
     """
 
-    def __init__(self, rest: Any) -> None:
+    def __init__(self, rest: Any, *, model: str | None = None) -> None:
         self._rest = rest
+        # Carried explicitly on every prompt: REST-created sessions inherit
+        # neither the KIMI_MODEL_* overlay nor config.toml's default_model
+        # (spike-results §0 + live finding 2026-07-22).
+        self._model = model
 
     def create_session(self, *, cwd: str, title: str) -> SessionSummary:
         data = self._rest.call("POST", "/sessions", {"title": title, "metadata": {"cwd": cwd}})
@@ -156,16 +160,19 @@ class KapSessionOps:
         permission_mode: str,
         plan_mode: bool,
     ) -> SubmitPromptResult:
-        # permission_mode / plan_mode are carried explicitly on every prompt
-        # (kite-design.md §7).
+        # permission_mode / plan_mode / model are carried explicitly on every
+        # prompt (kite-design.md §7; spike-results §0 for the model part).
+        payload: dict[str, Any] = {
+            "content": [{"type": "text", "text": text}],
+            "permission_mode": permission_mode,
+            "plan_mode": plan_mode,
+        }
+        if self._model:
+            payload["model"] = self._model
         data = self._rest.call(
             "POST",
             f"/sessions/{_quote(session_id)}/prompts",
-            {
-                "content": [{"type": "text", "text": text}],
-                "permission_mode": permission_mode,
-                "plan_mode": plan_mode,
-            },
+            payload,
         )
         if not isinstance(data, dict):
             raise KapTransportError("submit prompt: unexpected data shape")
@@ -247,12 +254,13 @@ class AppHandler(TransportHandler):
         runtime_loop: RuntimeLoop,
         config: Mapping[str, Any],
         init_token: str,
+        prompt_model: str | None = None,
         prompt_ownership: Optional[PromptOwnership] = None,
         on_session_bound: Optional[Callable[[str], None]] = None,
         persist_admins: Optional[Callable[[set[str]], None]] = None,
     ) -> None:
         self._transport = transport
-        self._ops = KapSessionOps(rest)
+        self._ops = KapSessionOps(rest, model=prompt_model)
         self._binding_store = binding_store
         self._loop = runtime_loop
         self._default_working_dir = kite_config.default_working_dir(config)

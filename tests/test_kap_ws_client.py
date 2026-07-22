@@ -40,6 +40,7 @@ class KapWsClientTests(unittest.TestCase):
             "cursor_store": self.cursors,
             "stale_seconds": 0.3,
             "reconnect_delay_seconds": 0.1,
+            "ping_timeout_seconds": 0.3,
             "on_event": self.events.append,
             "on_resync_required": self.resyncs.append,
         }
@@ -147,10 +148,32 @@ class KapWsClientTests(unittest.TestCase):
         self.assertEqual(self.resyncs, [])
 
     def test_stale_connection_triggers_reconnect(self) -> None:
+        self.state.pong_enabled = False  # dead connection: ping goes unanswered
         self._start_client()
         self.assertTrue(wait_until(lambda: self.state.hello_count >= 1))
-        # No frames flow on an idle connection: stale detection must cycle it.
+        # No frames and no pong: stale detection must cycle the connection.
         self.assertTrue(wait_until(lambda: self.state.hello_count >= 2, timeout=5.0))
+
+    def test_ping_probe_keeps_idle_connection_alive(self) -> None:
+        self._start_client()
+        self.assertTrue(wait_until(lambda: self.state.hello_count >= 1))
+        # kap answers ping: several stale windows pass without a reconnect.
+        time.sleep(1.2)
+        self.assertEqual(self.state.hello_count, 1)
+        self.assertGreaterEqual(self.state.ping_count, 1)
+
+    def test_error_frame_fires_callback(self) -> None:
+        errors = []
+        self._start_client(on_error_frame=errors.append)
+        self.assertTrue(wait_until(lambda: self.state.hello_count >= 1))
+        self.state.send_error_frame("s-1", "model.not_configured", "Model not set")
+        self.assertTrue(wait_until(lambda: len(errors) >= 1))
+        error = errors[0]
+        self.assertEqual(error.code, "model.not_configured")
+        self.assertEqual(error.message, "Model not set")
+        self.assertEqual(error.session_id, "s-1")
+        self.assertEqual(error.agent_id, "main")
+        self.assertFalse(error.retryable)
 
     def test_server_restart_resubscribes_with_cursor_and_replays(self) -> None:
         session = self.state.create_session("s-1")

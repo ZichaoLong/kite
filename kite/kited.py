@@ -137,6 +137,18 @@ def build_outbound_runtime(
         bot_open_id=str(config.get("bot_open_id") or ""),
         feishu_ws_proxy=str(config.get("feishu_ws_proxy") or DEFAULT_FEISHU_WS_PROXY),
     )
+    kap = kite_config.kap_settings(config)
+    prompt_model = kap_server.resolve_prompt_model(
+        kap.model, kap_server.resolve_kap_home(kap.home)
+    )
+    if prompt_model:
+        logger.info("prompt model carried per prompt: %s", prompt_model)
+    else:
+        logger.warning(
+            "no prompt model resolvable (kap.model unset and config.toml "
+            "default_model missing); prompts will fail upstream and surface "
+            "as failed terminal cards"
+        )
     pipeline = EventPipeline(
         transport=transport,
         rest=rest_proxy,
@@ -156,6 +168,7 @@ def build_outbound_runtime(
         runtime_loop=loop,
         config=config,
         init_token=init_token,
+        prompt_model=prompt_model,
         prompt_ownership=ownership,
         on_session_bound=ws_hook,
     )
@@ -267,6 +280,9 @@ def run(
                     outbound.pipeline.handle_resync_required if outbound else on_resync
                 ),
                 on_connection_change=on_connection_change,
+                on_error_frame=(
+                    outbound.pipeline.handle_error_frame if outbound else None
+                ),
             )
             ws.start()
             if outbound is not None:

@@ -61,6 +61,8 @@ class FakeKapState:
         self.sessions: dict[str, FakeSession] = {}
         self.log: list[str] = []
         self.hello_count = 0
+        self.ping_count = 0
+        self.pong_enabled = True
         self.shutdown_requested = False
         self.last_shutdown_content_type: str | None = None
         self.prompt_submissions: list[dict[str, Any]] = []
@@ -121,6 +123,27 @@ class FakeKapState:
             if key in self._subscribers:
                 connection, _ = self._subscribers[key]
                 self._subscribers[key] = (connection, session_ids)
+
+    def send_error_frame(self, session_id: str, code: str, message: str) -> None:
+        """Broadcast a WS ``error`` frame (not a durable event; no seq)."""
+        frame = {
+            "type": "error",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "payload": {
+                "code": code,
+                "message": message,
+                "retryable": False,
+                "agentId": "main",
+                "sessionId": session_id,
+            },
+        }
+        with self.lock:
+            subscribers = list(self._subscribers.values())
+        for connection, _session_ids in subscribers:
+            try:
+                connection.send(json.dumps(frame))
+            except Exception:  # noqa: BLE001 - dead subscribers drop lazily
+                pass
 
 
 def _session_wire(session: FakeSession) -> dict[str, Any]:
@@ -424,6 +447,15 @@ def _ws_handler(state: FakeKapState, connection: Any) -> None:
                     "type": "ack", "id": frame.get("id", ""), "code": 0, "msg": "success",
                     "payload": ack_payload,
                 }))
+            elif frame_type == "ping":
+                with state.lock:
+                    state.ping_count += 1
+                if state.pong_enabled:
+                    connection.send(json.dumps({
+                        "type": "pong",
+                        "timestamp": "2026-01-01T00:00:00Z",
+                        "payload": {"nonce": payload.get("nonce", "")},
+                    }))
             elif frame_type == "unsubscribe":
                 for sid in payload.get("session_ids") or []:
                     subscribed.discard(sid)

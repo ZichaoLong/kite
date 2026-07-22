@@ -38,17 +38,20 @@ import logging
 import os
 import pathlib
 import re
+import secrets
 import shutil
 import signal
 import socket
 import subprocess
 import threading
 import time
+import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
 
 import websockets.exceptions
@@ -583,6 +586,33 @@ def read_server_token(home: pathlib.Path) -> str:
     return token
 
 
+def read_kimi_default_model(home: pathlib.Path) -> str | None:
+    """``default_model`` from ``<home>/config.toml``; None when absent/unreadable."""
+    path = pathlib.Path(home) / "config.toml"
+    try:
+        with path.open("rb") as handle:
+            data = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    value = data.get("default_model")
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def resolve_prompt_model(config_model: str | None, home: pathlib.Path) -> str | None:
+    """The model carried explicitly on every prompt.
+
+    REST-created sessions inherit neither the ``KIMI_MODEL_*`` env overlay
+    nor ``config.toml``'s ``default_model`` (spike-results §0, extended by
+    the 2026-07-22 live finding), so every submit must name a model.
+    Resolution order: ``kap.model`` config → ``config.toml`` ``default_model``
+    → None (the submit then fails upstream and the WS error frame surfaces
+    it; fail-closed).
+    """
+    if config_model and str(config_model).strip():
+        return str(config_model).strip()
+    return read_kimi_default_model(home)
+
+
 def _instance_registry_dir(home: pathlib.Path) -> pathlib.Path:
     return pathlib.Path(home) / "server" / "instances"
 
@@ -1040,6 +1070,22 @@ class KapServerProcess:
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True, slots=True)
+class KapErrorFrame:
+    """Normalized WS ``error`` frame payload.
+
+    Distinct from REST business errors: a prompt whose REST submit succeeded
+    can still die immediately (e.g. ``model.not_configured``); the failure
+    only ever shows up as one of these frames.
+    """
+
+    code: str | None
+    message: str
+    session_id: str | None
+    agent_id: str | None
+    retryable: bool
+
+
 class KapWsClient:
     """Thread-based WS subscription client with cursor resume.
 
@@ -1081,6 +1127,8 @@ class KapWsClient:
         on_event: Callable[[KapEvent], None] | None = None,
         on_resync_required: Callable[[ResyncRequest], None] | None = None,
         on_connection_change: Callable[[bool], None] | None = None,
+        on_error_frame: Callable[[KapErrorFrame], None] | None = None,
+        ping_timeout_seconds: float = 10.0,
     ) -> None:
         self._url = f"ws://{host}:{port}{API_PREFIX}/ws"
         self._token = token
@@ -1094,6 +1142,8 @@ class KapWsClient:
         self._on_event = on_event
         self._on_resync = on_resync_required
         self._on_connection_change = on_connection_change
+        self._on_error_frame = on_error_frame
+        self._ping_timeout = float(ping_timeout_seconds)
 
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -1252,8 +1302,13 @@ class KapWsClient:
                 return
             try:
                 raw = ws.recv(timeout=self._stale_seconds)
-            except TimeoutError as exc:
-                raise _StaleConnection() from exc
+            except TimeoutError:
+                # kap has no heartbeat, but answers app-level ping: probe
+                # before declaring the connection stale (avoids reconnecting
+                # healthy idle connections every stale window).
+                if not self._probe_with_ping(ws):
+                    raise _StaleConnection() from None
+                continue
             try:
                 frame = json.loads(raw)
             except ValueError:
@@ -1262,6 +1317,26 @@ class KapWsClient:
             if not isinstance(frame, dict):
                 continue
             self._dispatch_frame(ws, frame)
+
+    def _probe_with_ping(self, ws: Any) -> bool:
+        """Send an app-level ping; any frame back within the window = alive."""
+        frame = {
+            "type": "ping",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "payload": {"nonce": secrets.token_hex(8)},
+        }
+        try:
+            ws.send(json.dumps(frame))
+            raw = ws.recv(timeout=self._ping_timeout)
+        except Exception:  # noqa: BLE001 - any failure means a dead connection
+            return False
+        try:
+            incoming = json.loads(raw)
+        except ValueError:
+            return True  # unparseable, but the socket is clearly alive
+        if isinstance(incoming, dict):
+            self._dispatch_frame(ws, incoming)
+        return True
 
     def _dispatch_frame(self, ws: Any, frame: dict[str, Any]) -> None:
         frame_type = frame.get("type")
@@ -1288,7 +1363,20 @@ class KapWsClient:
         if frame_type in ("server_hello", "pong"):
             return
         if frame_type == "error":
-            logger.error("WS error frame: %s", frame.get("payload"))
+            payload = frame.get("payload") if isinstance(frame.get("payload"), dict) else {}
+            error = KapErrorFrame(
+                code=_optional_str(payload.get("code")),
+                message=str(payload.get("message") or ""),
+                session_id=_optional_str(payload.get("sessionId")),
+                agent_id=_optional_str(payload.get("agentId")),
+                retryable=bool(payload.get("retryable")),
+            )
+            logger.error("WS error frame: %s", payload)
+            if self._on_error_frame is not None:
+                try:
+                    self._on_error_frame(error)
+                except Exception:  # noqa: BLE001 - callbacks must not kill the loop
+                    logger.exception("on_error_frame callback failed")
             return
         event = _parse_event_frame(frame)
         if event is None:
