@@ -1,0 +1,25 @@
+# KITE instance config template.
+# Copy to ~/.config/kite/system.yaml (or $KITE_CONFIG_DIR/system.yaml) and fill
+# in real values. The real file must stay out of version control (mode 0600).
+
+# Feishu self-built app credentials (https://open.feishu.cn/app → 凭证与基础信息):
+app_id: "cli_xxx"
+app_secret: "xxx"
+
+# Admins (open_ids). The first admin can also register at runtime via the
+# Feishu `/init <token>` command (token generated at install/first run).
+# admins: []
+
+# Working directory for sessions auto-created on first use.
+# default_working_dir: "~"
+
+# Approval timeout in seconds; on timeout KITE responds REJECTED (never
+# auto-approves). Default: 300.
+# approval_timeout_seconds: 300
+
+# kap-server connection (all optional; defaults shown):
+# kap:
+#   host: 127.0.0.1   # loopback only; kap-server has no TLS
+#   port: 58627       # requested port; the server may bump +1 on conflict
+#   home: ~/.kimi-code  # KIMI_CODE_HOME for the managed child
+#   kimi_bin: kimi    # path to the kimi binary

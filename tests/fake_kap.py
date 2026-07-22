@@ -63,6 +63,7 @@ class FakeKapState:
         self.hello_count = 0
         self.shutdown_requested = False
         self.last_shutdown_content_type: str | None = None
+        self.prompt_submissions: list[dict[str, Any]] = []
         self._subscribers: dict[int, tuple[Any, set[str]]] = {}
 
     def note(self, entry: str) -> None:
@@ -284,6 +285,7 @@ class FakeKapRestHandler(BaseHTTPRequestHandler):
             if session is None:
                 self._send(_envelope(40401, None, "session not found"))
                 return
+            self.state.prompt_submissions.append(body if isinstance(body, dict) else {})
             prompt_id = f"p-{uuid.uuid4().hex[:6]}"
             if session.active_prompt is None:
                 session.active_prompt = prompt_id
