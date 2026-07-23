@@ -91,7 +91,7 @@ KAP_ERROR_QUESTION_NOT_FOUND = 40405
 KAP_ERROR_QUESTION_DISMISSED = 40909
 
 _MAX_TOOL_LINES = 30
-_LATEST_ASSISTANT_PAGE_SIZE = 5
+_LATEST_ASSISTANT_PAGE_SIZE = 20
 
 _KAP_UNREACHABLE_TOAST = "无法连接 kap-server，操作未完成，请稍后再试。"
 
@@ -172,7 +172,12 @@ class KapInteractionOps:
         items = data.get("items")
         if not isinstance(items, list):
             raise KapTransportError("messages: unexpected data shape")
-        for message in reversed(items):
+        # Server contract (messageLegacyService.list): items are newest-first,
+        # and the role filter is applied AFTER pagination — so the first
+        # assistant item with text is the latest assistant message. (Iterating
+        # oldest-first here surfaced the PREVIOUS prompt's text on terminal
+        # cards, observed live 2026-07-22.)
+        for message in items:
             if not isinstance(message, dict) or message.get("role") != "assistant":
                 continue
             parts = [

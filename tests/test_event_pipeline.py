@@ -111,6 +111,9 @@ class FakeInteractionRest:
         self.prompt_states: dict[str, PromptQueueState] = {}
         self.snapshots: dict[str, object] = {}
         self.assistant_text = "最终答复文本"
+        # When set, returned as the messages page verbatim (must be
+        # newest-first, mirroring upstream's ordering contract).
+        self.assistant_items: list[dict] | None = None
         self.approval_resolutions: list[dict] = []
         self.question_answers: list[dict] = []
         self.dismissals: list[tuple[str, str]] = []
@@ -152,6 +155,8 @@ class FakeInteractionRest:
         if method == "GET" and match:
             if self.messages_error is not None:
                 raise self.messages_error
+            if self.assistant_items is not None:
+                return {"items": list(self.assistant_items), "has_more": False}
             text = self.assistant_text
             return {
                 "items": [
@@ -628,6 +633,28 @@ class ExecutionCardTests(PipelineTestCase):
 
         terminal = self.transport.cards_to(CHAT_ID)[-1]["content"]
         self.assertIn("已中止", json.dumps(terminal, ensure_ascii=False))
+
+    def test_terminal_text_is_latest_assistant_message_not_previous(self) -> None:
+        # Upstream (messageLegacyService.list) returns items newest-first and
+        # applies the role filter AFTER pagination; the newest assistant text
+        # must win over older turns (live bug 2026-07-22: terminal cards
+        # showed the previous prompt's reply).
+        self.rest.assistant_items = [
+            {"id": "m-new", "role": "assistant",
+             "content": [{"type": "text", "text": "本轮答复"}]},
+            {"id": "m-tool", "role": "tool",
+             "content": [{"type": "text", "text": "tool output"}]},
+            {"id": "m-old", "role": "assistant",
+             "content": [{"type": "text", "text": "上一轮答复"}]},
+        ]
+        self.bind(CHAT_ID)
+        self.start_prompt()
+
+        self.feed(kap_event("turn.ended", {"turnId": 1, "reason": "completed"}))
+
+        records = self.terminal_store.list_all()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].final_reply_text, "本轮答复")
 
     def test_terminal_is_idempotent_across_abort_and_turn_end(self) -> None:
         self.bind(CHAT_ID)

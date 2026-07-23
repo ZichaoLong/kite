@@ -268,7 +268,12 @@ class AppHandler(TransportHandler):
         self._init_token = str(init_token or "").strip()
         if not self._init_token:
             logger.error("init token is empty; /init can never succeed")
-        self._ownership = prompt_ownership or PromptOwnership()
+        # NB: PromptOwnership defines __len__, so `or` would treat an empty
+        # shared map as falsy and silently split ownership into two maps
+        # (observed live 2026-07-22: approvals expired as "unattributable").
+        self._ownership = (
+            prompt_ownership if prompt_ownership is not None else PromptOwnership()
+        )
         self._on_session_bound = on_session_bound
         self._persist_admins = persist_admins or _persist_admins_to_config
         self._commands: dict[str, Callable[[InboundMessage, str], None]] = {

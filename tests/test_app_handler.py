@@ -23,7 +23,7 @@ from kite.app_handler import (
     AppHandler,
 )
 from kite.feishu_transport import CardAction, InboundAttachment, InboundMessage
-from kite.prompt_ownership import CERTAINTY_BEST_EFFORT
+from kite.prompt_ownership import CERTAINTY_BEST_EFFORT, PromptOwnership
 from kite.runtime_loop import RuntimeLoop
 from kite.stores.binding_store import BindingStore
 
@@ -518,6 +518,18 @@ class PromptSubmissionTests(AppHandlerTestCase):
         self.rest.add_session("s-1")
         self.send("hello")
         self.assertNotIn("model", self.rest.submissions[0]["body"])
+
+    def test_shared_empty_ownership_is_not_split(self) -> None:
+        # Regression (live 2026-07-22): PromptOwnership defines __len__, so an
+        # empty map is falsy and `or` used to silently swap in a private map —
+        # approvals then routed as "unattributable" and expired.
+        shared = PromptOwnership()
+        self.handler = self._make_handler(prompt_ownership=shared)
+        self.assertIs(self.handler.prompt_ownership, shared)
+        self.bind("s-1")
+        self.rest.add_session("s-1")
+        self.send("hello")
+        self.assertEqual(len(shared), 1)
 
     def test_unknown_slash_command_points_to_help(self) -> None:
         self.send("/bogus stuff")
