@@ -316,6 +316,30 @@ def _cmd_service_status(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_service_autostart(args: argparse.Namespace) -> int:
+    manager = _service_manager()
+    definition = _service_definition()
+    try:
+        if args.autostart_command == "enable":
+            manager.autostart_enable(definition)
+            print(f"service '{manager.display_name(definition)}' autostart enabled")
+            return 0
+        if args.autostart_command == "disable":
+            manager.autostart_disable(definition)
+            print(f"service '{manager.display_name(definition)}' autostart disabled")
+            return 0
+        status = manager.autostart_status(definition)
+    except service_manager.ServiceManagerError as exc:
+        _die(str(exc), exit_code=1)
+    print(f"service: {manager.display_name(definition)}")
+    print(f"autostart: {'enabled' if status.enabled else 'disabled'}")
+    if status.source:
+        print(f"source: {status.source}")
+    if status.detail:
+        print(f"detail: {status.detail}")
+    return 0
+
+
 def _tail_lines(path: pathlib.Path, count: int, *, block_size: int = 8192) -> list[str]:
     """The last `count` lines of a text file, read back-to-front in blocks."""
     with open(path, "rb") as handle:
@@ -445,6 +469,14 @@ def _build_parser() -> argparse.ArgumentParser:
     service_sub.add_parser("status", help="show installed/running state").set_defaults(
         func=_cmd_service_status
     )
+    autostart_parser = service_sub.add_parser(
+        "autostart", help="manage start-on-login"
+    )
+    autostart_sub = autostart_parser.add_subparsers(
+        dest="autostart_command", required=True
+    )
+    for _name in ("enable", "disable", "status"):
+        autostart_sub.add_parser(_name).set_defaults(func=_cmd_service_autostart)
     log_parser = service_sub.add_parser("log", help="tail the daemon stdout log")
     log_parser.add_argument(
         "-n",

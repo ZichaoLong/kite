@@ -180,6 +180,9 @@ class _RecordingServiceManager:
         self.status_result = service_manager.ServiceStatus(
             installed=True, running=True, source="fake-status", detail="active"
         )
+        self.autostart_result = service_manager.AutostartStatus(
+            enabled=True, source="fake-autostart", detail="enabled"
+        )
         self.error: Exception | None = None
 
     def display_name(self, definition: object) -> str:
@@ -209,6 +212,16 @@ class _RecordingServiceManager:
     def status(self, definition: object) -> service_manager.ServiceStatus:
         self._record("status", definition)
         return self.status_result
+
+    def autostart_enable(self, definition: object) -> None:
+        self._record("autostart_enable", definition)
+
+    def autostart_disable(self, definition: object) -> None:
+        self._record("autostart_disable", definition)
+
+    def autostart_status(self, definition: object) -> service_manager.AutostartStatus:
+        self._record("autostart_status", definition)
+        return self.autostart_result
 
 
 class ServiceCommandTests(KitectlTestCase):
@@ -270,6 +283,26 @@ class ServiceCommandTests(KitectlTestCase):
         self.assertEqual(code, 0)
         self.assertIn("installed: no", out)
         self.assertIn("running: no", out)
+
+    def test_autostart_enable_disable(self) -> None:
+        manager = self._fake_manager()
+
+        code, out, _ = self._run_cli("service", "autostart", "enable")
+        self.assertEqual(code, 0)
+        self.assertIn("autostart enabled", out)
+        code, out, _ = self._run_cli("service", "autostart", "disable")
+        self.assertEqual(code, 0)
+        self.assertIn("autostart disabled", out)
+        self.assertEqual(manager.calls, ["autostart_enable", "autostart_disable"])
+
+    def test_autostart_status_prints_state(self) -> None:
+        self._fake_manager()
+
+        code, out, _ = self._run_cli("service", "autostart", "status")
+
+        self.assertEqual(code, 0)
+        self.assertIn("autostart: enabled", out)
+        self.assertIn("detail: enabled", out)
 
     def test_manager_failure_is_a_clear_error(self) -> None:
         manager = self._fake_manager()
