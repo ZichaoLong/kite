@@ -55,6 +55,10 @@ kitectl —— local admin surface (config/start-stop/binding/session/prompt/ima
   guaranteed upstream; see `docs/decisions/concurrency-model.md`). It binds to
   127.0.0.1 by default; LAN/phone access (exposed via `--host`) is off by
   default — see aligned item 5 in the last section.
+- `kitectl` mutates daemon-owned state only through a **loopback control
+  plane** inside kited (JSON-lines, token-checked); read-only queries may
+  still use kap REST / the stores directly. This keeps the prompt-ownership
+  axis single-writer (see `docs/decisions/control-plane.md`).
 
 ## 3. Layers
 
@@ -74,7 +78,9 @@ axes.
 
 ## 4. State Axes
 
-The MVP recognizes only four axes, each with a clear owner:
+The MVP recognizes four axes, each with a clear owner. Phase 2 adds two
+more (registered 2026-07-23, before any code — see
+`docs/contracts/group-chat.md` and `docs/contracts/images.md`):
 
 1. **binding** (local, persistent): the logical bookmark of chat ↔ session.
    Survives kited restarts.
@@ -85,9 +91,19 @@ The MVP recognizes only four axes, each with a clear owner:
    `event.session.work_changed`; KITE does not infer it on its own, and rebuilds
    it from a REST snapshot after a disconnect.
 4. **prompt ownership** (local, in-memory): which chat initiated each
-   active/queued prompt; determines whom approval/form cards route to. After a
+   active/queued prompt; determines whom approval/form cards route to.
+   Extended in Phase 2 with `sender_open_id` for group actor checks
+   (`docs/contracts/group-chat.md` §3.3). After a
    restart, rebuilt on a best-effort basis via `GET .../prompts` + snapshot;
    approval cards that cannot be rebuilt are explicitly expired and closed out
+   (fail-closed).
+5. **group config** (local, persistent; Phase 2): per-chat `{activated,
+   activated_by, activated_at, mode}` for `mention_only` groups. Loaded like
+   bindings; a corrupt record reads as non-activated (fail-closed to
+   silence).
+6. **attachment staging** (local, persistent, TTL'd; Phase 2): pending
+   inbound attachments keyed by `(sender_open_id, chat_id)`. Files are
+   validated at consume time; expired/missing blocks the prompt
    (fail-closed).
 
 **Reserved concepts (not implemented)**: interaction owner (write-exclusive

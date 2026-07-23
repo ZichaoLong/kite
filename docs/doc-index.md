@@ -10,11 +10,15 @@ the docs, or both.
 
 ## Current Status
 
-Milestone 0 (spike validation) passed on 2026-07-21 against **kimi 0.28.1**
-(results: `docs/verification/spike-results.md`). `contracts/`,
-`architecture/`, and `decisions/` are **active** repository facts — any
-inconsistency between them and the code is a contract gap. Code work may
-begin.
+M1 (the MVP) is complete and live-verified (2026-07-22); the daemon is
+deployed (systemd --user + autostart). Milestone 0 (spike validation) passed
+on 2026-07-21 against **kimi 0.28.1** (results:
+`docs/verification/spike-results.md`). `contracts/`, `architecture/`, and
+`decisions/` are **active** repository facts — any inconsistency between
+them and the code is a contract gap. Phase 2 is admitted: volatile
+streaming cards, images in/out, group chat (see the Phase 2 contracts);
+implementation starts with a hardening batch from the FOCUS asset survey
+(`docs/research/focus-assets-map.md`).
 
 ## Document Types
 
@@ -48,12 +52,18 @@ Status guidance:
 
 ### Contracts
 
-- [`mvp-scope.md`](./contracts/mvp-scope.md) (draft)
+- [`mvp-scope.md`](./contracts/mvp-scope.md) (active)
   - MVP feature scope, command surface, approval behavior, fail-closed list, non-goals, carrying-capacity gate
+- [`streaming-cards.md`](./contracts/streaming-cards.md) (admitted, Phase 2)
+  - volatile streaming into the execution card: coalescing/throttle/retry discipline, gap→rebuild, fail-closed list
+- [`images.md`](./contracts/images.md) (admitted, Phase 2)
+  - image inbound (staged, TTL'd) and outbound (upload+fan-out) pipelines; the attachment-staging state axis
+- [`group-chat.md`](./contracts/group-chat.md) (admitted, Phase 2)
+  - mention_only groups: activation, ingress matrix, actor-at-click approvals, allowlist fallout; the group-config state axis
 
 ### Architecture
 
-- [`kite-design.md`](./architecture/kite-design.md) (draft)
+- [`kite-design.md`](./architecture/kite-design.md) (active)
   - overall architecture, process shape, layering, adapter layer boundaries, state axes, event consumption strategy, card model, persistence, service management
 
 ### Decisions
@@ -64,6 +74,8 @@ Status guidance:
   - why Python + managed subprocess; why the local TUI wrapper is deferred; the stance on bare kimi
 - [`concurrency-model.md`](./decisions/concurrency-model.md)
   - why server-side queue semantics + prompt-level ownership; why no interaction owner is implemented; cross-process tearing risk and the single-instance premise
+- [`control-plane.md`](./decisions/control-plane.md)
+  - why kitectl mutates daemon state through a loopback control plane; the dual-writer bug it fixed; the outcome-unknown error taxonomy
 
 ### Verification
 
@@ -78,6 +90,8 @@ Status guidance:
   - kap-server usability survey (lifecycle, authentication, API coverage, event model, concurrency semantics, maturity, gaps)
 - [`okbot-vs-focus.md`](./research/okbot-vs-focus.md)
   - comparison of the benchmark project OKbot with FOCUS; lessons from the OKbot route
+- [`focus-assets-map.md`](./research/focus-assets-map.md)
+  - what to borrow from FOCUS and why (lifecycle, robustness, SSOT assets), mapped to the admitted Phase 2 features
 
 ## Read By Question
 
@@ -91,6 +105,8 @@ Status guidance:
 | What does the MVP do and not do? How does a new feature get admitted? | [`mvp-scope.md`](./contracts/mvp-scope.md) |
 | Which upstream behaviors must be validated hands-on before work starts? | [`spike-checklist.md`](./verification/spike-checklist.md) |
 | What did the spike observe, and which doc facts did it correct? | [`spike-results.md`](./verification/spike-results.md) |
+| Which Phase 2 features are admitted, and under what contracts? | [`streaming-cards.md`](./contracts/streaming-cards.md), [`images.md`](./contracts/images.md), [`group-chat.md`](./contracts/group-chat.md) |
+| Why does kitectl mutate through a loopback control plane? | [`control-plane.md`](./decisions/control-plane.md), [`focus-assets-map.md`](./research/focus-assets-map.md) |
 | Why no memory / ASR / device control? | [`okbot-vs-focus.md`](./research/okbot-vs-focus.md), [`mvp-scope.md`](./contracts/mvp-scope.md) |
 
 ## Language

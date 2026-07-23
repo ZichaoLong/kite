@@ -10,10 +10,13 @@ the docs, or both.
 
 ## 当前状态
 
-第 0 里程碑（spike 验证）已于 2026-07-21 对 **kimi 0.28.1** 全部通过
-（结果见 `docs/verification/spike-results.md`)。contracts/、
-architecture/、decisions/ 已转为 **active** repository facts——与代码
-不一致即 contract gap。业务代码可以开工。
+M1(MVP）已完成并经实网验证（2026-07-22);daemon 已部署（systemd
+--user + autostart)。第 0 里程碑（spike 验证）已于 2026-07-21 对
+**kimi 0.28.1** 全部通过（结果见 `docs/verification/spike-results.md`)。
+contracts/、architecture/、decisions/ 为 **active** repository
+facts——与代码不一致即 contract gap。Phase 2 已准入：volatile 流式卡、
+图片进出、群聊（见各 Phase 2 合同）；实现从 FOCUS 资产盘点导出的加固批
+开始（`docs/research/focus-assets-map.md`)。
 
 ## Document Types
 
@@ -46,12 +49,18 @@ Status guidance:
 
 ### Contracts
 
-- [`mvp-scope.md`](./contracts/mvp-scope.zh-CN.md)（草案）
+- [`mvp-scope.md`](./contracts/mvp-scope.zh-CN.md)(active)
   - MVP 功能范围、命令面、审批行为、fail-closed 清单、non-goals、功能承载力门槛
+- [`streaming-cards.md`](./contracts/streaming-cards.zh-CN.md)（已准入，Phase 2)
+  - 执行卡 volatile 流式：合并/节流/重试纪律、缺口→重建、fail-closed 清单
+- [`images.md`](./contracts/images.zh-CN.md)（已准入，Phase 2)
+  - 图片入站（暂存、TTL）与出站（上传+扇出）管线；附件暂存状态轴
+- [`group-chat.md`](./contracts/group-chat.zh-CN.md)（已准入，Phase 2)
+  - mention_only 群：激活、入站矩阵、点击校验审批、允许名单落地；群配置状态轴
 
 ### Architecture
 
-- [`kite-design.md`](./architecture/kite-design.zh-CN.md)（草案）
+- [`kite-design.md`](./architecture/kite-design.zh-CN.md)(active)
   - 总体架构、进程形态、分层、适配层边界、状态轴、事件消费策略、卡片模型、持久化、服务管理
 
 ### Decisions
@@ -62,6 +71,8 @@ Status guidance:
   - 为什么 Python + managed 子进程；为什么暂缓本地 TUI wrapper；裸 kimi 的立场
 - [`concurrency-model.md`](./decisions/concurrency-model.zh-CN.md)
   - 为什么采用服务端队列语义 + prompt 级归属；为什么不实现 interaction owner；跨进程撕裂风险与单实例前提
+- [`control-plane.md`](./decisions/control-plane.zh-CN.md)
+  - 为什么 kitectl 经 loopback 控制面变更 daemon 状态；它修复的双写者 bug;outcome-unknown 错误分类
 
 ### Verification
 
@@ -76,6 +87,8 @@ Status guidance:
   - kap-server 可用性调查（生命周期、认证、API 覆盖、事件模型、并发语义、成熟度、缺口）
 - [`okbot-vs-focus.md`](./research/okbot-vs-focus.zh-CN.md)
   - 对标项目 OKbot 与 FOCUS 的对比；OKbot 路线的教训
+- [`focus-assets-map.md`](./research/focus-assets-map.zh-CN.md)
+  - 从 FOCUS 借鉴什么、为什么（生命周期、鲁棒性、单一事实源资产），映射到已准入的 Phase 2 功能
 
 ## Read By Question
 
@@ -89,6 +102,8 @@ Status guidance:
 | MVP 做什么、不做什么？新功能怎么获准进入？ | [`mvp-scope.md`](./contracts/mvp-scope.zh-CN.md) |
 | 开工前要实测验证上游的哪些行为？ | [`spike-checklist.md`](./verification/spike-checklist.zh-CN.md) |
 | spike 实测观察到什么、修正了哪些文档事实？ | [`spike-results.md`](./verification/spike-results.zh-CN.md) |
+| 哪些 Phase 2 功能已准入、各在什么合同下？ | [`streaming-cards.md`](./contracts/streaming-cards.zh-CN.md), [`images.md`](./contracts/images.zh-CN.md), [`group-chat.md`](./contracts/group-chat.zh-CN.md) |
+| 为什么 kitectl 要经 loopback 控制面做变更？ | [`control-plane.md`](./decisions/control-plane.zh-CN.md), [`focus-assets-map.md`](./research/focus-assets-map.zh-CN.md) |
 | 为什么不做 memory / ASR / 设备控制？ | [`okbot-vs-focus.md`](./research/okbot-vs-focus.zh-CN.md), [`mvp-scope.md`](./contracts/mvp-scope.zh-CN.md) |
 
 ## Language

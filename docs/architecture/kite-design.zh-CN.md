@@ -50,6 +50,9 @@ kitectl —— 本地管理面（配置/启停/binding/session/prompt/image)
   /api/v1 客户端，与 KITE 地位平等，天然共享同一批 session（排队与广播
   由上游保证，见 `docs/decisions/concurrency-model.md`)。默认绑
   127.0.0.1;LAN/手机访问（`--host` 暴露）默认关闭，见末节已对齐 5。
+- `kitectl` 对 daemon 所属状态的变更只经 kited 内的 **loopback 控制面**
+  (JSON-lines,token 校验）；只读查询仍可直连 kap REST / stores。由此
+  保持 prompt 归属轴单写者（见 `docs/decisions/control-plane.md`)。
 
 ## 3. 分层
 
@@ -67,7 +70,9 @@ question**。不引入 codex 时代的 thread/turn 命名（FOCUS 资产移植�
 
 ## 4. 状态轴
 
-MVP 只承认四条轴，每条都有明确 owner:
+MVP 承认四条轴，每条都有明确 owner。Phase 2 新增两条（2026-07-23 先行
+登记，先于任何代码——见 `docs/contracts/group-chat.md` 与
+`docs/contracts/images.md`):
 
 1. **binding**（本地，持久）:chat ↔ session 的逻辑书签。kited 重启后保留。
 2. **attached/detached**（本地，持久）:chat 是否接收该 session 的飞书推送。
@@ -75,8 +80,16 @@ MVP 只承认四条轴，每条都有明确 owner:
    pending_interaction——来自 `event.session.work_changed`,KITE 不自行推断，
    掉线时用 REST snapshot 重建。
 4. **prompt 归属**（本地，内存）:active/queued prompt 各由哪个 chat 发起，
-   决定审批/表单卡片路由给谁。重启后经 `GET .../prompts` + snapshot 尽力
-   重建；建不回的审批卡片做显式过期收口（fail-closed)。
+   决定审批/表单卡片路由给谁。Phase 2 扩展 `sender_open_id` 用于群内
+   操作者校验（`docs/contracts/group-chat.md` §3.3)。重启后经
+   `GET .../prompts` + snapshot 尽力重建；建不回的审批卡片做显式过期
+   收口（fail-closed)。
+5. **群配置**（本地，持久；Phase 2)：每群 `{activated, activated_by,
+   activated_at, mode}`，用于 `mention_only` 群。与 binding 同样加载；
+   记录损坏按未激活处理（fail 向静默）。
+6. **附件暂存**（本地，持久，带 TTL;Phase 2)：以 `(sender_open_id,
+   chat_id)` 为键的待消费入站附件。消费时校验文件；过期/缺失阻断
+   prompt(fail-closed)。
 
 **预留概念（不实现）**:interaction owner（写入独占租约）、跨实例 loaded
 gate。登记在 `docs/decisions/concurrency-model.md`，等产品证明需要时再引入；
