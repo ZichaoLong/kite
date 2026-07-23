@@ -187,6 +187,10 @@ FOCUS's wrapper design; the command names `kite` (local entrypoint) and `kcode`
 - Install: `install.sh` → managed venv + wrapper + service definition (written
   but not started); `pip install .` / `-e .` is forbidden (same discipline as
   FOCUS).
+- Service-environment credentials: the daemon runs without the user's shell
+  env, so provider keys are read from the env file (default
+  `~/.config/kite/env`, mode 0600; `KITE_ENV_FILE` overrides) — never from
+  the unit definition.
 - Single instance is the premise: one config/data directory; multi-instance
   (multiple Feishu apps) is registered as a Phase 3 candidate, and requires a
   cross-instance concurrency contract first.

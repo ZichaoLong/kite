@@ -17,8 +17,9 @@ KITE 把飞书机器人接到 kimi-code 的共享后端（kap-server）上，让
 **M1 完成**:MVP 主链路已于 2026-07-22 实网联调通过（飞书单聊对话、执行卡/终态卡、
 审批卡、`/abort`、重启恢复；453 tests)。第 0 里程碑（spike）于 2026-07-21 通过
 （kimi 0.28.1，结果见 `docs/verification/spike-results.md`),`contracts/`、
-`architecture/`、`decisions/` 为 active repository facts。下一步：daemon 化部署
-（`kitectl service`)、Phase 2 候选评审（群聊、volatile 流式卡、图片、允许名单）。
+`architecture/`、`decisions/` 为 active repository facts。daemon 化部署已完成
+（systemd --user `kite.service`,autostart 已启用；管理面 `kitectl service`)。
+下一步：Phase 2 候选评审（群聊、volatile 流式卡、图片、允许名单）。
 
 ## 文档入口
 

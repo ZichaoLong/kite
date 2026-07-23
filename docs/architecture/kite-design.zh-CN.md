@@ -159,6 +159,9 @@ gate。登记在 `docs/decisions/concurrency-model.md`，等产品证明需要�
   macOS launchd、Windows Task Scheduler。
 - 安装：`install.sh` → 受管 venv + wrapper + service 定义（只写不启动）;
   禁止 `pip install .` / `-e .`（同 FOCUS 纪律）。
+- 服务环境凭证：daemon 不继承用户 shell 环境，provider 密钥从 env 文件
+  读取（默认 `~/.config/kite/env`,0600;`KITE_ENV_FILE` 可覆盖）——绝不
+  写进 unit 定义。
 - 单实例为前提：配置/数据目录一份；多实例（多飞书应用）登记为 Phase 3
   候选，届时需先补跨实例并发合同。
 

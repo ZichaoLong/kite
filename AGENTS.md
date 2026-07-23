@@ -114,7 +114,7 @@ Keep repository facts out of this file.
 
 ## 工程命令
 
-- 安装：仅 `install.sh`（受管 venv + 包装脚本；服务注册待 `kitectl service` 落地，见 `docs/architecture/kite-design.md` §9）。
+- 安装：仅 `install.sh`（受管 venv + `~/.local/bin/kitectl` wrapper + 写 service 定义不启动，见 `docs/architecture/kite-design.md` §9）。运行：`kitectl service start|stop|restart|status|log|autostart`；服务环境的 provider 凭证走 env 文件（默认 `~/.config/kite/env`,0600)。
 - 测试：`python3 -m pytest -q`（无 kimi 时合同测试自动跳过）；真实 kap-server 合同测试：`python3 -m pytest tests/test_kap_contract.py -q`（需 `kimi` 在 PATH）。
 - 上游漂移护栏：`python3 scripts/ci/kap_snapshot_diff.py --spawn`（需 kimi，见 `kite-design.md` §10）；CI 中为 `workflow_dispatch`（`.github/workflows/kap-snapshot.yml`）。
 - 文档检查：`bash scripts/check-docs.sh`（CI:`.github/workflows/docs.yml`）；单测 CI:`.github/workflows/tests.yml`。
