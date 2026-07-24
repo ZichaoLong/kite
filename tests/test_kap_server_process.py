@@ -51,7 +51,10 @@ class KapServerProcessTests(FakeKimiTestCase):
             self.assertEqual(proc.token, fake_kap.FAKE_TOKEN)
             self.assertIsNone(proc.poll())
         finally:
-            returncode = proc.stop()
+            # Load-tolerant grace: under a full-suite run the fake's SIGTERM
+            # handling can outlast the production default (10s), and what this
+            # test locks is the clean-stop path, not the timing budget.
+            returncode = proc.stop(grace_seconds=30)
         self.assertEqual(returncode, 0)
 
     def test_port_conflict_retries_with_next_port(self) -> None:
@@ -112,7 +115,8 @@ class KapServerProcessTests(FakeKimiTestCase):
 
         proc2 = KapServerProcess(kimi_bin=self.kimi_bin, home=self.home, requested_port=0)
         proc2.start()
-        self.assertEqual(proc2.stop(), 0)
+        # Load-tolerant grace (see test_start_waits_for_readiness...).
+        self.assertEqual(proc2.stop(grace_seconds=30), 0)
         self.assertIsNotNone(proc2.poll())
 
     def test_child_env_contains_home_and_model_overlay(self) -> None:
