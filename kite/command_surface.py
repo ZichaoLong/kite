@@ -87,6 +87,11 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
         "查看绑定、会话工作状态与队列。",
     ),
     CommandSpec(
+        "/last",
+        "/last",
+        "重发当前会话最近一次终态答复文本。",
+    ),
+    CommandSpec(
         "/abort",
         "/abort",
         "中止当前执行中的 prompt；仅发起者或管理员可用。",

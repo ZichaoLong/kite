@@ -156,11 +156,12 @@ def build_outbound_runtime(
             "default_model missing); prompts will fail upstream and surface "
             "as failed terminal cards"
         )
+    terminal_store = TerminalResultStore(data_dir)
     pipeline = EventPipeline(
         transport=transport,
         rest=rest_proxy,
         binding_store=binding_store,
-        terminal_store=TerminalResultStore(data_dir),
+        terminal_store=terminal_store,
         ownership=ownership,
         runtime_loop=loop,
         cursor_store=EventCursorStore(data_dir),
@@ -181,6 +182,7 @@ def build_outbound_runtime(
         prompt_model=prompt_model,
         prompt_ownership=ownership,
         on_session_bound=ws_hook,
+        terminal_store=terminal_store,
     )
     handler_proxy.impl = handler
 

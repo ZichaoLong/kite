@@ -148,6 +148,7 @@ _GROUP_NOT_ACTIVATED_MEMBER_TEXT = "本群尚未激活，@我 发送的消息不
 _GROUP_NOT_ACTIVATED_ADMIN_TEXT = "本群尚未激活，@我 发送的消息不会被处理。发送 /group activate 激活后，群成员即可 @我 使用。"
 _GROUP_COMMAND_ADMIN_ONLY_TEXT = "群聊中命令仅管理员可用。"
 _ABORT_DENIED_TEXT = "只有该 prompt 的发起者或管理员可以中止它。"
+_LAST_TEXT_CAP = 15000
 _GROUP_PROMPT_HINT_TEXT = "群聊中请 @我 并发送文字来提交 prompt。"
 
 
@@ -313,11 +314,13 @@ class AppHandler(TransportHandler):
         prompt_ownership: Optional[PromptOwnership] = None,
         on_session_bound: Optional[Callable[[str], None]] = None,
         persist_admins: Optional[Callable[[set[str]], None]] = None,
+        terminal_store: Any = None,
     ) -> None:
         self._transport = transport
         self._ops = KapSessionOps(rest, model=prompt_model)
         self._binding_store = binding_store
         self._group_config_store = group_config_store
+        self._terminal_store = terminal_store
         self._loop = runtime_loop
         self._default_working_dir = kite_config.default_working_dir(config)
         self._admins: set[str] = kite_config.admin_open_ids(config)
@@ -355,6 +358,7 @@ class AppHandler(TransportHandler):
             "/plan": self._cmd_plan,
             "/group": self._cmd_group,
             "/status": self._cmd_status,
+            "/last": self._cmd_last,
             "/abort": self._cmd_abort,
             "/help": self._cmd_help,
             "/init": self._cmd_init,
@@ -1201,6 +1205,29 @@ class AppHandler(TransportHandler):
             active = "1 条执行中" if queue.active_prompt_id else "无执行中 prompt"
             lines.append(f"队列：{active}，排队 {queue.queue_depth} 条")
         self._reply_to(message, "\n".join(lines))
+
+    def _cmd_last(self, message: InboundMessage, arg: str) -> None:
+        """/last: reply with the bound session's latest terminal result text.
+
+        Reads the local terminal result store (design §6: terminal text is
+        persisted for /last-style reads); no upstream call, no state axis.
+        """
+        if arg.strip():
+            self._reply_to(message, build_usage_text("/last"))
+            return
+        binding = self._load_binding_or_reply(message)
+        if binding is None:
+            return
+        if self._terminal_store is None:
+            self._reply_to(message, "终态记录不可用。")
+            return
+        text = self._terminal_store.latest_for_session(binding["session_id"])
+        if not text:
+            self._reply_to(message, "该会话暂无终态答复记录。")
+            return
+        if len(text) > _LAST_TEXT_CAP:
+            text = text[:_LAST_TEXT_CAP] + "\n\n（内容过长，已截断）"
+        self._reply_to(message, text)
 
     def _cmd_abort(self, message: InboundMessage, arg: str) -> None:
         if arg.strip():

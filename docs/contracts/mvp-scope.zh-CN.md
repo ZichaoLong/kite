@@ -33,6 +33,7 @@
 | `/mode <auto\|manual\|yolo>` | 读写 binding 级 permission mode（kap `permission_mode`)；每个 prompt 显式携带 |
 | `/plan [on\|off]` | 查看/切换 binding 级 plan mode（kap `plan_mode`，与 permission mode 正交）；每个 prompt 显式携带 |
 | `/status` | 展示 binding、session、work state、排队情况 |
+| `/last` | 重发当前会话最近一次终态答复文本（本地终态 store，超过 15000 字符截断） |
 | `/abort` | 中断 active prompt；仅该 prompt 发起者与管理员可用；对已完成 prompt 再 abort 得上游 40402(not pending)→ 提示"已结束"，执行卡不转失败（spike S2) |
 | `/help` | 命令导航 |
 | `kitectl` | config / service（启停、status、log)/ binding(list)/ session(list、status)/ prompt send |

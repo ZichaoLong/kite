@@ -35,6 +35,7 @@ from kite.runtime_loop import RuntimeLoop
 from kite.stores.binding_store import BindingStore
 from kite.stores.group_config_store import GroupConfigStore
 from kite.stores.pending_attachment_store import PendingAttachmentStore
+from kite.stores.terminal_result_store import TerminalResultRecord, TerminalResultStore
 
 ADMIN_OPEN_ID = "ou_admin"
 CHAT_ID = "oc_chat"
@@ -427,6 +428,49 @@ class IdentityTests(AppHandlerTestCase):
 # ---------------------------------------------------------------------------
 # Plain-text prompt path
 # ---------------------------------------------------------------------------
+
+
+class LastCommandTests(AppHandlerTestCase):
+    def _seed_terminal(self, text: str = "最终答复文本", session_id: str = "s-1") -> TerminalResultStore:
+        store = TerminalResultStore(self.data_dir)
+        store.upsert(
+            TerminalResultRecord(
+                message_id="om_t1",
+                execution_message_id="om_e1",
+                final_reply_text=text,
+                recorded_at=1000.0,
+                terminal_result_id="p-1",
+                session_id=session_id,
+            )
+        )
+        return store
+
+    def test_last_replies_with_terminal_text(self) -> None:
+        store = self._seed_terminal()
+        self.handler = self._make_handler(terminal_store=store)
+        self.bind("s-1")
+
+        self.send("/last")
+
+        self.assertIn("最终答复文本", self.transport.last_text())
+
+    def test_last_without_record(self) -> None:
+        self.handler = self._make_handler(terminal_store=TerminalResultStore(self.data_dir))
+        self.bind("s-1")
+
+        self.send("/last")
+
+        self.assertIn("暂无终态答复记录", self.transport.last_text())
+
+    def test_last_truncates_long_text(self) -> None:
+        store = self._seed_terminal(text="长" * 16000)
+        self.handler = self._make_handler(terminal_store=store)
+        self.bind("s-1")
+
+        self.send("/last")
+
+        self.assertIn("已截断", self.transport.last_text())
+        self.assertLess(len(self.transport.last_text()), 16000)
 
 
 class PromptSubmissionTests(AppHandlerTestCase):

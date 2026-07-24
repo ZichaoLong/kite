@@ -38,6 +38,7 @@ If it cannot answer, cut the requirement. No exceptions.
 | `/mode <auto\|manual\|yolo>` | read/write the binding-level permission mode (kap `permission_mode`); carried explicitly on every prompt |
 | `/plan [on\|off]` | read/toggle the binding-level plan mode (kap `plan_mode`, orthogonal to permission mode); carried explicitly on every prompt |
 | `/status` | show binding, session, work state, queue status |
+| `/last` | reply with the bound session's most recent terminal result text from the local store (truncated past 15000 chars) |
 | `/abort` | abort the active prompt; only available to that prompt's initiator and admins; aborting an already-finished prompt gets upstream 40402 (not pending) → show "already finished", do not transition the card to failed (spike S2) |
 | `/help` | command navigation |
 | `kitectl` | config / service (start/stop, status, log) / binding (list) / session (list, status) / prompt send |

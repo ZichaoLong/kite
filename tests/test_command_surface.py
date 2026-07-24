@@ -74,6 +74,7 @@ class CommandSpecTests(unittest.TestCase):
                 "/plan",
                 "/group",
                 "/status",
+                "/last",
                 "/abort",
                 "/init",
                 "/help",
