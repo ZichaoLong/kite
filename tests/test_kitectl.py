@@ -653,6 +653,74 @@ class PromptSendTests(KitectlTestCase):
         self.assertIn("kited error unauthorized", err)
 
 
+class InteractionSweepTests(KitectlTestCase):
+    def _seed(
+        self,
+        session_id: str = "s-1",
+        *,
+        approvals: int = 2,
+        questions: int = 1,
+    ) -> None:
+        session = self.state.create_session(session_id)
+        for index in range(approvals):
+            self.state.add_pending_approval(session, f"a-{index}")
+        for index in range(questions):
+            self.state.add_pending_question(session, f"q-{index}")
+
+    def test_dry_run_prints_plan_without_resolving(self) -> None:
+        self._seed()
+
+        code, out, _ = self._run_cli("interaction", "sweep")
+
+        self.assertEqual(code, 0)
+        self.assertIn("2 approval(s), 1 question(s) pending", out)
+        self.assertIn("dry-run", out)
+        self.assertEqual(self.state.approval_resolutions, [])
+        self.assertEqual(self.state.question_dismissals, [])
+
+    def test_yes_sweeps_and_tolerates_dismiss_envelope(self) -> None:
+        self._seed()
+
+        code, out, _ = self._run_cli("interaction", "sweep", "--yes")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.state.approval_resolutions), 2)
+        for resolution in self.state.approval_resolutions:
+            self.assertEqual(resolution["body"]["decision"], "rejected")
+        self.assertEqual(self.state.question_dismissals, [("s-1", "q-0")])
+        session = self.state.sessions["s-1"]
+        self.assertEqual(session.pending_approvals, [])
+        self.assertEqual(session.pending_questions, [])
+        self.assertIn("swept 2 approval(s), 1 question(s)", out)
+
+    def test_no_pending(self) -> None:
+        self.state.create_session("s-1")
+
+        code, out, _ = self._run_cli("interaction", "sweep")
+
+        self.assertEqual(code, 0)
+        self.assertIn("(no pending interactions)", out)
+
+    def test_session_filter_leaves_others_untouched(self) -> None:
+        self._seed("s-1")
+        other = self.state.create_session("s-2")
+        self.state.add_pending_approval(other, "a-x")
+
+        code, _, _ = self._run_cli("interaction", "sweep", "--session", "s-2", "--yes")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [item["approval_id"] for item in self.state.approval_resolutions], ["a-x"]
+        )
+        self.assertEqual(len(self.state.sessions["s-1"].pending_approvals), 2)
+
+    def test_missing_session_is_reported_and_skipped(self) -> None:
+        code, out, _ = self._run_cli("interaction", "sweep", "--session", "s-nope")
+
+        self.assertEqual(code, 0)
+        self.assertIn("session not found; skipped", out)
+
+
 class ImageSendTests(KitectlTestCase):
     """`image send` is a client of kited's loopback control plane (§3).
 

@@ -46,6 +46,9 @@ class FakeSession:
         self.journal: list[dict[str, Any]] = []
         self.active_prompt: str | None = None
         self.queued_prompts: list[str] = []
+        # Pending approvals/questions for the interaction sweep endpoints.
+        self.pending_approvals: list[dict[str, Any]] = []
+        self.pending_questions: list[dict[str, Any]] = []
         # Optional in-flight turn projection for the snapshot route (wire
         # inFlightTurnSchema: turn_id / assistant_text / thinking_text / ...).
         self.in_flight_turn: dict[str, Any] | None = None
@@ -69,6 +72,8 @@ class FakeKapState:
         self.shutdown_requested = False
         self.last_shutdown_content_type: str | None = None
         self.prompt_submissions: list[dict[str, Any]] = []
+        self.approval_resolutions: list[dict[str, Any]] = []
+        self.question_dismissals: list[tuple[str, str]] = []
         self._subscribers: dict[int, tuple[Any, set[str]]] = {}
 
     def note(self, entry: str) -> None:
@@ -152,6 +157,28 @@ class FakeKapState:
             if key in self._subscribers:
                 connection, _ = self._subscribers[key]
                 self._subscribers[key] = (connection, session_ids)
+
+    def add_pending_approval(self, session: FakeSession, approval_id: str) -> None:
+        with self.lock:
+            session.pending_approvals.append({
+                "approval_id": approval_id,
+                "session_id": session.id,
+                "tool_call_id": f"tc-{approval_id}",
+                "tool_name": "Bash",
+                "action": "execute",
+                "tool_input_display": {"kind": "command", "command": "rm -rf build/"},
+                "created_at": "2026-01-01T00:00:00Z",
+                "expires_at": "2026-01-01T01:00:00Z",
+            })
+
+    def add_pending_question(self, session: FakeSession, question_id: str) -> None:
+        with self.lock:
+            session.pending_questions.append({
+                "question_id": question_id,
+                "session_id": session.id,
+                "items": [{"question": "继续吗？", "options": [{"label": "是"}, {"label": "否"}]}],
+                "created_at": "2026-01-01T00:00:00Z",
+            })
 
     def send_error_frame(self, session_id: str, code: str, message: str) -> None:
         """Broadcast a WS ``error`` frame (not a durable event; no seq)."""
@@ -282,6 +309,20 @@ class FakeKapRestHandler(BaseHTTPRequestHandler):
                 "queued": [_prompt_wire(pid, "queued") for pid in session.queued_prompts],
             }))
             return
+        if len(parts) == 3 and parts[0] == "sessions" and parts[2] == "approvals":
+            session = self.state.sessions.get(parts[1])
+            if session is None:
+                self._send(_envelope(40401, None, "session not found"))
+                return
+            self._send(_envelope(0, {"items": list(session.pending_approvals)}))
+            return
+        if len(parts) == 3 and parts[0] == "sessions" and parts[2] == "questions":
+            session = self.state.sessions.get(parts[1])
+            if session is None:
+                self._send(_envelope(40401, None, "session not found"))
+                return
+            self._send(_envelope(0, {"items": list(session.pending_questions)}))
+            return
         if len(parts) == 3 and parts[0] == "sessions" and parts[2] == "snapshot":
             session = self.state.sessions.get(parts[1])
             if session is None:
@@ -347,6 +388,35 @@ class FakeKapRestHandler(BaseHTTPRequestHandler):
                 session.queued_prompts.append(prompt_id)
                 status = "queued"
             self._send(_envelope(0, _prompt_wire(prompt_id, status)))
+            return
+        if len(parts) == 4 and parts[0] == "sessions" and parts[2] == "approvals":
+            session = self.state.sessions.get(parts[1])
+            if session is None:
+                self._send(_envelope(40401, None, "session not found"))
+                return
+            remaining = [a for a in session.pending_approvals if a["approval_id"] != parts[3]]
+            if len(remaining) == len(session.pending_approvals):
+                self._send(_envelope(40404, None, "approval not found"))
+                return
+            session.pending_approvals = remaining
+            self.state.approval_resolutions.append(
+                {"session_id": parts[1], "approval_id": parts[3], "body": body}
+            )
+            self._send(_envelope(0, {"resolved": True, "resolved_at": "2026-01-01T00:00:00Z"}))
+            return
+        if len(parts) == 4 and parts[0] == "sessions" and parts[2] == "questions" and parts[3].endswith(":dismiss"):
+            session = self.state.sessions.get(parts[1])
+            if session is None:
+                self._send(_envelope(40401, None, "session not found"))
+                return
+            question_id = parts[3][: -len(":dismiss")]
+            remaining = [q for q in session.pending_questions if q["question_id"] != question_id]
+            if len(remaining) == len(session.pending_questions):
+                self._send(_envelope(40404, None, "question not found"))
+                return
+            session.pending_questions = remaining
+            self.state.question_dismissals.append((parts[1], question_id))
+            self._send(_envelope(40909, {"dismissed": True, "dismissed_at": "2026-01-01T00:00:00Z"}))
             return
         self._send(_envelope(40404, None, "route not found"))
 

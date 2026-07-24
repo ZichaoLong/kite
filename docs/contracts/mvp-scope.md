@@ -146,3 +146,7 @@ explicitly; "best-effort" silent degradation is forbidden:
 9. The running execution card carries a 取消执行 button (same permission
    rule as `/abort`: initiator or admin); clicks are idempotent — an
    already-finished prompt answers "已结束" (40402) (2026-07-24).
+10. `kitectl interaction sweep [--session <id>] [--yes]` rejects/dismisses
+    stale pending approvals/questions upstream (dry-run without `--yes`);
+    these are upstream kap resources, so it talks to kap REST directly
+    (2026-07-24).

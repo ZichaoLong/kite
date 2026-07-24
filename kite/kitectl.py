@@ -546,6 +546,98 @@ def _cmd_image_send(args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
+def _quote_path(value: str) -> str:
+    from urllib.parse import quote
+
+    return quote(str(value), safe="")
+
+
+# Upstream quirk: a successful question dismiss replies with code 40909
+# (the *success* envelope, routes/questions.ts) — not an error.
+_KAP_QUESTION_DISMISSED = 40909
+
+
+def _pending_interactions(client: KapRestClient, session_id: str) -> tuple[list[str], list[str]]:
+    """Pending approval/question ids of one session (empty lists when clean)."""
+    approvals = client.get(f"/sessions/{_quote_path(session_id)}/approvals?status=pending")
+    questions = client.get(f"/sessions/{_quote_path(session_id)}/questions?status=pending")
+    approval_ids = [
+        str(item.get("approval_id") or "")
+        for item in (approvals.get("items") or [])
+        if isinstance(item, dict) and str(item.get("approval_id") or "").strip()
+    ]
+    question_ids = [
+        str(item.get("question_id") or "")
+        for item in (questions.get("items") or [])
+        if isinstance(item, dict) and str(item.get("question_id") or "").strip()
+    ]
+    return approval_ids, question_ids
+
+
+def _cmd_interaction_sweep(args: argparse.Namespace) -> int:
+    """Reject/dismiss stale pending approvals/questions upstream.
+
+    These are UPSTREAM kap resources (not daemon-owned state), so this talks
+    to kap REST directly, like the service gate. Dry-run by default;
+    `--yes` performs the sweep.
+    """
+    client = _connect()
+    if args.session:
+        session_ids = [args.session]
+    else:
+        sessions = _checked(client.list_sessions)
+        session_ids = [summary.session_id for summary in sessions]
+
+    plan: list[tuple[str, list[str], list[str]]] = []
+    for session_id in session_ids:
+        try:
+            approval_ids, question_ids = _pending_interactions(client, session_id)
+        except kap_server.KapError as exc:
+            if exc.code == 40401:
+                print(f"{session_id}: session not found; skipped")
+                continue
+            _die(f"cannot list pending interactions for {session_id}: {exc.msg}", exit_code=1)
+        if approval_ids or question_ids:
+            plan.append((session_id, approval_ids, question_ids))
+
+    if not plan:
+        print("(no pending interactions)")
+        return 0
+    for session_id, approval_ids, question_ids in plan:
+        print(f"{session_id}: {len(approval_ids)} approval(s), {len(question_ids)} question(s) pending")
+    if not args.yes:
+        print("dry-run: re-run with --yes to reject the approvals and dismiss the questions")
+        return 0
+
+    skipped = 0
+    for session_id, approval_ids, question_ids in plan:
+        for approval_id in approval_ids:
+            try:
+                client.call(
+                    "POST",
+                    f"/sessions/{_quote_path(session_id)}/approvals/{_quote_path(approval_id)}",
+                    {"decision": "rejected"},
+                )
+            except kap_server.KapError as exc:
+                skipped += 1
+                print(f"  {session_id} approval {approval_id}: {exc.code} {exc.msg} (skipped)")
+        for question_id in question_ids:
+            try:
+                client.call(
+                    "POST",
+                    f"/sessions/{_quote_path(session_id)}/questions/{_quote_path(question_id)}:dismiss",
+                )
+            except kap_server.KapError as exc:
+                if exc.code == _KAP_QUESTION_DISMISSED:
+                    continue  # the dismiss success envelope (upstream quirk)
+                skipped += 1
+                print(f"  {session_id} question {question_id}: {exc.code} {exc.msg} (skipped)")
+        print(f"{session_id}: swept {len(approval_ids)} approval(s), {len(question_ids)} question(s)")
+    if skipped:
+        print(f"note: {skipped} item(s) were already resolved upstream (skipped)")
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="kitectl", description="KITE local admin CLI.")
     parser.add_argument(
@@ -663,6 +755,29 @@ def _build_parser() -> argparse.ArgumentParser:
         help="local image file (the daemon validates existence and the byte cap)",
     )
     image_send_parser.set_defaults(func=_cmd_image_send)
+
+    interaction_parser = subparsers.add_parser(
+        "interaction", help="stale approval/question cleanup (upstream)"
+    )
+    interaction_sub = interaction_parser.add_subparsers(
+        dest="interaction_command", required=True
+    )
+    sweep_parser = interaction_sub.add_parser(
+        "sweep",
+        help="reject stale pending approvals and dismiss stale pending questions "
+        "(dry-run unless --yes is given)",
+    )
+    sweep_parser.add_argument(
+        "--session",
+        metavar="SESSION_ID",
+        help="limit the sweep to one session (default: all visible sessions)",
+    )
+    sweep_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="actually reject/dismiss; without it only the plan is printed",
+    )
+    sweep_parser.set_defaults(func=_cmd_interaction_sweep)
     return parser
 
 
