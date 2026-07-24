@@ -688,6 +688,75 @@ class MergeForwardFetchTests(unittest.TestCase):
             transport.fetch_merge_forward_items("om-root")
 
 
+class ListMessagesTests(unittest.TestCase):
+    def _transport_with_mock_client(self) -> tuple[FeishuTransport, Mock]:
+        transport = _make_transport()
+        transport.client = Mock()
+        return transport, transport.client
+
+    def test_list_messages_builds_chat_history_request(self) -> None:
+        transport, client = self._transport_with_mock_client()
+        items = [SimpleNamespace(message_id="om-1"), SimpleNamespace(message_id="om-2")]
+        client.im.v1.message.list.return_value = _ok_response(
+            items=items, has_more=True, page_token="tok-2"
+        )
+
+        page = transport.list_messages(
+            "oc-1",
+            start_time="100",
+            end_time="200",
+            sort_type="ByCreateTimeAsc",
+            page_size=50,
+            page_token="tok-1",
+        )
+
+        self.assertEqual(page.items, items)
+        self.assertTrue(page.has_more)
+        self.assertEqual(page.page_token, "tok-2")
+        request = client.im.v1.message.list.call_args.args[0]
+        self.assertEqual(request.uri, "/open-apis/im/v1/messages")
+        self.assertEqual(
+            dict(request.queries),
+            {
+                "container_id_type": "chat",
+                "container_id": "oc-1",
+                "sort_type": "ByCreateTimeAsc",
+                "page_size": "50",
+                "start_time": "100",
+                "end_time": "200",
+                "page_token": "tok-1",
+            },
+        )
+
+    def test_list_messages_omits_optional_params(self) -> None:
+        transport, client = self._transport_with_mock_client()
+        client.im.v1.message.list.return_value = _ok_response(items=[], has_more=False)
+
+        page = transport.list_messages("oc-1")
+
+        self.assertEqual(page.items, [])
+        self.assertFalse(page.has_more)
+        request = client.im.v1.message.list.call_args.args[0]
+        queries = dict(request.queries)
+        self.assertNotIn("start_time", queries)
+        self.assertNotIn("end_time", queries)
+        self.assertNotIn("page_token", queries)
+
+    def test_list_messages_failure_raises(self) -> None:
+        transport, client = self._transport_with_mock_client()
+        client.im.v1.message.list.return_value = _fail_response()
+
+        with self.assertRaises(RuntimeError):
+            transport.list_messages("oc-1")
+
+    def test_list_messages_sdk_exception_raises(self) -> None:
+        transport, client = self._transport_with_mock_client()
+        client.im.v1.message.list.side_effect = RuntimeError("network down")
+
+        with self.assertRaises(RuntimeError):
+            transport.list_messages("oc-1")
+
+
 class ImageUploadTests(unittest.TestCase):
     def test_upload_image_missing_path_returns_none(self) -> None:
         transport = _make_transport()

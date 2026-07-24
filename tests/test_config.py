@@ -8,11 +8,15 @@ from unittest.mock import patch
 from kite import config as config_module
 from kite.config import (
     DEFAULT_APPROVAL_TIMEOUT_SECONDS,
+    DEFAULT_GROUP_HISTORY_FETCH_LIMIT,
+    DEFAULT_GROUP_HISTORY_FETCH_LOOKBACK_SECONDS,
     admin_open_ids,
     approval_timeout_seconds,
     config_dir,
     default_working_dir,
     ensure_init_token,
+    group_history_fetch_limit,
+    group_history_fetch_lookback_seconds,
     init_token_path,
     kap_settings,
     load_config,
@@ -145,6 +149,39 @@ class ConfigTests(unittest.TestCase):
             with self.subTest(bad=bad):
                 with self.assertRaisesRegex(ValueError, "approval_timeout_seconds"):
                     approval_timeout_seconds({"approval_timeout_seconds": bad})
+
+    def test_group_history_fetch_settings_default(self) -> None:
+        self.assertEqual(group_history_fetch_limit({}), DEFAULT_GROUP_HISTORY_FETCH_LIMIT)
+        self.assertEqual(
+            group_history_fetch_lookback_seconds({}),
+            DEFAULT_GROUP_HISTORY_FETCH_LOOKBACK_SECONDS,
+        )
+
+    def test_group_history_fetch_settings_accept_overrides(self) -> None:
+        config = {
+            "group_history_fetch_limit": 20,
+            "group_history_fetch_lookback_seconds": 3600,
+        }
+        self.assertEqual(group_history_fetch_limit(config), 20)
+        self.assertEqual(group_history_fetch_lookback_seconds(config), 3600)
+
+    def test_group_history_fetch_settings_accept_zero_as_disable(self) -> None:
+        config = {
+            "group_history_fetch_limit": 0,
+            "group_history_fetch_lookback_seconds": 0,
+        }
+        self.assertEqual(group_history_fetch_limit(config), 0)
+        self.assertEqual(group_history_fetch_lookback_seconds(config), 0)
+
+    def test_group_history_fetch_settings_reject_invalid_values(self) -> None:
+        for bad in (-1, "abc", True, None):
+            with self.subTest(bad=bad):
+                with self.assertRaisesRegex(ValueError, "group_history_fetch_limit"):
+                    group_history_fetch_limit({"group_history_fetch_limit": bad})
+                with self.assertRaisesRegex(ValueError, "group_history_fetch_lookback_seconds"):
+                    group_history_fetch_lookback_seconds(
+                        {"group_history_fetch_lookback_seconds": bad}
+                    )
 
     def test_kap_settings_defaults_when_section_absent(self) -> None:
         settings = kap_settings({})

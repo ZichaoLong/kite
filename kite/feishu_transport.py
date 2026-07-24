@@ -53,6 +53,7 @@ from lark_oapi.api.im.v1 import (
     DeleteMessageRequest,
     GetMessageRequest,
     GetMessageResourceRequest,
+    ListMessageRequest,
     P2ImChatDisbandedV1,
     P2ImChatMemberBotDeletedV1,
     P2ImMessageRecalledV1,
@@ -233,6 +234,15 @@ class DownloadedMessageResource:
     content_type: str
 
 
+@dataclass(frozen=True, slots=True)
+class ListedMessagesPage:
+    """One page of the chat message-history list API."""
+
+    items: list[Any]
+    has_more: bool = False
+    page_token: str = ""
+
+
 @dataclass
 class _MessageThreadContext:
     chat_id: str
@@ -354,6 +364,11 @@ class FeishuTransport:
         if normalized:
             self._configured_bot_open_id = normalized
             self._bot_open_id_error_logged = False
+
+    @property
+    def bot_open_id(self) -> str:
+        """The bot's own open_id ("" until configured/discovered)."""
+        return self._configured_bot_open_id
 
     def fetch_bot_open_id(self) -> str | None:
         """Discover this bot's open_id via ``GET /open-apis/bot/v3/info/``.
@@ -1116,6 +1131,53 @@ class FeishuTransport:
             file_key,
             resource_type="file",
         ).content
+
+    def list_messages(
+        self,
+        chat_id: str,
+        *,
+        start_time: str | None = None,
+        end_time: str | None = None,
+        sort_type: str = "ByCreateTimeAsc",
+        page_size: int = 50,
+        page_token: str = "",
+    ) -> ListedMessagesPage:
+        """Fetch one page of a chat's message history.
+
+        ``GET /open-apis/im/v1/messages`` with ``container_id_type=chat``
+        (FOCUS ``_list_history_messages_page``, same contract): start/end are
+        second-precision unix timestamps as strings; raises RuntimeError on
+        failure so the assistant-mode history fetch can fail closed
+        (group-chat contract §4.5).
+        """
+        builder = (
+            ListMessageRequest.builder()
+            .container_id_type("chat")
+            .container_id(str(chat_id or "").strip())
+            .sort_type(sort_type)
+            .page_size(int(page_size))
+        )
+        if start_time is not None:
+            builder = builder.start_time(str(start_time))
+        if end_time is not None:
+            builder = builder.end_time(str(end_time))
+        if page_token:
+            builder = builder.page_token(page_token)
+        request = builder.build()
+        try:
+            response = self.client.im.v1.message.list(request)
+        except Exception as e:
+            raise RuntimeError(f"message history fetch failed (SDK exception): {e}") from e
+        if not response.success():
+            raise RuntimeError(
+                f"message history fetch failed: code={response.code}, msg={response.msg}"
+            )
+        body = response.data
+        return ListedMessagesPage(
+            items=list(getattr(body, "items", None) or []),
+            has_more=bool(getattr(body, "has_more", False)),
+            page_token=str(getattr(body, "page_token", "") or "").strip(),
+        )
 
     def fetch_merge_forward_items(self, message_id: str) -> list[Any]:
         """Fetch the flattened message list of a merge_forward bundle.

@@ -110,7 +110,35 @@ class StrictWriteValidationTests(GroupConfigStoreTestCase):
 
     def test_invalid_mode_is_rejected(self) -> None:
         self._assert_save_rejected(_activated_config(mode="all"))
-        self._assert_save_rejected(_activated_config(mode="assistant"))
+        self._assert_save_rejected(_activated_config(mode="unknown"))
+
+    def test_assistant_mode_is_admitted(self) -> None:
+        saved = self.store.save(CHAT_ID, _activated_config(mode="assistant"))
+        self.assertEqual(saved["mode"], "assistant")
+        loaded = self.store.load(CHAT_ID)
+        assert loaded is not None
+        self.assertEqual(loaded["mode"], "assistant")
+
+    def test_set_mode_switches_and_preserves_activation(self) -> None:
+        self.store.activate(CHAT_ID, activated_by="ou_admin", activated_at=123.0)
+        config = self.store.set_mode(CHAT_ID, "assistant")
+        self.assertEqual(config["mode"], "assistant")
+        self.assertTrue(config["activated"])
+        self.assertEqual(config["activated_by"], "ou_admin")
+        # ...and back, still activated.
+        config = self.store.set_mode(CHAT_ID, "mention_only")
+        self.assertEqual(config["mode"], "mention_only")
+        self.assertTrue(config["activated"])
+
+    def test_set_mode_without_record_creates_non_activated(self) -> None:
+        config = self.store.set_mode(CHAT_ID, "assistant")
+        self.assertEqual(config["mode"], "assistant")
+        self.assertFalse(config["activated"])
+        self.assertFalse(self.store.is_activated(CHAT_ID))
+
+    def test_set_mode_rejects_invalid_mode(self) -> None:
+        with self.assertRaises(ValueError):
+            self.store.set_mode(CHAT_ID, "all")
 
     def test_activated_must_be_bool(self) -> None:
         self._assert_save_rejected(_activated_config(activated="yes"))

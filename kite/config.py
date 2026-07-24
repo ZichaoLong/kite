@@ -29,6 +29,13 @@ DEFAULT_APPROVAL_TIMEOUT_SECONDS = 300
 DEFAULT_ATTACHMENT_TTL_SECONDS = 600
 DEFAULT_ATTACHMENT_MAX_BYTES = 20 * 1024 * 1024
 
+# Assistant-mode group context (docs/contracts/group-chat.md §3.3): the
+# Feishu REST history backfill merged into the local log is capped at this
+# many messages over this lookback window. 0 disables the backfill (context
+# is then local-log only — the fetch-failure block never fires).
+DEFAULT_GROUP_HISTORY_FETCH_LIMIT = 50
+DEFAULT_GROUP_HISTORY_FETCH_LOOKBACK_SECONDS = 24 * 3600
+
 
 def config_dir() -> Path:
     raw = os.environ.get("KITE_CONFIG_DIR", "").strip()
@@ -201,6 +208,33 @@ def attachment_max_bytes(config: Mapping[str, Any]) -> int:
     if isinstance(raw, bool) or value <= 0:
         raise ValueError("attachment_max_bytes must be a positive integer")
     return value
+
+
+def _non_negative_int(config: Mapping[str, Any], key: str, default: int) -> int:
+    raw = config.get(key, default)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{key} must be a non-negative integer") from exc
+    if isinstance(raw, bool) or value < 0:
+        raise ValueError(f"{key} must be a non-negative integer")
+    return value
+
+
+def group_history_fetch_limit(config: Mapping[str, Any]) -> int:
+    """Max messages the assistant-mode REST history backfill returns."""
+    return _non_negative_int(
+        config, "group_history_fetch_limit", DEFAULT_GROUP_HISTORY_FETCH_LIMIT
+    )
+
+
+def group_history_fetch_lookback_seconds(config: Mapping[str, Any]) -> int:
+    """Lookback window (seconds) for the assistant-mode history backfill."""
+    return _non_negative_int(
+        config,
+        "group_history_fetch_lookback_seconds",
+        DEFAULT_GROUP_HISTORY_FETCH_LOOKBACK_SECONDS,
+    )
 
 
 # ---------------------------------------------------------------------------

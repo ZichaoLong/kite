@@ -82,6 +82,11 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
         "激活/停用当前群聊（仅管理员，在群聊中使用）；激活后成员 @机器人 发送文字即可提交 prompt。",
     ),
     CommandSpec(
+        "/group-mode",
+        "/group-mode 〈mention_only|assistant〉",
+        "查看或切换群聊模式（仅管理员，在已激活的群聊中使用）；assistant 模式记录群成员消息并在 @机器人 时携带群聊上下文。",
+    ),
+    CommandSpec(
         "/status",
         "/status",
         "查看绑定、会话工作状态与队列。",

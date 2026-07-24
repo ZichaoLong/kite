@@ -51,6 +51,7 @@ from kite.event_pipeline import (
 )
 from kite.feishu_transport import FeishuTransport, TransportHandler
 from kite.feishu_ws_proxy import DEFAULT_FEISHU_WS_PROXY
+from kite.group_history import GroupHistoryRecovery
 from kite.identity_names import IdentityNames
 from kite.logging_setup import configure_logging
 from kite.platform_paths import default_data_root
@@ -60,6 +61,7 @@ from kite.runtime_status import RuntimeStatusWriter
 from kite.stores.binding_store import BindingStore
 from kite.stores.event_cursor_store import EventCursorStore
 from kite.stores.group_config_store import GroupConfigStore
+from kite.stores.group_log_store import GroupLogStore
 from kite.stores.pending_attachment_store import PendingAttachmentStore
 from kite.stores.terminal_result_store import TerminalResultStore
 
@@ -164,6 +166,30 @@ def build_outbound_runtime(
     # One shared display-name cache: the pipeline's routing hints and the
     # forward aggregator's transcript sender names read through it.
     names = IdentityNames(transport.fetch_user_name)
+    # Assistant-mode group context (group-chat contract §3.3): the per-chat
+    # log store (axis 6) plus the recovery port merging it with the Feishu
+    # REST history backfill. The render port reuses the transport's text
+    # extraction/mention normalization so history items read exactly like
+    # live inbound messages.
+    group_log_store = GroupLogStore(data_dir)
+
+    def _render_group_history_text(
+        msg_type: str, content_dict: dict, mentions: list
+    ) -> str:
+        text = FeishuTransport._extract_text(msg_type, content_dict)
+        if text and mentions:
+            text = transport._normalize_mentions(text, list(mentions))
+        return text
+
+    group_history = GroupHistoryRecovery(
+        list_messages=transport.list_messages,
+        render_text=_render_group_history_text,
+        name_of=names.name_of,
+        log_store=group_log_store,
+        app_id=str(config["app_id"]),
+        fetch_limit=kite_config.group_history_fetch_limit(config),
+        lookback_seconds=kite_config.group_history_fetch_lookback_seconds(config),
+    )
     pipeline = EventPipeline(
         transport=transport,
         rest=rest_proxy,
@@ -191,6 +217,8 @@ def build_outbound_runtime(
         on_session_bound=ws_hook,
         terminal_store=terminal_store,
         names=names,
+        group_log_store=group_log_store,
+        group_history=group_history,
     )
     handler_proxy.impl = handler
 

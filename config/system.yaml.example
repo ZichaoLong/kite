@@ -23,6 +23,13 @@ app_secret: "xxx"
 # attachment_ttl_seconds: 600
 # attachment_max_bytes: 20971520
 
+# Assistant-mode group context (docs/contracts/group-chat.md): the Feishu
+# REST history backfill merged into the per-chat log is capped at this many
+# messages over this lookback window. 0 disables the backfill (context is
+# then local-log only). Defaults: 50 / 86400 (24h).
+# group_history_fetch_limit: 50
+# group_history_fetch_lookback_seconds: 86400
+
 # kap-server connection (all optional; defaults shown):
 # kap:
 #   host: 127.0.0.1   # loopback only; kap-server has no TLS

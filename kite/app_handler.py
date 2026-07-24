@@ -18,12 +18,18 @@ Implements the MVP inbound contract (docs/contracts/mvp-scope.md):
   submit discipline for `kitectl prompt send` (minus the Feishu ack), so
   CLI-sent prompts record ownership exactly like Feishu-originated ones
   (docs/decisions/control-plane.md);
-- group chats (docs/contracts/group-chat.md, mention_only first cut): a
-  non-activated group ignores everything except admin slash commands; in an
-  activated group any member's @bot+text enters the same prompt path as p2p
-  (first use creates+binds), slash commands stay admin-only except /abort
+- group chats (docs/contracts/group-chat.md): a non-activated group ignores
+  everything except admin slash commands; in an activated mention_only
+  group any member's @bot+text enters the same prompt path as p2p (first
+  use creates+binds), slash commands stay admin-only except /abort
   (initiator-or-admin actor check), and non-@ messages are ignored entirely.
-  Group activation config lives in the GroupConfigStore (state axis 5);
+  In assistant mode every member text message is appended to the per-chat
+  log (GroupLogStore, state axis 6) and @bot+text triggers with the log
+  since the trigger boundary — merged with a Feishu REST history backfill
+  by GroupHistoryRecovery — as the context envelope; a history fetch
+  failure blocks the prompt with an explicit notice (fail-closed), and the
+  boundary advances only after a successful submit. Group activation config
+  lives in the GroupConfigStore (state axis 5);
 - merge_forward bundles (p2p only): each merge_forward message's children
   are fetched and buffered per (sender, chat) by the ForwardAggregator; a
   short window later the expanded `<forwarded_messages>` transcript enters
@@ -31,7 +37,7 @@ Implements the MVP inbound contract (docs/contracts/mvp-scope.md):
   forwards at ingress — a forward never carries an @mention, so the
   mention_only ingress matrix drops it by definition;
 - the MVP slash commands (/new /sessions /switch /detach /attach /mode
-  /plan /group /status /abort /help /init); in-flight-work-sensitive commands run
+  /plan /group /group-mode /status /abort /help /init); in-flight-work-sensitive commands run
   the reason-coded preflights in kite/preflights.py (/new denies with an
   active prompt, /detach only notes it), and /new /switch rebinds fire the
   on_session_unbound seam so the outbound path can fail-close sweep the old
@@ -97,6 +103,7 @@ from kite.feishu_transport import (
     TransportHandler,
 )
 from kite.forward_aggregator import ForwardAggregator, MergedForwardBatch
+from kite.group_history import GroupHistoryRecovery
 from kite.identity_names import IdentityNames
 from kite.prompt_ownership import (
     CERTAINTY_BEST_EFFORT,
@@ -113,7 +120,13 @@ from kite.stores.binding_store import (
     BindingStore,
     StoredBinding,
 )
-from kite.stores.group_config_store import GroupConfigStore
+from kite.stores.group_config_store import (
+    GROUP_MODE_ASSISTANT,
+    GROUP_MODE_MENTION_ONLY,
+    VALID_GROUP_MODES,
+    GroupConfigStore,
+)
+from kite.stores.group_log_store import GroupLogStore
 from kite.stores.pending_attachment_store import PendingAttachmentStore
 
 logger = logging.getLogger("kite.app")
@@ -159,6 +172,12 @@ _GROUP_COMMAND_ADMIN_ONLY_TEXT = "群聊中命令仅管理员可用。"
 _ABORT_DENIED_TEXT = "只有该 prompt 的发起者或管理员可以中止它。"
 _LAST_TEXT_CAP = 15000
 _GROUP_PROMPT_HINT_TEXT = "群聊中请 @我 并发送文字来提交 prompt。"
+# Fail-closed §4.5: never answer without the context, say so explicitly.
+_GROUP_HISTORY_FETCH_FAILED_TEXT = (
+    "获取群聊历史上下文失败，本次消息未提交——我不会在缺少上下文的情况下回答。"
+    "请稍后重试；若持续失败请联系管理员排查。"
+)
+_GROUP_ASSISTANT_NOT_WIRED_TEXT = "群聊 assistant 模式未正确配置，消息未提交。请联系管理员排查。"
 
 
 @dataclass(frozen=True, slots=True)
@@ -326,11 +345,15 @@ class AppHandler(TransportHandler):
         terminal_store: Any = None,
         names: Optional[IdentityNames] = None,
         forward_timer_factory: Any = None,
+        group_log_store: Optional[GroupLogStore] = None,
+        group_history: Optional[GroupHistoryRecovery] = None,
     ) -> None:
         self._transport = transport
         self._ops = KapSessionOps(rest, model=prompt_model)
         self._binding_store = binding_store
         self._group_config_store = group_config_store
+        self._group_log_store = group_log_store
+        self._group_history = group_history
         self._terminal_store = terminal_store
         self._loop = runtime_loop
         self._default_working_dir = kite_config.default_working_dir(config)
@@ -381,6 +404,7 @@ class AppHandler(TransportHandler):
             "/mode": self._cmd_mode,
             "/plan": self._cmd_plan,
             "/group": self._cmd_group,
+            "/group-mode": self._cmd_group_mode,
             "/status": self._cmd_status,
             "/last": self._cmd_last,
             "/abort": self._cmd_abort,
@@ -494,10 +518,14 @@ class AppHandler(TransportHandler):
         - non-activated group: everything is ignored except admin slash
           commands (member @/slash gets one denial hint, never spam);
         - activated group: slash commands stay admin-only, except /abort
-          which uses the initiator-or-admin actor check (§3.4); non-@
-          messages are ignored entirely; any member's @bot+text enters the
-          prompt path (first use creates+binds like p2p). A missing sender
-          identity is treated as a non-member (§4.4) and never prompts.
+          which uses the initiator-or-admin actor check (§3.4). In
+          mention_only mode non-@ messages are ignored entirely and any
+          member's @bot+text enters the prompt path (first use creates+binds
+          like p2p). In assistant mode every member text message is appended
+          to the per-chat log (the bot's own and identity-less messages
+          never enter) and @bot+text triggers with the log since the trigger
+          boundary as context. A missing sender identity is treated as a
+          non-member (§4.4) and never prompts.
         """
         activated = self._group_config_store.is_activated(message.chat_id)
         is_admin = self._is_admin(message.sender_open_id)
@@ -519,6 +547,11 @@ class AppHandler(TransportHandler):
                     _GROUP_NOT_ACTIVATED_ADMIN_TEXT if is_admin else _GROUP_NOT_ACTIVATED_MEMBER_TEXT,
                 )
             return
+        group_config = self._group_config_store.load(message.chat_id)
+        mode = group_config["mode"] if group_config is not None else GROUP_MODE_MENTION_ONLY
+        if mode == GROUP_MODE_ASSISTANT:
+            self._on_assistant_group_message(message, text)
+            return
         if not message.bot_mentioned:
             # Non-@ group chatter is ignored entirely: no prompt, no
             # interaction claim, no context (§3.2).
@@ -533,6 +566,101 @@ class AppHandler(TransportHandler):
         if self.try_handle_interaction_reply(message):
             return
         self._handle_prompt(message)
+
+    def _on_assistant_group_message(self, message: InboundMessage, text: str) -> None:
+        """Assistant-mode group ingress (group-chat §3.2/§3.3).
+
+        Every member text message is appended to the per-chat log — including
+        the trigger message itself, which the context merge then excludes by
+        seq (it is rendered as the current turn). @bot+text composes the
+        envelope via the history recovery port and submits; the boundary
+        advances to the trigger point only after a successful submit, so a
+        failed submit (or a blocked fetch) never loses context silently.
+        """
+        if self._group_log_store is None or self._group_history is None:
+            # Assistant mode cannot work without the log/history wiring:
+            # fail closed (never degrade to answering without context).
+            logger.error(
+                "assistant mode active but group log/history not wired: chat=%s",
+                message.chat_id,
+            )
+            if message.bot_mentioned and text:
+                self._reply_to(message, _GROUP_ASSISTANT_NOT_WIRED_TEXT)
+            return
+        chat_id = message.chat_id
+        sender = message.sender_open_id.strip()
+        is_self = message.sender_type == "app" or (
+            bool(sender) and sender == self._bot_open_id()
+        )
+        current_seq = 0
+        if sender and not is_self and text:
+            current_seq = self._group_log_store.append(
+                chat_id,
+                {
+                    "message_id": message.message_id,
+                    "created_at": max(int(message.create_time or 0), 0),
+                    "sender_open_id": sender,
+                    "sender_type": message.sender_type.strip() or "user",
+                    "sender_name": self._names.name_of(
+                        sender, sender_type=message.sender_type
+                    ),
+                    "msg_type": message.msg_type.strip() or "text",
+                    "text": text,
+                },
+            )
+        if not message.bot_mentioned:
+            return
+        if not text:
+            self._reply_to(message, _GROUP_PROMPT_HINT_TEXT)
+            return
+        if not sender:
+            # Missing identity -> non-member (§4.4); never prompts.
+            self._reply_to(message, "无法识别你的身份（缺少 open_id），消息未提交。")
+            return
+        if is_self:
+            # The bot's own messages never enter the log nor trigger (§3.2).
+            return
+        if self.try_handle_interaction_reply(message):
+            return
+        # Compose the context envelope. A history fetch failure blocks the
+        # prompt with an explicit notice (fail-closed §4.5): the log entry
+        # and the boundary stay, so the next trigger still sees this context.
+        try:
+            context_entries = self._group_history.collect_context_entries(
+                chat_id=chat_id,
+                current_message_id=message.message_id,
+                current_create_time=message.create_time,
+                current_seq=current_seq,
+            )
+        except Exception as exc:
+            logger.warning("group history fetch failed chat=%s: %s", chat_id, exc)
+            self._reply_to(message, _GROUP_HISTORY_FETCH_FAILED_TEXT)
+            return
+        envelope = self._group_history.build_envelope(
+            text,
+            sender_name=self._names.name_of(sender, sender_type=message.sender_type),
+            context_entries=context_entries,
+            log_path=self._group_log_store.log_path(chat_id),
+        )
+        result = self._handle_prompt(message, submit_text=envelope)
+        if result is None or not current_seq:
+            return
+        # Boundary discipline: advance to the trigger point only after a
+        # successful submit. The id set covers every message sharing the
+        # trigger millisecond, so the REST backfill dedups exactly.
+        boundary_ids = self._group_history.collect_boundary_message_ids(
+            current_message_id=message.message_id,
+            current_created_at=message.create_time,
+            context_entries=context_entries,
+        )
+        self._group_log_store.set_boundary(
+            chat_id,
+            {
+                "seq": current_seq,
+                "created_at": max(int(message.create_time or 0), 0),
+                "message_ids": boundary_ids,
+            },
+        )
 
     def _dispatch_command(self, message: InboundMessage, command: SlashCommand) -> None:
         handler = self._commands.get(command.name)
@@ -675,9 +803,22 @@ class AppHandler(TransportHandler):
     # Prompt submission
     # ------------------------------------------------------------------
 
-    def _handle_prompt(self, message: InboundMessage) -> None:
+    def _handle_prompt(
+        self, message: InboundMessage, *, submit_text: str | None = None
+    ) -> Optional[SubmitPromptResult]:
+        """Submit the prompt for one inbound text message.
+
+        ``submit_text`` overrides the submitted text (assistant-mode group
+        triggers submit the context envelope while the session title still
+        comes from the raw message). Returns the SubmitPromptResult on a
+        successful submit, None on every failure path — the assistant-mode
+        trigger uses this to advance the boundary only after a real submit.
+        """
         chat_id = message.chat_id
         text = message.text.strip()
+        prompt_text = (
+            submit_text.strip() if submit_text is not None else text
+        )
         binding = self._binding_store.load(chat_id)
         created = False
         if binding is None:
@@ -685,7 +826,7 @@ class AppHandler(TransportHandler):
             # and bind it (mvp-scope §2).
             binding = self._create_and_bind(chat_id, text)
             if binding is None:
-                return
+                return None
             created = True
         if not binding["attached"]:
             # A detached chat must not silently run invisible work: refuse
@@ -694,7 +835,7 @@ class AppHandler(TransportHandler):
                 message,
                 "当前会话已暂停推送（/detach 状态），消息未提交。发送 /attach 恢复后再继续。",
             )
-            return
+            return None
         session_id = binding["session_id"]
         # Pre-flight: an archived (or vanished) session errors and points to
         # /sessions; KITE never auto-recreates one (mvp-scope §4.7). Upstream
@@ -704,7 +845,7 @@ class AppHandler(TransportHandler):
             info = self._ops.get_session(session_id)
         except KapTransportError:
             self._reply_to(message, _KAP_UNREACHABLE_TEXT)
-            return
+            return None
         except KapError as exc:
             if exc.code == KAP_ERROR_SESSION_NOT_FOUND:
                 self._reply_to(
@@ -714,14 +855,14 @@ class AppHandler(TransportHandler):
                 )
             else:
                 self._reply_to(message, f"查询会话状态失败：{exc.msg}")
-            return
+            return None
         if info.archived:
             self._reply_to(
                 message,
                 f"绑定的会话 `{session_id}` 已被归档。"
                 "发送 /sessions 查看可用会话并切换；KITE 不会自动新建会话。",
             )
-            return
+            return None
         # Pending staged images are consumed by this prompt (images contract
         # §2.3): an expired/missing/stale-cwd record blocks the prompt
         # fail-closed; otherwise the prompt carries the composed text plus
@@ -729,12 +870,12 @@ class AppHandler(TransportHandler):
         prepared = self._attachment_domain.prepare_prompt(
             sender_open_id=message.sender_open_id,
             chat_id=chat_id,
-            text=text,
+            text=prompt_text,
             cwd=info.cwd or "",
         )
         if prepared.blocking_text:
             self._reply_to(message, prepared.blocking_text)
-            return
+            return None
         content: list[dict[str, Any]] = [{"type": "text", "text": prepared.text}]
         content.extend(
             {
@@ -759,18 +900,18 @@ class AppHandler(TransportHandler):
             # has them (contract §5.1); staged files are kept.
             self._attachment_domain.restore_consumed(prepared.consumed)
             self._reply_to(message, _KAP_UNREACHABLE_TEXT)
-            return
+            return None
         except KapError as exc:
             # Business error on submit (mvp-scope §4.5): report the upstream
             # msg; no prompt started, so no card exists to transition.
             self._attachment_domain.restore_consumed(prepared.consumed)
             self._reply_to(message, f"提交失败：{exc.msg}")
-            return
+            return None
         if result.status == "blocked":
             # Upstream rejects blocked submissions before a turn launches.
             self._attachment_domain.restore_consumed(prepared.consumed)
             self._reply_to(message, "提交被 kap-server 拒绝（blocked），该 prompt 未执行。")
-            return
+            return None
         if prepared.consumed:
             # Successful submit: consumption deletes the staged files
             # (contract §2.5); the image bytes live in the kap message.
@@ -792,6 +933,7 @@ class AppHandler(TransportHandler):
             self._reply_to(message, f"{prefix}已加入队列，等待执行。{suffix}")
         else:
             self._reply_to(message, f"{prefix}已提交，正在执行。{suffix}")
+        return result
 
     def _create_and_bind(self, chat_id: str, text: str) -> Optional[StoredBinding]:
         try:
@@ -1275,7 +1417,7 @@ class AppHandler(TransportHandler):
             )
             self._reply_to(
                 message,
-                "已激活当前群聊（模式：mention_only）。群成员 @我 并发送文字即可提交 prompt；"
+                f"已激活当前群聊（模式：{config['mode']}）。群成员 @我 并发送文字即可提交 prompt；"
                 "审批与问题仅发起者或管理员可处理。发送 /group deactivate 停用。",
             )
             return
@@ -1289,6 +1431,57 @@ class AppHandler(TransportHandler):
             )
             return
         self._reply_to(message, build_usage_text("/group"))
+
+    def _cmd_group_mode(self, message: InboundMessage, arg: str) -> None:
+        """/group-mode 〈mention_only|assistant〉: switch the group mode."""
+        if message.chat_type != "group":
+            self._reply_to(message, "`/group-mode` 仅在群聊中可用。")
+            return
+        if not self._is_admin(message.sender_open_id):
+            # Defense in depth (same convention as /group): the group ingress
+            # gate already limits slash commands to admins, but the mode
+            # switch changes what member messages do and stays explicitly
+            # admin-only (contract §2).
+            self._reply_to(message, _GROUP_COMMAND_ADMIN_ONLY_TEXT)
+            return
+        group_config = self._group_config_store.load(message.chat_id)
+        if group_config is None or not group_config["activated"]:
+            # Mode switching only makes sense on an activated group; a
+            # corrupt record reads as non-activated here too (§4.3).
+            self._reply_to(message, "本群尚未激活，请先发送 /group activate 激活。")
+            return
+        mode = arg.strip().lower()
+        if not mode:
+            self._reply_to(
+                message,
+                f"当前群聊模式：{group_config['mode']}。可选：mention_only / assistant。",
+            )
+            return
+        if mode not in VALID_GROUP_MODES:
+            self._reply_to(message, build_usage_text("/group-mode"))
+            return
+        if mode == group_config["mode"]:
+            self._reply_to(message, f"群聊模式已是 {mode}。")
+            return
+        self._group_config_store.set_mode(message.chat_id, mode)
+        logger.info(
+            "group mode set chat_id=%s mode=%s operator=%s",
+            message.chat_id,
+            mode,
+            message.sender_open_id,
+        )
+        if mode == GROUP_MODE_ASSISTANT:
+            self._reply_to(
+                message,
+                "已切换为 assistant 模式：群成员的文字消息会记录到群聊日志；"
+                "@我 时会携带自上次触发以来的群聊上下文。"
+                "发送 /group-mode mention_only 切回。",
+            )
+        else:
+            self._reply_to(
+                message,
+                "已切换为 mention_only 模式：仅 @我 的文字会触发，其他消息不再记录。",
+            )
 
     def _cmd_status(self, message: InboundMessage, arg: str) -> None:
         if arg.strip():
@@ -1560,6 +1753,10 @@ class AppHandler(TransportHandler):
     def _is_admin(self, open_id: str) -> bool:
         normalized = str(open_id or "").strip()
         return bool(normalized) and normalized in self._admins
+
+    def _bot_open_id(self) -> str:
+        """The bot's own open_id, read live (discovered after construction)."""
+        return str(getattr(self._transport, "bot_open_id", "") or "").strip()
 
     def _may_abort(self, message: InboundMessage, prompt_id: str) -> bool:
         """The /abort actor rule: initiator or admin (group-chat §3.4).
