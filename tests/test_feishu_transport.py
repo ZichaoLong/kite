@@ -700,6 +700,26 @@ class BotIdentityTests(unittest.TestCase):
 
         self.assertTrue(transport._is_bot_mentioned(mentions))
 
+    def test_fetch_user_name_success(self) -> None:
+        transport = _make_transport()
+        response = Mock()
+        response.success.return_value = True
+        response.raw.content = json.dumps({"user": {"name": "张三"}})
+        transport.client = Mock()
+        transport.client.request.return_value = response
+
+        self.assertEqual(transport.fetch_user_name("ou_x"), "张三")
+
+    def test_fetch_user_name_failure_returns_none(self) -> None:
+        transport = _make_transport()
+        response = Mock()
+        response.success.return_value = False
+        response.code = 500
+        transport.client = Mock()
+        transport.client.request.return_value = response
+
+        self.assertIsNone(transport.fetch_user_name("ou_x"))
+
 
 if __name__ == "__main__":
     unittest.main()

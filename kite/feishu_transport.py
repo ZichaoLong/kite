@@ -349,6 +349,33 @@ class FeishuTransport:
             logger.warning("bot info fetch raised: %s", exc)
             return None
 
+    def fetch_user_name(self, open_id: str) -> str | None:
+        """Resolve one user's display name via the contact API (tenant token).
+
+        Used by ``kite.identity_names`` for group-facing notices; failure
+        returns None and the caller falls back to a shortened open_id.
+        Requires the ``contact:user.base:readonly`` scope.
+        """
+        normalized = str(open_id or "").strip()
+        if not normalized:
+            return None
+        try:
+            req = lark.BaseRequest.builder() \
+                .http_method(lark.HttpMethod.GET) \
+                .uri(f"/open-apis/contact/v3/users/{normalized}?user_id_type=open_id") \
+                .token_types({lark.AccessTokenType.TENANT}) \
+                .build()
+            resp = self.client.request(req)
+            if not resp.success():
+                logger.warning("user info fetch failed open_id=%s: code=%s", normalized, resp.code)
+                return None
+            data = json.loads(resp.raw.content)
+            name = ((data.get("user") or {}).get("name"))
+            return name.strip() if isinstance(name, str) and name.strip() else None
+        except Exception as exc:  # noqa: BLE001 - best-effort lookup
+            logger.warning("user info fetch raised open_id=%s: %s", normalized, exc)
+            return None
+
     # ---- inbound: dedup ----
 
     def _is_duplicate(self, message_id: str) -> bool:

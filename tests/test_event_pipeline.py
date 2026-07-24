@@ -39,6 +39,7 @@ from kite.event_pipeline import (
     _PendingApproval,
 )
 from kite.feishu_transport import CardAction, InboundMessage
+from kite.identity_names import IdentityNames
 from kite.prompt_ownership import PromptOwnership
 from kite.runtime_loop import RuntimeLoop
 from kite.stores.binding_store import BindingStore
@@ -771,6 +772,29 @@ class ApprovalTests(PipelineTestCase):
         # The timeout timer is running.
         self.assertEqual(len(self.timers.live), 1)
         self.assertEqual(self.timers.live[0].delay, 300)
+
+    def test_notice_uses_display_name_when_resolvable(self) -> None:
+        self.pipeline._names = IdentityNames(lambda open_id: "张三")
+        self.bind(CHAT_ID)
+        self.bind(CHAT_ID_2)
+        self.start_prompt()
+        self.ownership.record("p-1", CHAT_ID, sender_open_id=ADMIN_OPEN_ID)
+
+        self.feed(approval_requested())
+
+        notices = self.transport.texts_to(CHAT_ID_2)
+        self.assertEqual(len(notices), 1)
+        self.assertIn("等待 张三（`p-1` 号 prompt 的发起者）处理审批", notices[0])
+
+    def test_notice_falls_back_without_sender_on_record(self) -> None:
+        # Resolver present, but the ownership entry has no sender (rebuild
+        # path) — the wording falls back to the generic one.
+        self.pipeline._names = IdentityNames(lambda open_id: "张三")
+        self._start_and_request_approval()
+
+        notices = self.transport.texts_to(CHAT_ID_2)
+        self.assertEqual(len(notices), 1)
+        self.assertIn("等待 `p-1` 号 prompt 的发起者处理审批", notices[0])
 
     def test_best_effort_ownership_gets_expired_card_no_timer(self) -> None:
         self._start_and_request_approval(certainty="best_effort")

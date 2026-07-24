@@ -364,6 +364,7 @@ class EventPipeline:
         stream_reply_char_limit: int = DEFAULT_STREAM_REPLY_CHAR_LIMIT,
         terminal_card_byte_budget: int = _DEFAULT_TERMINAL_CARD_BYTE_BUDGET,
         patch_dispatcher: Optional[CardPatchDispatcher] = None,
+        names: Any = None,
     ) -> None:
         self._transport = transport
         self._rest = rest
@@ -378,6 +379,7 @@ class EventPipeline:
         self._question_timeout = int(question_timeout_seconds)
         self._timer_factory = timer_factory
         self._monotonic = monotonic
+        self._names = names
         self._on_snapshot_rebuilt = on_snapshot_rebuilt
         self._terminal_empty_retry_count = max(int(terminal_empty_retry_count), 0)
         self._terminal_retry_delay = max(float(terminal_empty_retry_delay_seconds), 0.0)
@@ -1226,7 +1228,11 @@ class EventPipeline:
             approval_id,
             owner_chat,
         )
-        notice = f"⏳ 该会话有一个审批待处理：等待 `{prompt_id}` 号 prompt 的发起者处理审批。"
+        label = self._initiator_label(prompt_id)
+        if label:
+            notice = f"⏳ 该会话有一个审批待处理：等待 {label}（`{prompt_id}` 号 prompt 的发起者）处理审批。"
+        else:
+            notice = f"⏳ 该会话有一个审批待处理：等待 `{prompt_id}` 号 prompt 的发起者处理审批。"
         for chat_id in attached:
             if chat_id != owner_chat:
                 self._send_text(chat_id, notice)
@@ -1428,6 +1434,18 @@ class EventPipeline:
         logger.info("abort requested from card session=%s prompt=%s", session_id, prompt_id)
         return CardActionResponse(toast="已发起中止。")
 
+    def _initiator_label(self, prompt_id: str) -> str:
+        """The initiator's display name for group-facing notices, "" unknown.
+
+        Display names ride the ownership record's sender_open_id through the
+        IdentityNames cache (fail-soft: fallback text keeps the old wording).
+        """
+        entry = self._ownership.entry_of(prompt_id)
+        sender = entry.sender_open_id if entry is not None else ""
+        if sender and self._names is not None:
+            return str(self._names.name_of(sender) or "")
+        return ""
+
     def _is_interaction_actor(
         self,
         prompt_id: str,
@@ -1526,7 +1544,11 @@ class EventPipeline:
             event.question_id,
             owner_chat,
         )
-        notice = f"⏳ 该会话有一个问题待回答：等待 `{prompt_id}` 号 prompt 的发起者处理。"
+        label = self._initiator_label(prompt_id)
+        if label:
+            notice = f"⏳ 该会话有一个问题待回答：等待 {label}（`{prompt_id}` 号 prompt 的发起者）处理。"
+        else:
+            notice = f"⏳ 该会话有一个问题待回答：等待 `{prompt_id}` 号 prompt 的发起者处理。"
         for chat_id in attached:
             if chat_id != owner_chat:
                 self._send_text(chat_id, notice)

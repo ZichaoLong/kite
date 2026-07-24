@@ -93,3 +93,13 @@ via kitectl.
   `group_history_recovery.py` are the ready-made designs (asset map §1).
 - Merge-forward aggregation: `forward_aggregator.py` (2s window) is filed.
 - Rich question form in groups: same actor rule, no new contract needed.
+
+## Aligned Additions (2026-07-24)
+
+1. **Sender display names**: group-facing notices (approval/question routing
+   hints) resolve the initiator's display name via the contact API
+   (`contact:user.base:readonly`) through a TTL'd read-through cache
+   (fail-soft fallback to a shortened open_id; no state axis — the cache is
+   disposable and rebuilt on demand). Layer: application; recovery: nothing
+   to rebuild; tests: cache hit/TTL/negative-cache/fallback, notice wording
+   with and without a resolvable name.

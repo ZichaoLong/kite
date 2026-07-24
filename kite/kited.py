@@ -51,6 +51,7 @@ from kite.event_pipeline import (
 )
 from kite.feishu_transport import FeishuTransport, TransportHandler
 from kite.feishu_ws_proxy import DEFAULT_FEISHU_WS_PROXY
+from kite.identity_names import IdentityNames
 from kite.logging_setup import configure_logging
 from kite.platform_paths import default_data_root
 from kite.prompt_ownership import PromptOwnership
@@ -165,6 +166,7 @@ def build_outbound_runtime(
         cursor_store=EventCursorStore(data_dir),
         approval_timeout_seconds=kite_config.approval_timeout_seconds(config),
         question_timeout_seconds=cards.DEFAULT_QUESTION_TIMEOUT_SECONDS,
+        names=IdentityNames(transport.fetch_user_name),
     )
     handler = OutboundAppHandler(
         event_pipeline=pipeline,
