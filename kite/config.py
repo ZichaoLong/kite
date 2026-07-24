@@ -18,6 +18,7 @@ from kite.platform_paths import default_config_root
 from kite.platform_paths import default_working_dir as _platform_default_working_dir
 
 _INIT_TOKEN_FILENAME = "init.token"
+_CONTROL_TOKEN_FILENAME = "control.token"
 
 # Approval cards that receive no response within this window are resolved to
 # upstream as rejected (never auto-approved). See docs/contracts/mvp-scope.md.
@@ -37,6 +38,10 @@ def system_config_path() -> Path:
 
 def init_token_path() -> Path:
     return config_dir() / _INIT_TOKEN_FILENAME
+
+
+def control_token_path() -> Path:
+    return config_dir() / _CONTROL_TOKEN_FILENAME
 
 
 def _load_yaml_file(path: Path) -> dict[str, Any]:
@@ -78,6 +83,22 @@ def save_system_config_updates(updates: dict[str, Any]) -> tuple[dict[str, Any],
 
 def ensure_init_token() -> str:
     path = init_token_path()
+    if path.exists():
+        token = path.read_text(encoding="utf-8").strip()
+        if token:
+            return token
+    token = secrets.token_urlsafe(24)
+    _atomic_write_text(path, f"{token}\n", mode=0o600)
+    return token
+
+
+def ensure_control_token() -> str:
+    """The daemon-issued control-plane token (docs/decisions/control-plane.md).
+
+    Created 0600 at daemon start when absent, alongside the other instance
+    secrets; kitectl reads it to authenticate control-plane requests.
+    """
+    path = control_token_path()
     if path.exists():
         token = path.read_text(encoding="utf-8").strip()
         if token:

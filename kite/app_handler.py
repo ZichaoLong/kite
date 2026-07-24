@@ -9,8 +9,16 @@ Implements the MVP inbound contract (docs/contracts/mvp-scope.md):
   cwd=default_working_dir and binds it) -> submit the prompt carrying the
   binding's permission_mode + plan_mode explicitly -> record prompt
   ownership -> minimal ack;
+- the loopback control plane's prompt/submit endpoint reuses that same
+  submit discipline for `kitectl prompt send` (minus the Feishu ack), so
+  CLI-sent prompts record ownership exactly like Feishu-originated ones
+  (docs/decisions/control-plane.md);
 - the MVP slash commands (/new /sessions /switch /detach /attach /mode
-  /plan /status /abort /help /init);
+  /plan /status /abort /help /init); in-flight-work-sensitive commands run
+  the reason-coded preflights in kite/preflights.py (/new denies with an
+  active prompt, /detach only notes it), and /new /switch rebinds fire the
+  on_session_unbound seam so the outbound path can fail-close sweep the old
+  session's pending approvals/questions;
 - card-action dispatch: session_switch buttons are handled here;
   approval/question buttons route to no-op-with-log seam methods that the
   outbound path (E3) fills in.
@@ -42,6 +50,7 @@ from typing import Any, Callable, Mapping, Optional
 
 from kite import cards
 from kite import config as kite_config
+from kite import preflights
 from kite.adapters.kap_server import (
     KapError,
     KapTransportError,
@@ -55,6 +64,7 @@ from kite.command_surface import (
     parse_plan_mode_arg,
     parse_slash_command,
 )
+from kite.control_plane import ControlError
 from kite.feishu_card_markdown import sanitize_runtime_markdown_for_feishu_card
 from kite.feishu_transport import (
     CardAction,
@@ -75,6 +85,7 @@ from kite.stores.binding_store import (
     DEFAULT_PERMISSION_MODE,
     DEFAULT_PLAN_MODE,
     PERMISSION_MODE_YOLO,
+    VALID_PERMISSION_MODES,
     BindingStore,
     StoredBinding,
 )
@@ -511,6 +522,130 @@ class AppHandler(TransportHandler):
         return binding
 
     # ------------------------------------------------------------------
+    # Control-plane prompt submission (kitectl -> kited)
+    # ------------------------------------------------------------------
+
+    def submit_prompt_control(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        """Control-plane entry for `kitectl prompt send`.
+
+        Called on control-plane server threads; serialized onto the
+        RuntimeLoop like every other state mutation. Raises ControlError
+        (code/msg) for business failures, which the control plane returns as
+        a structured error response.
+        """
+        return self._loop.call(self._submit_prompt_control_impl, params)
+
+    def _submit_prompt_control_impl(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        """The _handle_prompt submit discipline minus the Feishu surface:
+        same pre-flight, same explicit modes + model, same certain ownership
+        record — but no text ack (the response travels back over the control
+        channel; the execution card still arrives event-driven).
+        """
+        text = str(params.get("text") or "").strip()
+        chat_id = str(params.get("chat_id") or "").strip()
+        session_id = str(params.get("session_id") or "").strip()
+        if not text:
+            raise ControlError("prompt text must not be empty", code="invalid_params")
+        if bool(chat_id) == bool(session_id):
+            raise ControlError(
+                "exactly one of chat_id / session_id must be given", code="invalid_params"
+            )
+        permission_mode = params.get("permission_mode")
+        if permission_mode is not None and (
+            not isinstance(permission_mode, str)
+            or permission_mode not in VALID_PERMISSION_MODES
+        ):
+            raise ControlError(
+                f"permission_mode must be one of {sorted(VALID_PERMISSION_MODES)}",
+                code="invalid_params",
+            )
+        plan_mode = params.get("plan_mode")
+        if plan_mode is not None and not isinstance(plan_mode, bool):
+            raise ControlError("plan_mode must be a boolean", code="invalid_params")
+
+        owner_chat_id = ""
+        if chat_id:
+            binding = self._binding_store.load(chat_id)
+            if binding is None:
+                raise ControlError(
+                    f"no binding for chat {chat_id}; bind the chat from Feishu first",
+                    code="no_binding",
+                )
+            if not binding["attached"]:
+                # Mirrors the Feishu path: a detached chat must not silently
+                # run work whose cards/approvals it would never see.
+                raise ControlError(
+                    f"chat {chat_id} is detached; send /attach in Feishu to resume first",
+                    code="chat_detached",
+                )
+            session_id = binding["session_id"]
+            # Modes are chat-level settings: the binding's values win unless
+            # explicitly overridden (kite-design.md §7).
+            if permission_mode is None:
+                permission_mode = binding["permission_mode"]
+            if plan_mode is None:
+                plan_mode = binding["plan_mode"]
+            owner_chat_id = chat_id
+        else:
+            # No binding to inherit from and no owner to record: approvals
+            # from such prompts expire explicitly by design (fail-closed).
+            if permission_mode is None:
+                permission_mode = DEFAULT_PERMISSION_MODE
+            if plan_mode is None:
+                plan_mode = DEFAULT_PLAN_MODE
+
+        try:
+            info = self._ops.get_session(session_id)
+        except KapTransportError as exc:
+            raise ControlError(f"cannot reach kap-server: {exc}", code="kap_unreachable") from exc
+        except KapError as exc:
+            raise ControlError(exc.msg, code=str(exc.code)) from exc
+        if info.archived:
+            # KITE never auto-recreates an archived session (mvp-scope §4.7);
+            # an upstream submit would quietly resurrect it, so refuse here.
+            raise ControlError(
+                f"session {session_id} is archived; switch sessions from Feishu first",
+                code="session_archived",
+            )
+        try:
+            result = self._ops.submit_prompt(
+                session_id,
+                text,
+                permission_mode=permission_mode,
+                plan_mode=plan_mode,
+            )
+        except KapTransportError as exc:
+            raise ControlError(f"cannot reach kap-server: {exc}", code="kap_unreachable") from exc
+        except KapError as exc:
+            raise ControlError(exc.msg, code=str(exc.code)) from exc
+        if result.status == "blocked":
+            # Upstream rejects blocked submissions before a turn launches.
+            raise ControlError(
+                "kap-server rejected the prompt as blocked; it did not run",
+                code="submit_blocked",
+            )
+        owner_recorded = False
+        if owner_chat_id:
+            # The same certain-ownership record the Feishu path writes, into
+            # the same map the outbound pipeline reads (single-writer
+            # discipline on state axis 4, docs/decisions/control-plane.md).
+            self._ownership.record(result.prompt_id, owner_chat_id)
+            owner_recorded = True
+        logger.info(
+            "control-plane prompt submitted session_id=%s prompt_id=%s status=%s owner=%s",
+            session_id,
+            result.prompt_id,
+            result.status,
+            owner_chat_id or "<none>",
+        )
+        return {
+            "prompt_id": result.prompt_id,
+            "session_id": session_id,
+            "status": result.status,
+            "owner_recorded": owner_recorded,
+        }
+
+    # ------------------------------------------------------------------
     # Slash commands
     # ------------------------------------------------------------------
 
@@ -548,6 +683,27 @@ class AppHandler(TransportHandler):
             return
         chat_id = message.chat_id
         current = self._binding_store.load(chat_id)
+        if current is not None:
+            # Preflight (fail-closed, mvp-scope aligned item 7): refuse the
+            # rebind while the bound session has an active prompt — its
+            # execution card, terminal result and approval routing would lose
+            # visibility. Unverifiable queue state also refuses.
+            try:
+                queue = self._ops.get_prompts(current["session_id"])
+            except KapTransportError:
+                self._reply_to(message, _KAP_UNREACHABLE_TEXT)
+                return
+            except KapError as exc:
+                self._reply_to(message, f"查询会话状态失败：{exc.msg}")
+                return
+            check = preflights.check_new(queue)
+            if not check.allowed:
+                logger.info(
+                    "/new denied chat_id=%s reason_code=%s", chat_id, check.reason_code
+                )
+                self._reply_to(message, check.reason_text)
+                return
+        old_session_id = current["session_id"] if current else ""
         # Create first, rebind second: on failure the old binding is intact.
         try:
             info = self._ops.create_session(cwd=self._default_working_dir, title="")
@@ -568,6 +724,10 @@ class AppHandler(TransportHandler):
         }
         self._binding_store.save(chat_id, binding)
         self._notify_session_bound(info.session_id)
+        if old_session_id and old_session_id != info.session_id:
+            # Fail-close sweep of the old session's pending approvals/questions
+            # routed to this chat (E3; no-op until the outbound path is wired).
+            self.on_session_unbound(chat_id, old_session_id)
         logger.info("binding renewed chat_id=%s session_id=%s", chat_id, info.session_id)
         self._reply_to(
             message,
@@ -614,9 +774,23 @@ class AppHandler(TransportHandler):
         if not binding["attached"]:
             self._reply_to(message, "当前会话已是暂停推送状态。")
             return
+        # Preflight note: /detach only flips a local push flag, so it is never
+        # denied — but an active prompt keeps running upstream unseen, which
+        # the reply must say. The note is best-effort: detach stays available
+        # when kap is unreachable (that is exactly when users want it).
+        note = ""
+        try:
+            note = preflights.check_detach(
+                self._ops.get_prompts(binding["session_id"])
+            ).note
+        except (KapError, KapTransportError) as exc:
+            logger.debug("detach preflight skipped chat=%s: %s", message.chat_id, exc)
         binding["attached"] = False
         self._binding_store.save(message.chat_id, binding)
-        self._reply_to(message, "已暂停当前会话的飞书推送；绑定保留。发送 /attach 恢复。")
+        text = "已暂停当前会话的飞书推送；绑定保留。发送 /attach 恢复。"
+        if note:
+            text += f"\n{note}"
+        self._reply_to(message, text)
 
     def _cmd_attach(self, message: InboundMessage, arg: str) -> None:
         if arg.strip():
@@ -791,6 +965,7 @@ class AppHandler(TransportHandler):
             current["attached"] = True
             self._binding_store.save(chat_id, current)
             return True, "当前已绑定该会话，推送已恢复。"
+        old_session_id = current["session_id"] if current else ""
         try:
             info = self._ops.get_session(session_id)
         except KapTransportError:
@@ -818,6 +993,10 @@ class AppHandler(TransportHandler):
         }
         self._binding_store.save(chat_id, binding)
         self._notify_session_bound(session_id)
+        if old_session_id:
+            # Fail-close sweep of the old session's pending approvals/questions
+            # routed to this chat (E3; no-op until the outbound path is wired).
+            self.on_session_unbound(chat_id, old_session_id)
         logger.info("binding switched chat_id=%s session_id=%s", chat_id, session_id)
         return True, f"已切换到会话 {info.title or '（无标题）'}（`{session_id}`），推送已开启。"
 
@@ -857,6 +1036,17 @@ class AppHandler(TransportHandler):
         Default consumes nothing, so all plain text becomes a prompt.
         """
         return False
+
+    def on_session_unbound(self, chat_id: str, old_session_id: str) -> None:
+        """E3 seam: the chat rebound away from ``old_session_id`` (/new,
+        /switch); the outbound path fail-close sweeps that session's pending
+        approvals/questions routed to this chat. Default is a no-op-with-log.
+        """
+        logger.info(
+            "session unbound (outbound path not wired): chat=%s session=%s",
+            chat_id,
+            old_session_id,
+        )
 
     def rebuild_prompt_ownership(self) -> None:
         """Best-effort ownership rebuild after a restart (mvp-scope §4.6).

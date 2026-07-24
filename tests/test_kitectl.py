@@ -11,8 +11,10 @@ from unittest.mock import patch
 import fake_kap
 from kite import kitectl
 from kite import service_manager
+from kite.control_plane import ControlError, ControlPlaneServer
 from kite.runtime_status import RuntimeStatusWriter
 from kite.stores.binding_store import BindingStore
+from test_control_plane import DropConnectionServer, dead_pid, unused_port
 
 
 class KitectlTestCase(unittest.TestCase):
@@ -313,6 +315,90 @@ class ServiceCommandTests(KitectlTestCase):
         self.assertEqual(code, 1)
         self.assertIn("systemctl exploded", err)
 
+
+class ServicePreviewGateTests(KitectlTestCase):
+    """stop/restart preview gate: busy or unverifiable live state is
+    --force-only (never silently available)."""
+
+    def _fake_manager(self) -> _RecordingServiceManager:
+        manager = _RecordingServiceManager()
+        patcher = patch("kite.service_manager.current_service_manager", return_value=manager)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return manager
+
+    def test_stop_refused_when_session_busy_without_force(self) -> None:
+        manager = self._fake_manager()
+        session = self.state.create_session("s-busy", title="demo")
+        session.busy = True
+
+        code, _, err = self._run_cli("service", "stop")
+
+        self.assertEqual(code, 2)
+        self.assertIn("1 session(s) busy, 0 pending interaction(s)", err)
+        self.assertIn("stopping kills in-flight prompts", err)
+        self.assertIn("--force", err)
+        self.assertEqual(manager.calls, [])
+
+    def test_stop_with_force_proceeds_when_busy(self) -> None:
+        manager = self._fake_manager()
+        session = self.state.create_session("s-busy", title="demo")
+        session.busy = True
+
+        code, out, _ = self._run_cli("service", "stop", "--force")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(manager.calls, ["stop"])
+        self.assertIn("warning:", out)
+        self.assertIn("1 session(s) busy, 0 pending interaction(s)", out)
+        self.assertIn("proceeding anyway (--force)", out)
+
+    def test_restart_refused_with_pending_interaction(self) -> None:
+        manager = self._fake_manager()
+        session = self.state.create_session("s-pending", title="demo")
+        session.pending_interaction = "approval"
+
+        code, _, err = self._run_cli("service", "restart")
+
+        self.assertEqual(code, 2)
+        self.assertIn("0 session(s) busy, 1 pending interaction(s)", err)
+        self.assertIn("restarting kills in-flight prompts", err)
+        self.assertEqual(manager.calls, [])
+
+    def test_restart_refused_when_live_state_unverifiable(self) -> None:
+        manager = self._fake_manager()
+        self.rest_server.shutdown()
+        self.rest_server.server_close()
+
+        code, _, err = self._run_cli("service", "restart")
+
+        self.assertEqual(code, 2)
+        self.assertIn("cannot verify live state", err)
+        self.assertIn("--force", err)
+        self.assertEqual(manager.calls, [])
+
+    def test_restart_with_force_proceeds_when_unverifiable(self) -> None:
+        manager = self._fake_manager()
+        self.rest_server.shutdown()
+        self.rest_server.server_close()
+
+        code, out, _ = self._run_cli("service", "restart", "--force")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(manager.calls, ["restart"])
+        self.assertIn("warning:", out)
+        self.assertIn("cannot verify live state", out)
+
+    def test_clean_live_state_proceeds_without_force(self) -> None:
+        manager = self._fake_manager()
+        self.state.create_session("s-idle", title="demo")
+
+        code, out, _ = self._run_cli("service", "restart")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(manager.calls, ["restart"])
+        self.assertNotIn("warning:", out)
+
     def test_log_tails_stdout_log(self) -> None:
         (self.data_dir / "service.stdout.log").write_text(
             "".join(f"line-{i}\n" for i in range(1, 11)), encoding="utf-8"
@@ -399,69 +485,79 @@ class BindingListTests(KitectlTestCase):
 
 
 class PromptSendTests(KitectlTestCase):
-    def _bind(
-        self,
-        chat_id: str,
-        session_id: str,
-        *,
-        permission_mode: str = "auto",
-        plan_mode: bool = False,
-    ) -> None:
-        BindingStore(self.data_dir).save(
-            chat_id,
-            {
-                "session_id": session_id,
-                "attached": True,
-                "permission_mode": permission_mode,
-                "plan_mode": plan_mode,
-            },
+    """`prompt send` is a client of kited's loopback control plane.
+
+    The daemon side is faked with a real ControlPlaneServer over a scripted
+    dispatch; wire-protocol details are covered in test_control_plane.py and
+    the submit discipline in test_kited.py.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        (self.config_dir / "control.token").write_text(
+            "test-control-token\n", encoding="utf-8"
+        )
+        self.received: list[tuple[str, dict]] = []
+        self.dispatch_error: Exception | None = None
+        self.dispatch_response: dict = {
+            "prompt_id": "p-1",
+            "session_id": "s-abc",
+            "status": "running",
+            "owner_recorded": True,
+        }
+        self.control_server = ControlPlaneServer(
+            data_dir=self.data_dir,
+            dispatch=self._dispatch,
+            auth_token=lambda: "test-control-token",
+        )
+        self.control_server.start()
+        self.addCleanup(self.control_server.stop)
+
+    def _dispatch(self, method: str, params: dict) -> dict:
+        self.received.append((method, params))
+        if self.dispatch_error is not None:
+            raise self.dispatch_error
+        return self.dispatch_response
+
+    def _write_metadata(self, *, port: int, pid: int) -> None:
+        (self.data_dir / "control_plane.json").write_text(
+            json.dumps({"port": port, "pid": pid, "started_at": time.time()}),
+            encoding="utf-8",
         )
 
-    def test_send_to_bound_chat_carries_binding_modes(self) -> None:
-        session = self.state.create_session("s-abc", title="demo")
-        self._bind("chat-1", "s-abc", permission_mode="manual", plan_mode=True)
-
+    def test_send_to_bound_chat_goes_through_the_daemon(self) -> None:
         code, out, _ = self._run_cli(
             "prompt", "send", "--chat", "chat-1", "--text", "hello kite"
         )
 
         self.assertEqual(code, 0)
+        self.assertEqual(
+            self.received,
+            [("prompt/submit", {"text": "hello kite", "chat_id": "chat-1"})],
+        )
+        self.assertIn("prompt_id: p-1", out)
         self.assertIn("session_id: s-abc", out)
         self.assertIn("status: running", out)
-        prompt_line = next(
-            line for line in out.splitlines() if line.startswith("prompt_id: ")
-        )
-        prompt_id = prompt_line.split(": ", 1)[1]
-        self.assertTrue(prompt_id.startswith("p-"))
-        self.assertEqual(session.active_prompt, prompt_id)
-        submission = self.state.prompt_submissions[-1]
-        self.assertEqual(submission["content"], [{"type": "text", "text": "hello kite"}])
-        self.assertEqual(submission["permission_mode"], "manual")
-        self.assertEqual(submission["plan_mode"], True)
+        self.assertIn("owner_recorded: yes", out)
 
-    def test_send_second_prompt_is_queued(self) -> None:
-        self.state.create_session("s-abc")
-        self._bind("chat-1", "s-abc")
-        self._run_cli("prompt", "send", "--chat", "chat-1", "--text", "first")
-
-        code, out, _ = self._run_cli(
-            "prompt", "send", "--chat", "chat-1", "--text", "second"
-        )
-
-        self.assertEqual(code, 0)
-        self.assertIn("status: queued", out)
-
-    def test_send_to_session_uses_default_modes(self) -> None:
-        self.state.create_session("s-abc")
+    def test_send_to_session_reports_owner_not_recorded(self) -> None:
+        self.dispatch_response = {
+            "prompt_id": "p-2",
+            "session_id": "s-abc",
+            "status": "queued",
+            "owner_recorded": False,
+        }
 
         code, out, _ = self._run_cli(
             "prompt", "send", "--session", "s-abc", "--text", "hi"
         )
 
         self.assertEqual(code, 0)
-        submission = self.state.prompt_submissions[-1]
-        self.assertEqual(submission["permission_mode"], "auto")
-        self.assertEqual(submission["plan_mode"], False)
+        self.assertEqual(
+            self.received, [("prompt/submit", {"text": "hi", "session_id": "s-abc"})]
+        )
+        self.assertIn("status: queued", out)
+        self.assertIn("owner_recorded: no", out)
 
     def test_send_requires_a_target(self) -> None:
         with self.assertRaises(SystemExit) as ctx:
@@ -469,41 +565,92 @@ class PromptSendTests(KitectlTestCase):
         self.assertEqual(ctx.exception.code, 2)
 
     def test_send_rejects_empty_text(self) -> None:
-        self.state.create_session("s-abc")
-        self._bind("chat-1", "s-abc")
-
         code, _, err = self._run_cli("prompt", "send", "--chat", "chat-1", "--text", "  ")
 
         self.assertEqual(code, 2)
         self.assertIn("prompt text must not be empty", err)
+        self.assertEqual(self.received, [])
 
-    def test_send_without_binding_is_fail_closed(self) -> None:
-        code, _, err = self._run_cli(
-            "prompt", "send", "--chat", "chat-ghost", "--text", "hi"
-        )
-
-        self.assertEqual(code, 2)
-        self.assertIn("no binding for chat chat-ghost", err)
-        self.assertEqual(self.state.prompt_submissions, [])
-
-    def test_send_unreachable_is_fail_closed(self) -> None:
-        self.state.create_session("s-abc")
-        self._bind("chat-1", "s-abc")
-        self.rest_server.shutdown()
-        self.rest_server.server_close()
+    def test_send_daemon_down_is_fail_closed(self) -> None:
+        self.control_server.stop()  # also unpublishes the metadata file
 
         code, _, err = self._run_cli("prompt", "send", "--chat", "chat-1", "--text", "hi")
 
         self.assertEqual(code, 2)
-        self.assertIn("cannot reach kap-server", err)
+        self.assertIn("kited is not running", err)
+        self.assertEqual(self.received, [])
 
-    def test_send_to_unknown_session_surfaces_business_error(self) -> None:
+    def test_send_stale_metadata_means_daemon_down(self) -> None:
+        self.control_server.stop()
+        self._write_metadata(port=unused_port(), pid=dead_pid())
+
+        code, _, err = self._run_cli("prompt", "send", "--chat", "chat-1", "--text", "hi")
+
+        self.assertEqual(code, 2)
+        self.assertIn("kited is not running", err)
+
+    def test_send_refused_connection_means_daemon_down(self) -> None:
+        # Live metadata (own pid) but a dead port: the daemon went away
+        # between discovery and connect. Never retried, never direct REST.
+        self.control_server.stop()
+        self._write_metadata(port=unused_port(), pid=os.getpid())
+
+        code, _, err = self._run_cli("prompt", "send", "--chat", "chat-1", "--text", "hi")
+
+        self.assertEqual(code, 2)
+        self.assertIn("kited is not running", err)
+        self.assertIn("not submitted", err)
+
+    def test_send_outcome_unknown_is_exit_3(self) -> None:
+        dropper = DropConnectionServer()
+        self.addCleanup(dropper.close)
+        self.control_server.stop()
+        self._write_metadata(port=dropper.port, pid=os.getpid())
+
+        code, _, err = self._run_cli("prompt", "send", "--chat", "chat-1", "--text", "hi")
+
+        self.assertEqual(code, 3)
+        self.assertIn("may have been delivered", err)
+        self.assertIn("kitectl session status", err)
+
+    def test_send_business_error_is_exit_1(self) -> None:
+        self.dispatch_error = ControlError(
+            "no binding for chat chat-ghost; bind the chat from Feishu first",
+            code="no_binding",
+        )
+
         code, _, err = self._run_cli(
-            "prompt", "send", "--session", "s-ghost", "--text", "hi"
+            "prompt", "send", "--chat", "chat-ghost", "--text", "hi"
         )
 
         self.assertEqual(code, 1)
-        self.assertIn("kap-server error 40401", err)
+        self.assertIn("kited error no_binding", err)
+        self.assertIn("no binding for chat chat-ghost", err)
+
+    def test_send_kap_error_code_passes_through(self) -> None:
+        self.dispatch_error = ControlError("session not found", code="40401")
+
+        code, _, err = self._run_cli("prompt", "send", "--session", "s-ghost", "--text", "hi")
+
+        self.assertEqual(code, 1)
+        self.assertIn("kited error 40401", err)
+
+    def test_send_without_control_token_is_fail_closed(self) -> None:
+        (self.config_dir / "control.token").unlink()
+
+        code, _, err = self._run_cli("prompt", "send", "--chat", "chat-1", "--text", "hi")
+
+        self.assertEqual(code, 2)
+        self.assertIn("no control-plane token", err)
+        self.assertEqual(self.received, [])
+
+    def test_send_with_wrong_token_surfaces_unauthorized(self) -> None:
+        (self.config_dir / "control.token").write_text("wrong-token\n", encoding="utf-8")
+
+        code, _, err = self._run_cli("prompt", "send", "--chat", "chat-1", "--text", "hi")
+
+        self.assertEqual(code, 1)
+        self.assertIn("kited error unauthorized", err)
 
 
 class ConfigShowTests(KitectlTestCase):

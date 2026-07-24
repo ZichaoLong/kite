@@ -5,9 +5,12 @@ kited is the parent process of kap-server (docs/architecture/kite-design.md
 §2): it spawns and supervises `kimi web --no-open` (crash restart with bounded
 backoff, graceful shutdown), owns the WS subscription client, assembles the
 full bridge (Feishu transport -> AppHandler inbound path -> EventPipeline
-outbound path), and publishes a best-effort runtime status for kitectl. On
-SIGTERM/SIGINT it shuts timers, WS clients, and the managed child down
-cleanly.
+outbound path), serves the loopback control plane kitectl mutates the daemon
+through (docs/decisions/control-plane.md), and publishes a best-effort
+runtime status for kitectl. On SIGTERM/SIGINT it first fail-close sweeps
+pending approvals/questions (responded upstream while kap is still up, cards
+patched expired locally), then shuts timers, WS clients, the control plane,
+and the managed child down cleanly.
 
 Restart recovery (mvp-scope §4.6): bindings/modes/cursors come back from the
 stores; after the startup (re)subscribe, prompt ownership is rebuilt
@@ -26,7 +29,7 @@ import signal
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional
 
 from kite import cards
 from kite import config as kite_config
@@ -39,6 +42,7 @@ from kite.adapters.kap_server import (
     KapWsClient,
     ResyncRequest,
 )
+from kite.control_plane import ControlError, ControlPlaneServer
 from kite.event_pipeline import (
     EventPipeline,
     OutboundAppHandler,
@@ -190,6 +194,21 @@ def build_outbound_runtime(
     )
 
 
+def _control_dispatch(outbound: OutboundRuntime) -> Callable[[str, dict[str, Any]], Any]:
+    """The control-plane method table (docs/decisions/control-plane.md).
+
+    Only mutations that must serialize through the daemon live here;
+    read-only kitectl queries keep talking to kap REST / the stores directly.
+    """
+
+    def dispatch(method: str, params: dict[str, Any]) -> Any:
+        if method == "prompt/submit":
+            return outbound.handler.submit_prompt_control(params)
+        raise ControlError(f"unknown control method: {method}", code="unknown_method")
+
+    return dispatch
+
+
 def run(
     *,
     kimi_bin: str,
@@ -204,6 +223,7 @@ def run(
     backoff: BackoffPolicy | None = None,
     readiness_timeout_seconds: float = 60.0,
     outbound: OutboundRuntime | None = None,
+    control_token: str | None = None,
 ) -> int:
     """Supervise kap-server until stop_event is set. Returns a process exit code."""
     backoff = backoff or BackoffPolicy()
@@ -211,6 +231,7 @@ def run(
     cursor_store = EventCursorStore(data_dir)
     binding_store = BindingStore(data_dir)
     proc: KapServerProcess | None = None
+    control_plane: ControlPlaneServer | None = None
     recovered = False
     if outbound is not None:
         outbound.runtime_loop.start()
@@ -218,6 +239,17 @@ def run(
         outbound.pipeline.set_snapshot_rebuilt_hook(
             lambda _sid, _snap: status.update(ws={"last_resync_at": time.time()})
         )
+        # The control plane starts with the outbound runtime and publishes
+        # its endpoint (control_plane.json) for kitectl discovery.
+        if control_token is None:
+            control_token = kite_config.ensure_control_token()
+        control_plane = ControlPlaneServer(
+            data_dir=data_dir,
+            dispatch=_control_dispatch(outbound),
+            auth_token=lambda: str(control_token),
+        )
+        control_plane.start()
+        logger.info("control plane listening on 127.0.0.1:%d", control_plane.port)
     try:
         while not stop_event.is_set():
             proc = KapServerProcess(
@@ -312,7 +344,13 @@ def run(
             ws.stop()
             if outbound is not None:
                 outbound.ws_hook.set_client(None)
-                outbound.rest_proxy.set_client(None)
+                if crashed:
+                    # Crash window: drop the dead incarnation's client so
+                    # commands fail closed until the next one is up. On a
+                    # clean stop the client stays live so the pipeline's
+                    # shutdown sweep can still respond upstream (kap-server
+                    # is stopped only afterwards, in the finally below).
+                    outbound.rest_proxy.set_client(None)
 
             if not crashed:
                 break
@@ -322,10 +360,20 @@ def run(
                 break
         return 0
     finally:
+        if control_plane is not None:
+            # Stop the control plane first so no request can arrive after the
+            # runtime loop below has stopped (it also unpublishes the
+            # metadata file, marking the daemon undiscoverable).
+            control_plane.stop()
         if outbound is not None:
-            # Clean shutdown: cancel pipeline timers, stop the runtime loop;
-            # the Feishu transport thread is daemonic (lark has no stop()).
+            # Clean shutdown: the pipeline's fail-close sweep responds to
+            # pending approvals/questions upstream — the rest proxy must stay
+            # live until it has run (the barrier drains the loop), then the
+            # timers are cancelled and the loop stops. The Feishu transport
+            # thread is daemonic (lark has no stop()).
             outbound.pipeline.shutdown()
+            outbound.runtime_loop.call(lambda: None)
+            outbound.rest_proxy.set_client(None)
             outbound.runtime_loop.stop()
         if proc is not None and proc.poll() is None:
             logger.info("stopping kap-server pid=%s", proc.pid)

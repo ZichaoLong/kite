@@ -6,22 +6,31 @@ Implemented slice (docs/contracts/mvp-scope.md §2 kitectl row, §6):
   - `kitectl service install|uninstall|start|stop|restart|status|log`
                               — the single-instance OS service over
                                 kite.service_manager; install only writes the
-                                definition, it does not start it (design §9)
+                                definition, it does not start it (design §9).
+                                stop/restart run a destructive-op preview gate:
+                                busy sessions or pending interactions (or an
+                                unverifiable live state) require --force
   - `kitectl binding list`    — chat ↔ session bindings from the local store
   - `kitectl session list`    — sessions visible on kap-server
   - `kitectl session status`  — binding mapping, work state, queue depth,
                                 WS connection age, last resync time
   - `kitectl prompt send`     — submit a prompt to a bound chat's session (or
                                 a session id directly); the control-plane entry
-                                for later scheduled capabilities. Permission
-                                mode and plan mode are always carried
-                                explicitly (kite-design.md §7).
+                                for later scheduled capabilities. The submit
+                                goes through kited's loopback control plane
+                                (docs/decisions/control-plane.md), so ownership
+                                is recorded exactly as for a Feishu-originated
+                                prompt. Exit codes: 2 daemon down / setup, 3
+                                outcome unknown (may be delivered — verify
+                                before retrying), 1 business error.
 
-Server address/token resolution: the `kap:` section of system.yaml, with the
-instance registry as the source of the actual port (the server may have
-bumped the requested port on conflict) and `<kap home>/server.token` as the
-credential. kap wire schemas never appear here — only the adapter's
-normalized types are consumed.
+Read-only commands talk to kap-server REST directly: the `kap:` section of
+system.yaml provides address/home, the instance registry is the source of
+the actual port (the server may have bumped the requested port on conflict),
+and `<kap home>/server.token` is the credential. kap wire schemas never
+appear here — only the adapter's normalized types are consumed. The control
+plane is discovered from `control_plane.json` in the data dir (pid liveness
+checked) and authenticated with `control.token` from the config dir.
 """
 
 from __future__ import annotations
@@ -37,18 +46,22 @@ from typing import Any, Callable, NoReturn
 import yaml
 
 from kite import config as kite_config
+from kite import preflights
 from kite import service_manager
 from kite.adapters import kap_server
 from kite.adapters.kap_server import KapRestClient
 from kite.cli_table import render_table
+from kite.control_plane import (
+    ControlClient,
+    ControlError,
+    ControlOutcomeUnknownError,
+    ControlRefusedError,
+    discover_live_control_metadata,
+)
 from kite.platform_paths import default_data_root
 from kite.process_utils import process_exists
 from kite.runtime_status import read_runtime_status
-from kite.stores.binding_store import (
-    DEFAULT_PERMISSION_MODE,
-    DEFAULT_PLAN_MODE,
-    BindingStore,
-)
+from kite.stores.binding_store import BindingStore
 
 _NO_VALUE = "-"
 _DEFAULT_LOG_LINES = 50
@@ -287,16 +300,46 @@ def _cmd_service_start(_args: argparse.Namespace) -> int:
     )
 
 
-def _cmd_service_stop(_args: argparse.Namespace) -> int:
+def _cmd_service_stop(args: argparse.Namespace) -> int:
+    _service_in_flight_gate(args, verb="stopping")
     return _run_service_action(
         lambda manager, definition: manager.stop(definition), done="stopped"
     )
 
 
-def _cmd_service_restart(_args: argparse.Namespace) -> int:
+def _cmd_service_restart(args: argparse.Namespace) -> int:
+    _service_in_flight_gate(args, verb="restarting")
     return _run_service_action(
         lambda manager, definition: manager.restart(definition), done="restarted"
     )
+
+
+def _service_in_flight_gate(args: argparse.Namespace, *, verb: str) -> None:
+    """Destructive-op preview gate for service stop/restart.
+
+    Queries live state (runtime_status.json + kap sessions busy/pending via
+    REST): any busy session or pending interaction makes the operation
+    --force-only with a printed preview; an unverifiable live state (kap
+    unreachable) is also --force-only — never silently available (FOCUS
+    runtime_admin discipline, docs/research/focus-assets-map.md §0 item 4).
+    """
+    sessions: list[kap_server.SessionSummary] | None = None
+    try:
+        sessions = _connect().list_sessions()
+    except (CliError, kap_server.KapError, kap_server.KapTransportError):
+        sessions = None
+    status = read_runtime_status(default_data_root())
+    kited_pid = status.get("kited_pid") if status else None
+    preview = preflights.preview_service_stop(
+        sessions,
+        kited_running=isinstance(kited_pid, int) and process_exists(kited_pid),
+    )
+    if not preview.force_only:
+        return
+    text = preview.preview_text(verb)
+    if not getattr(args, "force", False):
+        _die(f"{text}\nre-run with --force to proceed")
+    print(f"warning: {text}; proceeding anyway (--force)")
 
 
 def _cmd_service_status(_args: argparse.Namespace) -> int:
@@ -386,48 +429,53 @@ def _cmd_binding_list(_args: argparse.Namespace) -> int:
     return 0
 
 
-def _prompt_model() -> str | None:
-    """Model carried per prompt: kap.model, else config.toml default_model."""
-    config = kite_config.load_config_file("system")
-    kap = kite_config.kap_settings(config)
-    home = kap_server.resolve_kap_home(kap.home)
-    return kap_server.resolve_prompt_model(kap.model, home)
-
-
 def _cmd_prompt_send(args: argparse.Namespace) -> int:
     text = args.text
     if not text.strip():
         _die("prompt text must not be empty")
+    data_dir = default_data_root()
+    # kitectl is a client of the daemon here (docs/decisions/control-plane.md):
+    # the submit must serialize through kited so prompt ownership is recorded
+    # in the daemon's map. Never fall back to direct kap REST — that would
+    # reintroduce the second writer on the ownership axis.
+    metadata = discover_live_control_metadata(data_dir)
+    if metadata is None:
+        _die("kited is not running (no live control plane); start it with `kitectl service start`")
+    token_path = kite_config.control_token_path()
+    try:
+        token = token_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        _die(f"no control-plane token at {token_path}; is kited running?")
+    params: dict[str, Any] = {"text": text}
     if args.chat is not None:
-        binding = BindingStore(default_data_root()).load(args.chat)
-        if binding is None:
-            _die(f"no binding for chat {args.chat}; bind the chat from Feishu first")
-        session_id = binding["session_id"]
-        permission_mode = binding["permission_mode"]
-        plan_mode = binding["plan_mode"]
+        params["chat_id"] = args.chat
     else:
-        # No binding to inherit from: the store defaults, stated in --help.
-        session_id = args.session
-        permission_mode = DEFAULT_PERMISSION_MODE
-        plan_mode = DEFAULT_PLAN_MODE
-
-    client = _connect()
-    # Lazy import: app_handler pulls in the Feishu transport stack, which this
-    # local control-plane path does not otherwise need. KapSessionOps stays
-    # the single application-side owner of the submit wire path/payload.
-    from kite.app_handler import KapSessionOps
-
-    result = _checked(
-        lambda: KapSessionOps(client, model=_prompt_model()).submit_prompt(
-            session_id,
-            text,
-            permission_mode=permission_mode,
-            plan_mode=plan_mode,
+        params["session_id"] = args.session
+    client = ControlClient(port=metadata.port, token=token)
+    try:
+        data = client.request("prompt/submit", params)
+    except ControlRefusedError:
+        # The daemon went away between discovery and connect; the submit was
+        # definitely not delivered.
+        _die("kited is not running (control plane refused the connection); the prompt was not submitted")
+    except ControlOutcomeUnknownError as exc:
+        _die(
+            f"{exc}\nthe prompt may have been delivered; "
+            "verify with `kitectl session status` before retrying",
+            exit_code=3,
         )
-    )
-    print(f"prompt_id: {result.prompt_id}")
-    print(f"session_id: {session_id}")
-    print(f"status: {result.status}")
+    except ControlError as exc:
+        _die(f"kited error {exc.code}: {exc.msg}", exit_code=1)
+    if not isinstance(data, dict):
+        _die(
+            "kited accepted the prompt but returned a malformed response; "
+            "verify with `kitectl session status`",
+            exit_code=3,
+        )
+    print(f"prompt_id: {data.get('prompt_id', '')}")
+    print(f"session_id: {data.get('session_id', '')}")
+    print(f"status: {data.get('status', '')}")
+    print(f"owner_recorded: {'yes' if data.get('owner_recorded') else 'no'}")
     return 0
 
 
@@ -460,12 +508,20 @@ def _build_parser() -> argparse.ArgumentParser:
     service_sub.add_parser("start", help="start the service").set_defaults(
         func=_cmd_service_start
     )
-    service_sub.add_parser("stop", help="stop the service").set_defaults(
-        func=_cmd_service_stop
+    stop_parser = service_sub.add_parser("stop", help="stop the service")
+    stop_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="stop even when sessions are busy or the live state is unverifiable",
     )
-    service_sub.add_parser("restart", help="restart the service").set_defaults(
-        func=_cmd_service_restart
+    stop_parser.set_defaults(func=_cmd_service_stop)
+    restart_parser = service_sub.add_parser("restart", help="restart the service")
+    restart_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="restart even when sessions are busy or the live state is unverifiable",
     )
+    restart_parser.set_defaults(func=_cmd_service_restart)
     service_sub.add_parser("status", help="show installed/running state").set_defaults(
         func=_cmd_service_status
     )
