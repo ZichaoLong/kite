@@ -21,12 +21,15 @@ Implements the outbound half of the MVP contract
   the card. Card clicks are two-phase guarded (pending -> processing ->
   resolved; a mid-flight second click gets a "正在处理中" notice, a click on
   a missing entry gets "已失效或已处理" — never an error, never a
-  double-submit). An approval unanswered for ``approval_timeout_seconds`` is
+  double-submit) and actor-gated (group-chat §3.3: initiator or admin only;
+  a bystander click is a denial toast with no state change and no upstream
+  call). An approval unanswered for ``approval_timeout_seconds`` is
   resolved to upstream as rejected and the initiator is notified — never
   auto-approved (§3).
 - question.requested is the MVP text pass-through: numbered options to the
   owner chat; numbered replies are claimed via ``try_handle_interaction_reply``
-  and answered over REST; timeout auto-dismisses with a notice.
+  (in groups, only from the initiator or an admin — the same actor rule) and
+  answered over REST; timeout auto-dismisses with a notice.
 - fail-close sweep: /new /switch unbinds sweep the old session's pending
   approvals/questions routed to that chat, and kited shutdown sweeps all of
   them — responded upstream (approval rejected, question dismissed) and the
@@ -1318,13 +1321,24 @@ class EventPipeline:
     # Approval card actions + reject-with-feedback (AppHandler seams)
     # ------------------------------------------------------------------
 
-    def handle_approval_action(self, action: CardAction) -> CardActionResponse:
+    def handle_approval_action(
+        self,
+        action: CardAction,
+        *,
+        is_admin: Optional[Callable[[str], bool]] = None,
+    ) -> CardActionResponse:
         """Approval card buttons (AppHandler E3 seam; runs on the loop).
 
         Two-phase click guard: the entry flips pending -> processing before
         the REST resolve and rolls back on failure, so a second click while
         processing is a "正在处理中" notice and a click on a missing entry is
         a "已失效或已处理" notice — never an error, never a double-submit.
+
+        Actor check (group-chat contract §3.3): only the prompt initiator or
+        an admin may act; a bystander click gets a denial toast and changes
+        nothing (no state change, no upstream call — the card stays live for
+        the actor). p2p is unchanged: the only human in a p2p chat is an
+        admin, which always passes the check.
         """
         name = str(action.value.get("action") or "")
         approval_id = str(action.value.get("approval_id") or "").strip()
@@ -1340,6 +1354,17 @@ class EventPipeline:
                 action.chat_id,
             )
             return CardActionResponse(toast="该审批只能由发起聊天处理。", toast_type="error")
+        if not self._is_interaction_actor(
+            pending.prompt_id, action.operator_open_id, is_admin
+        ):
+            logger.warning(
+                "approval action by non-actor approval=%s operator=%s",
+                approval_id,
+                action.operator_open_id,
+            )
+            return CardActionResponse(
+                toast="只有该 prompt 的发起者或管理员可以处理此审批。", toast_type="error"
+            )
         if name == cards.ACTION_APPROVAL_RESOLVE:
             decision = str(action.value.get("decision") or "").strip()
             if decision not in (
@@ -1355,9 +1380,31 @@ class EventPipeline:
                 operator_open_id=action.operator_open_id,
             )
             return CardActionResponse(
-                toast="请直接回复一段文字作为拒绝反馈（你的下一条消息将作为反馈提交）。"
+                toast="请直接回复一段文字作为拒绝反馈（你的下一条消息将作为反馈提交；"
+                "群聊中需 @机器人 回复）。"
             )
         return CardActionResponse()
+
+    def _is_interaction_actor(
+        self,
+        prompt_id: str,
+        operator_open_id: str,
+        is_admin: Optional[Callable[[str], bool]],
+    ) -> bool:
+        """The actor rule (§3.3): prompt initiator or admin.
+
+        A missing operator identity is treated as a non-member (fail-closed,
+        §4.4); an unknown initiator (restart rebuild, control-plane submit)
+        fails closed to admin-only.
+        """
+        operator = str(operator_open_id or "").strip()
+        if not operator:
+            return False
+        entry = self._ownership.entry_of(prompt_id)
+        initiator = entry.sender_open_id if entry is not None else ""
+        if initiator and operator == initiator:
+            return True
+        return bool(is_admin is not None and is_admin(operator))
 
     def _resolve_approval_from_card(
         self, pending: _PendingApproval, decision: str, *, feedback: str = ""
@@ -1601,14 +1648,31 @@ class EventPipeline:
     # Interaction replies (AppHandler E3 seam; runs on the loop)
     # ------------------------------------------------------------------
 
-    def try_handle_interaction_reply(self, message: InboundMessage) -> bool:
-        """First claim on plain text: approval feedback, then question replies."""
+    def try_handle_interaction_reply(
+        self,
+        message: InboundMessage,
+        *,
+        is_admin: Optional[Callable[[str], bool]] = None,
+    ) -> bool:
+        """First claim on plain text: approval feedback, then question replies.
+
+        In a group chat the question branch enforces the same actor rule as
+        card clicks (§3.3): a non-actor's text is never consumed as an
+        answer — it falls through to the prompt path untouched (no state
+        change, no upstream call). Approval feedback needs no extra check:
+        the pending-feedback key is planted at click time, which is already
+        actor-gated.
+        """
         feedback = self._pending_feedback.get((message.chat_id, message.sender_open_id))
         if feedback is not None:
             self._handle_feedback_reply(feedback, message.text.strip())
             return True
         question = self._question_for_chat(message.chat_id)
         if question is None:
+            return False
+        if message.chat_type == "group" and not self._is_interaction_actor(
+            question.prompt_id, message.sender_open_id, is_admin
+        ):
             return False
         try:
             answers = _parse_question_reply(message.text, question.items)
@@ -2114,10 +2178,14 @@ class OutboundAppHandler(AppHandler):
         self._event_pipeline = event_pipeline
 
     def handle_approval_action(self, action: CardAction) -> CardActionResponse:
-        return self._event_pipeline.handle_approval_action(action)
+        # The actor check (group-chat §3.3) needs the admin set, which the
+        # handler owns; the pipeline owns the pending-approval state.
+        return self._event_pipeline.handle_approval_action(action, is_admin=self._is_admin)
 
     def try_handle_interaction_reply(self, message: InboundMessage) -> bool:
-        return self._event_pipeline.try_handle_interaction_reply(message)
+        return self._event_pipeline.try_handle_interaction_reply(
+            message, is_admin=self._is_admin
+        )
 
     def on_session_unbound(self, chat_id: str, old_session_id: str) -> None:
         # Fail-close sweep of the old session's pending approvals/questions

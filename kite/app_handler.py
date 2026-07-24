@@ -18,8 +18,14 @@ Implements the MVP inbound contract (docs/contracts/mvp-scope.md):
   submit discipline for `kitectl prompt send` (minus the Feishu ack), so
   CLI-sent prompts record ownership exactly like Feishu-originated ones
   (docs/decisions/control-plane.md);
+- group chats (docs/contracts/group-chat.md, mention_only first cut): a
+  non-activated group ignores everything except admin slash commands; in an
+  activated group any member's @bot+text enters the same prompt path as p2p
+  (first use creates+binds), slash commands stay admin-only except /abort
+  (initiator-or-admin actor check), and non-@ messages are ignored entirely.
+  Group activation config lives in the GroupConfigStore (state axis 5);
 - the MVP slash commands (/new /sessions /switch /detach /attach /mode
-  /plan /status /abort /help /init); in-flight-work-sensitive commands run
+  /plan /group /status /abort /help /init); in-flight-work-sensitive commands run
   the reason-coded preflights in kite/preflights.py (/new denies with an
   active prompt, /detach only notes it), and /new /switch rebinds fire the
   on_session_unbound seam so the outbound path can fail-close sweep the old
@@ -65,6 +71,7 @@ from kite.adapters.kap_server import (
 )
 from kite.attachment_domain import AttachmentDomain, AttachmentPorts
 from kite.command_surface import (
+    SlashCommand,
     build_help_text,
     build_usage_text,
     parse_permission_mode_arg,
@@ -97,6 +104,7 @@ from kite.stores.binding_store import (
     BindingStore,
     StoredBinding,
 )
+from kite.stores.group_config_store import GroupConfigStore
 from kite.stores.pending_attachment_store import PendingAttachmentStore
 
 logger = logging.getLogger("kite.app")
@@ -136,6 +144,11 @@ _NOT_BOUND_TEXT = (
     "或发送 /sessions 查看已有会话后用 /switch 〈id〉 切换。"
 )
 _NON_ADMIN_TEXT = "抱歉，KITE 目前仅对管理员开放。发送 /help 查看说明。"
+_GROUP_NOT_ACTIVATED_MEMBER_TEXT = "本群尚未激活，@我 发送的消息不会被处理。请联系管理员发送 /group activate 激活。"
+_GROUP_NOT_ACTIVATED_ADMIN_TEXT = "本群尚未激活，@我 发送的消息不会被处理。发送 /group activate 激活后，群成员即可 @我 使用。"
+_GROUP_COMMAND_ADMIN_ONLY_TEXT = "群聊中命令仅管理员可用。"
+_ABORT_DENIED_TEXT = "只有该 prompt 的发起者或管理员可以中止它。"
+_GROUP_PROMPT_HINT_TEXT = "群聊中请 @我 并发送文字来提交 prompt。"
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,6 +305,7 @@ class AppHandler(TransportHandler):
         rest: Any,
         binding_store: BindingStore,
         attachment_store: PendingAttachmentStore,
+        group_config_store: GroupConfigStore,
         runtime_loop: RuntimeLoop,
         config: Mapping[str, Any],
         init_token: str,
@@ -303,6 +317,7 @@ class AppHandler(TransportHandler):
         self._transport = transport
         self._ops = KapSessionOps(rest, model=prompt_model)
         self._binding_store = binding_store
+        self._group_config_store = group_config_store
         self._loop = runtime_loop
         self._default_working_dir = kite_config.default_working_dir(config)
         self._admins: set[str] = kite_config.admin_open_ids(config)
@@ -338,6 +353,7 @@ class AppHandler(TransportHandler):
             "/attach": self._cmd_attach,
             "/mode": self._cmd_mode,
             "/plan": self._cmd_plan,
+            "/group": self._cmd_group,
             "/status": self._cmd_status,
             "/abort": self._cmd_abort,
             "/help": self._cmd_help,
@@ -406,6 +422,11 @@ class AppHandler(TransportHandler):
     def _on_message_impl(self, message: InboundMessage) -> None:
         text = message.text.strip()
         command = parse_slash_command(text)
+        if message.chat_type == "group":
+            # Group chats follow the group-chat contract ingress matrix
+            # (docs/contracts/group-chat.md §3.2), not the p2p identity gate.
+            self._on_group_message_impl(message, text, command)
+            return
         if not self._is_admin(message.sender_open_id):
             # Identity gate (mvp-scope §5): non-admins get /help and /init only.
             if command is not None and command.name == "/help":
@@ -416,11 +437,7 @@ class AppHandler(TransportHandler):
                 self._reply_to(message, _NON_ADMIN_TEXT)
             return
         if command is not None:
-            handler = self._commands.get(command.name)
-            if handler is None:
-                self._reply_to(message, f"未知命令 `{command.name}`。发送 /help 查看命令导航。")
-                return
-            handler(message, command.arg)
+            self._dispatch_command(message, command)
             return
         if not text:
             self._reply_to(message, "KITE 目前只处理文字消息。发送 /help 查看命令导航。")
@@ -431,8 +448,72 @@ class AppHandler(TransportHandler):
             return
         self._handle_prompt(message)
 
+    def _on_group_message_impl(
+        self, message: InboundMessage, text: str, command: SlashCommand | None
+    ) -> None:
+        """Group ingress matrix (group-chat contract §3.2, fail-closed §4.1).
+
+        - non-activated group: everything is ignored except admin slash
+          commands (member @/slash gets one denial hint, never spam);
+        - activated group: slash commands stay admin-only, except /abort
+          which uses the initiator-or-admin actor check (§3.4); non-@
+          messages are ignored entirely; any member's @bot+text enters the
+          prompt path (first use creates+binds like p2p). A missing sender
+          identity is treated as a non-member (§4.4) and never prompts.
+        """
+        activated = self._group_config_store.is_activated(message.chat_id)
+        is_admin = self._is_admin(message.sender_open_id)
+        if command is not None:
+            if is_admin:
+                self._dispatch_command(message, command)
+                return
+            if activated and command.name == "/abort":
+                # /abort is the one member-reachable command in groups; the
+                # actor check inside decides initiator vs bystander (§3.4).
+                self._cmd_abort(message, command.arg)
+                return
+            self._reply_to(message, _GROUP_COMMAND_ADMIN_ONLY_TEXT)
+            return
+        if not activated:
+            if message.bot_mentioned:
+                self._reply_to(
+                    message,
+                    _GROUP_NOT_ACTIVATED_ADMIN_TEXT if is_admin else _GROUP_NOT_ACTIVATED_MEMBER_TEXT,
+                )
+            return
+        if not message.bot_mentioned:
+            # Non-@ group chatter is ignored entirely: no prompt, no
+            # interaction claim, no context (§3.2).
+            return
+        if not text:
+            self._reply_to(message, _GROUP_PROMPT_HINT_TEXT)
+            return
+        if not message.sender_open_id.strip():
+            # Missing identity -> non-member (§4.4); never prompts.
+            self._reply_to(message, "无法识别你的身份（缺少 open_id），消息未提交。")
+            return
+        if self.try_handle_interaction_reply(message):
+            return
+        self._handle_prompt(message)
+
+    def _dispatch_command(self, message: InboundMessage, command: SlashCommand) -> None:
+        handler = self._commands.get(command.name)
+        if handler is None:
+            self._reply_to(message, f"未知命令 `{command.name}`。发送 /help 查看命令导航。")
+            return
+        handler(message, command.arg)
+
     def _on_attachment_impl(self, attachment: InboundAttachment) -> None:
-        if not self._is_admin(attachment.sender_open_id):
+        if attachment.chat_type == "group":
+            # Group attachments follow the ingress matrix (§3.2): only an
+            # activated group processes anything, and inbound image staging
+            # stays admin-only in this cut. Everything else is ignored
+            # silently (no spam, fail-closed).
+            if not self._group_config_store.is_activated(attachment.chat_id):
+                return
+            if not self._is_admin(attachment.sender_open_id):
+                return
+        elif not self._is_admin(attachment.sender_open_id):
             self._reply(attachment.chat_id, _NON_ADMIN_TEXT, parent_message_id=attachment.message_id)
             return
         self._attachment_domain.handle_attachment(attachment)
@@ -567,7 +648,9 @@ class AppHandler(TransportHandler):
             # Successful submit: consumption deletes the staged files
             # (contract §2.5); the image bytes live in the kap message.
             self._attachment_domain.discard_consumed_files(prepared.consumed)
-        self._ownership.record(result.prompt_id, chat_id)
+        self._ownership.record(
+            result.prompt_id, chat_id, sender_open_id=message.sender_open_id
+        )
         logger.info(
             "prompt submitted chat_id=%s session_id=%s prompt_id=%s status=%s attachments=%d",
             chat_id,
@@ -1036,6 +1119,50 @@ class AppHandler(TransportHandler):
         state = "开启" if new_plan_mode else "关闭"
         self._reply_to(message, f"计划模式已{state}。")
 
+    def _cmd_group(self, message: InboundMessage, arg: str) -> None:
+        if message.chat_type != "group":
+            self._reply_to(message, "`/group` 仅在群聊中可用。")
+            return
+        if not self._is_admin(message.sender_open_id):
+            # Defense in depth: the group ingress gate already limits slash
+            # commands to admins, but activation is the group access switch
+            # itself and stays explicitly admin-only (contract §3.1).
+            self._reply_to(message, _GROUP_COMMAND_ADMIN_ONLY_TEXT)
+            return
+        subcommand = arg.strip().lower()
+        if subcommand == "activate":
+            # Activation requires a binding (contract §3.1): an unbound
+            # group's first activation creates+binds a session with the
+            # instance default cwd, same first-use rule as p2p.
+            if self._binding_store.load(message.chat_id) is None:
+                if self._create_and_bind(message.chat_id, "群聊会话") is None:
+                    return
+            config = self._group_config_store.activate(
+                message.chat_id, activated_by=message.sender_open_id
+            )
+            logger.info(
+                "group activated chat_id=%s by=%s mode=%s",
+                message.chat_id,
+                config["activated_by"],
+                config["mode"],
+            )
+            self._reply_to(
+                message,
+                "已激活当前群聊（模式：mention_only）。群成员 @我 并发送文字即可提交 prompt；"
+                "审批与问题仅发起者或管理员可处理。发送 /group deactivate 停用。",
+            )
+            return
+        if subcommand == "deactivate":
+            self._group_config_store.deactivate(message.chat_id)
+            logger.info("group deactivated chat_id=%s", message.chat_id)
+            self._reply_to(
+                message,
+                "已停用当前群聊；成员消息将被忽略，群聊命令仍仅管理员可用。"
+                "发送 /group activate 重新激活。",
+            )
+            return
+        self._reply_to(message, build_usage_text("/group"))
+
     def _cmd_status(self, message: InboundMessage, arg: str) -> None:
         if arg.strip():
             self._reply_to(message, build_usage_text("/status"))
@@ -1049,6 +1176,13 @@ class AppHandler(TransportHandler):
             f"权限模式：{binding['permission_mode']}；"
             f"计划模式：{'开启' if binding['plan_mode'] else '关闭'}",
         ]
+        if message.chat_type == "group":
+            # Group activation state (group-chat contract §3.1).
+            group_config = self._group_config_store.load(message.chat_id)
+            if group_config is not None and group_config["activated"]:
+                lines.append(f"群聊：已激活（{group_config['mode']}）")
+            else:
+                lines.append("群聊：未激活（发送 /group activate 激活）")
         try:
             info = self._ops.get_session(binding["session_id"])
             queue = self._ops.get_prompts(binding["session_id"])
@@ -1086,12 +1220,11 @@ class AppHandler(TransportHandler):
             self._reply_to(message, "当前没有正在执行的 prompt。")
             return
         # /abort is gated to the active prompt's initiator and admins
-        # (mvp-scope §3). The identity gate already limits commands to
-        # admins; the ownership check stays explicit for the multi-chat
-        # bound-to-one-session case.
-        owner_chat = self._ownership.owner_of(active_id)
-        if owner_chat != message.chat_id and not self._is_admin(message.sender_open_id):
-            self._reply_to(message, "只有该 prompt 的发起者或管理员可以中止它。")
+        # (mvp-scope §3; group-chat contract §3.4). In p2p the initiating
+        # chat's user counts as the initiator (single-user chat); in a group
+        # the initiator is the recorded sender_open_id.
+        if not self._may_abort(message, active_id):
+            self._reply_to(message, _ABORT_DENIED_TEXT)
             return
         try:
             self._ops.abort_prompt(binding["session_id"], active_id)
@@ -1261,6 +1394,26 @@ class AppHandler(TransportHandler):
     def _is_admin(self, open_id: str) -> bool:
         normalized = str(open_id or "").strip()
         return bool(normalized) and normalized in self._admins
+
+    def _may_abort(self, message: InboundMessage, prompt_id: str) -> bool:
+        """The /abort actor rule: initiator or admin (group-chat §3.4).
+
+        p2p is unchanged: the initiating chat is a single-user chat, so an
+        abort from the owner chat counts as the initiator. In a group the
+        initiator is the recorded ``sender_open_id``; an unknown initiator
+        (e.g. after a restart rebuild) fails closed to admin-only.
+        """
+        if self._is_admin(message.sender_open_id):
+            return True
+        owner_chat = self._ownership.owner_of(prompt_id)
+        if owner_chat != message.chat_id:
+            return False
+        if message.chat_type != "group":
+            return True
+        entry = self._ownership.entry_of(prompt_id)
+        initiator = entry.sender_open_id if entry is not None else ""
+        sender = message.sender_open_id.strip()
+        return bool(initiator) and bool(sender) and sender == initiator
 
     def _load_binding_or_reply(self, message: InboundMessage) -> Optional[StoredBinding]:
         binding = self._binding_store.load(message.chat_id)

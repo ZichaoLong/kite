@@ -58,6 +58,7 @@ from kite.runtime_loop import RuntimeLoop
 from kite.runtime_status import RuntimeStatusWriter
 from kite.stores.binding_store import BindingStore
 from kite.stores.event_cursor_store import EventCursorStore
+from kite.stores.group_config_store import GroupConfigStore
 from kite.stores.pending_attachment_store import PendingAttachmentStore
 from kite.stores.terminal_result_store import TerminalResultStore
 
@@ -171,6 +172,7 @@ def build_outbound_runtime(
         rest=rest_proxy,
         binding_store=binding_store,
         attachment_store=PendingAttachmentStore(data_dir),
+        group_config_store=GroupConfigStore(data_dir),
         runtime_loop=loop,
         config=config,
         init_token=init_token,

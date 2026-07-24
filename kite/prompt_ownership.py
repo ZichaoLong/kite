@@ -2,7 +2,10 @@
 
 Which chat initiated each active/queued prompt. This determines where
 approval/question cards route to (mvp-scope §3: they go only to the prompt
-initiator's chat) and who may /abort it (initiator or admins).
+initiator's chat) and who may /abort it (initiator or admins). Entries also
+carry the initiating user's ``sender_open_id`` ("" when unknown) so group
+chats can enforce the actor rule at card click and /abort time
+(docs/contracts/group-chat.md §3.3).
 
 The map is deliberately in-memory only. After a kited restart it is rebuilt
 on a best-effort basis from ``GET .../prompts`` (mvp-scope §4.6); entries
@@ -33,11 +36,17 @@ VALID_CERTAINTIES = frozenset({CERTAINTY_CERTAIN, CERTAINTY_BEST_EFFORT})
 
 @dataclass(frozen=True, slots=True)
 class PromptOwnershipEntry:
-    """One ownership fact: prompt -> initiating chat, with certainty."""
+    """One ownership fact: prompt -> initiating chat, with certainty.
+
+    ``sender_open_id`` is the initiating Feishu user (group-chat actor
+    checks, docs/contracts/group-chat.md §3.3); "" when unknown (restart
+    rebuild, control-plane submissions).
+    """
 
     prompt_id: str
     chat_id: str
     certainty: str
+    sender_open_id: str = ""
 
 
 class PromptOwnership:
@@ -47,13 +56,15 @@ class PromptOwnership:
         self._lock = threading.Lock()
         self._entries: dict[str, PromptOwnershipEntry] = {}
 
-    def record(self, prompt_id: str, chat_id: str) -> PromptOwnershipEntry:
+    def record(
+        self, prompt_id: str, chat_id: str, *, sender_open_id: str = ""
+    ) -> PromptOwnershipEntry:
         """Record certain ownership (we submitted this prompt ourselves)."""
-        return self._store(prompt_id, chat_id, CERTAINTY_CERTAIN)
+        return self._store(prompt_id, chat_id, CERTAINTY_CERTAIN, sender_open_id)
 
     def record_best_effort(self, prompt_id: str, chat_id: str) -> PromptOwnershipEntry:
         """Record a single best-effort ownership (restart rebuild)."""
-        return self._store(prompt_id, chat_id, CERTAINTY_BEST_EFFORT)
+        return self._store(prompt_id, chat_id, CERTAINTY_BEST_EFFORT, "")
 
     def owner_of(self, prompt_id: str) -> str | None:
         """The initiating chat_id for a prompt, or None when unknown."""
@@ -84,7 +95,9 @@ class PromptOwnership:
         """
         rebuilt: dict[str, PromptOwnershipEntry] = {}
         for entry in entries:
-            normalized = self._validate(entry.prompt_id, entry.chat_id, entry.certainty)
+            normalized = self._validate(
+                entry.prompt_id, entry.chat_id, entry.certainty, entry.sender_open_id
+            )
             rebuilt[normalized.prompt_id] = normalized
         with self._lock:
             self._entries = rebuilt
@@ -97,17 +110,22 @@ class PromptOwnership:
         with self._lock:
             return len(self._entries)
 
-    def _store(self, prompt_id: str, chat_id: str, certainty: str) -> PromptOwnershipEntry:
-        entry = self._validate(prompt_id, chat_id, certainty)
+    def _store(
+        self, prompt_id: str, chat_id: str, certainty: str, sender_open_id: str
+    ) -> PromptOwnershipEntry:
+        entry = self._validate(prompt_id, chat_id, certainty, sender_open_id)
         with self._lock:
             self._entries[entry.prompt_id] = entry
         return entry
 
     @staticmethod
-    def _validate(prompt_id: str, chat_id: str, certainty: str) -> PromptOwnershipEntry:
+    def _validate(
+        prompt_id: str, chat_id: str, certainty: str, sender_open_id: str
+    ) -> PromptOwnershipEntry:
         normalized_prompt_id = str(prompt_id or "").strip()
         normalized_chat_id = str(chat_id or "").strip()
         normalized_certainty = str(certainty or "").strip()
+        normalized_sender_open_id = str(sender_open_id or "").strip()
         if not normalized_prompt_id:
             raise ValueError("prompt_id must not be empty")
         if not normalized_chat_id:
@@ -118,4 +136,5 @@ class PromptOwnership:
             prompt_id=normalized_prompt_id,
             chat_id=normalized_chat_id,
             certainty=normalized_certainty,
+            sender_open_id=normalized_sender_open_id,
         )

@@ -43,6 +43,7 @@ from kite.prompt_ownership import PromptOwnership
 from kite.runtime_loop import RuntimeLoop
 from kite.stores.binding_store import BindingStore
 from kite.stores.event_cursor_store import EventCursorStore
+from kite.stores.group_config_store import GroupConfigStore
 from kite.stores.pending_attachment_store import PendingAttachmentStore
 from kite.stores.terminal_result_store import TerminalResultStore
 
@@ -439,6 +440,7 @@ class PipelineTestCase(unittest.TestCase):
         self.addCleanup(self.loop.stop)
         self.timers = ManualTimerFactory()
         self.ownership = PromptOwnership()
+        self.group_config_store = GroupConfigStore(self.data_dir)
         self.pipeline = EventPipeline(
             transport=self.transport,
             rest=self.rest,
@@ -457,6 +459,7 @@ class PipelineTestCase(unittest.TestCase):
             rest=self.rest,
             binding_store=self.store,
             attachment_store=PendingAttachmentStore(self.data_dir),
+            group_config_store=self.group_config_store,
             runtime_loop=self.loop,
             config={
                 "admin_open_ids": [ADMIN_OPEN_ID, OTHER_OPEN_ID],
@@ -1613,6 +1616,182 @@ class SweepTests(PipelineTestCase):
         patch = json.dumps(self.transport.patches_to(approval_card_id)[-1], ensure_ascii=False)
         self.assertIn("已处理", patch)
         self.assertNotIn("已过期", patch)
+
+
+# ---------------------------------------------------------------------------
+# Group chat: actor checks at click/reply time (group-chat contract §3.3)
+# ---------------------------------------------------------------------------
+
+GROUP_CHAT_ID = "oc_group"
+MEMBER_OPEN_ID = "ou_member"
+BYSTANDER_OPEN_ID = "ou_bystander"
+
+
+def make_group_message(
+    text: str,
+    *,
+    sender: str = MEMBER_OPEN_ID,
+    chat_id: str = GROUP_CHAT_ID,
+    message_id: str = "om_g1",
+) -> InboundMessage:
+    return InboundMessage(
+        message_id=message_id,
+        chat_id=chat_id,
+        chat_type="group",
+        msg_type="text",
+        text=text,
+        sender_open_id=sender,
+        sender_user_id="u_1",
+        sender_type="user",
+        bot_mentioned=True,
+        mentions=[],
+        thread_id="",
+        root_id="",
+        parent_id="",
+        create_time=0,
+    )
+
+
+class GroupActorTests(PipelineTestCase):
+    def _start_group_prompt_with_approval(self, *, sender: str | None = MEMBER_OPEN_ID) -> str:
+        """Group + p2p chats bound to one session; the prompt is owned by the
+        group (initiator ``sender``; None records an unknown sender); the
+        approval card is routed to the group. Returns its message id."""
+        self.bind(CHAT_ID)  # p2p chat attached to the same session
+        self.bind(GROUP_CHAT_ID)
+        self.start_prompt()
+        if sender is None:
+            self.ownership.record("p-1", GROUP_CHAT_ID)
+        else:
+            self.ownership.record("p-1", GROUP_CHAT_ID, sender_open_id=sender)
+        self.feed(approval_requested())
+        return self.transport.cards_to(GROUP_CHAT_ID)[-1]["message_id"]
+
+    def _approve_click(self, operator: str, chat_id: str = GROUP_CHAT_ID):
+        return self.handler.on_card_action(
+            make_card_action(
+                {
+                    "action": cards.ACTION_APPROVAL_RESOLVE,
+                    "decision": cards.APPROVAL_DECISION_APPROVED,
+                    "approval_id": "a-1",
+                    "prompt_id": "p-1",
+                },
+                operator=operator,
+                chat_id=chat_id,
+            )
+        )
+
+    def test_broadcast_to_group_and_p2p_approval_only_to_initiator_chat(self) -> None:
+        # Broadcast (§3.5 + mvp-scope §3): a group is an ordinary attached
+        # chat — the execution card lands in both chats, the actionable
+        # approval card goes only to the initiator's chat (the group), and
+        # the p2p chat gets the read-only notice.
+        self._start_group_prompt_with_approval()
+
+        p2p_cards = self.transport.cards_to(CHAT_ID)
+        group_cards = self.transport.cards_to(GROUP_CHAT_ID)
+        self.assertEqual(len(p2p_cards), 1)  # execution card only
+        self.assertEqual(len(group_cards), 2)  # execution card + approval card
+        self.assertNotIn("审批请求", json.dumps(p2p_cards[-1]["content"], ensure_ascii=False))
+        self.assertIn("审批请求", json.dumps(group_cards[-1]["content"], ensure_ascii=False))
+        notices = self.transport.texts_to(CHAT_ID)
+        self.assertEqual(len(notices), 1)
+        self.assertIn("发起者处理审批", notices[0])
+
+    def test_bystander_click_denied_no_state_change_no_rest_call(self) -> None:
+        card_message_id = self._start_group_prompt_with_approval()
+
+        response = self._approve_click(BYSTANDER_OPEN_ID)
+
+        self.assertEqual(response.toast_type, "error")
+        self.assertIn("发起者或管理员", response.toast or "")
+        # No upstream call, no card patch, and the approval is still live:
+        # the initiator can still resolve it afterwards (§4.2).
+        self.assertEqual(self.rest.approval_resolutions, [])
+        self.assertEqual(self.transport.patches_to(card_message_id), [])
+        followup = self._approve_click(MEMBER_OPEN_ID)
+        self.assertIn("已批准", followup.toast or "")
+        self.assertEqual(len(self.rest.approval_resolutions), 1)
+
+    def test_initiator_click_resolves(self) -> None:
+        self._start_group_prompt_with_approval()
+
+        response = self._approve_click(MEMBER_OPEN_ID)
+
+        self.assertEqual(
+            self.rest.approval_resolutions,
+            [{"session_id": SESSION_ID, "approval_id": "a-1", "body": {"decision": "approved"}}],
+        )
+        self.assertIn("已批准", response.toast or "")
+
+    def test_admin_click_resolves(self) -> None:
+        self._start_group_prompt_with_approval()
+
+        response = self._approve_click(OTHER_OPEN_ID)
+
+        self.assertEqual(len(self.rest.approval_resolutions), 1)
+        self.assertIn("已批准", response.toast or "")
+
+    def test_unknown_initiator_fails_closed_to_admin_only(self) -> None:
+        # Ownership without a sender (control-plane submit / restart rebuild):
+        # no member can claim the initiator role (fail-closed).
+        self._start_group_prompt_with_approval(sender=None)
+
+        response = self._approve_click(MEMBER_OPEN_ID)
+
+        self.assertEqual(response.toast_type, "error")
+        self.assertEqual(self.rest.approval_resolutions, [])
+        followup = self._approve_click(OTHER_OPEN_ID)
+        self.assertIn("已批准", followup.toast or "")
+        self.assertEqual(len(self.rest.approval_resolutions), 1)
+
+    def test_missing_operator_identity_is_a_non_member(self) -> None:
+        # §4.4: sender identity missing from an event -> treat as non-member.
+        self._start_group_prompt_with_approval()
+
+        response = self._approve_click("")
+
+        self.assertEqual(response.toast_type, "error")
+        self.assertEqual(self.rest.approval_resolutions, [])
+
+    def _start_group_question(self) -> None:
+        self.bind(GROUP_CHAT_ID)
+        self.start_prompt(chat_id=GROUP_CHAT_ID)
+        self.ownership.record("p-1", GROUP_CHAT_ID, sender_open_id=MEMBER_OPEN_ID)
+        self.feed(question_requested())
+        # Member text only enters in an activated group.
+        self.group_config_store.activate(GROUP_CHAT_ID, activated_by=ADMIN_OPEN_ID)
+
+    def test_group_question_reply_from_bystander_is_not_claimed(self) -> None:
+        self._start_group_question()
+
+        # A bystander's @bot "1" is ordinary member text: it enters the
+        # prompt path instead of answering the initiator's question (§3.3).
+        self.handler.on_message(make_group_message("1", sender=BYSTANDER_OPEN_ID))
+
+        self.assertEqual(self.rest.question_answers, [])
+        self.assertEqual(len(self.rest.submissions), 1)
+        # The question is still pending for the initiator, who can answer it.
+        self.handler.on_message(make_group_message("1", sender=MEMBER_OPEN_ID))
+        self.assertEqual(len(self.rest.question_answers), 1)
+
+    def test_group_question_reply_from_initiator_is_answered(self) -> None:
+        self._start_group_question()
+
+        self.handler.on_message(make_group_message("1", sender=MEMBER_OPEN_ID))
+
+        self.assertEqual(len(self.rest.question_answers), 1)
+        answer = self.rest.question_answers[0]
+        self.assertEqual(answer["session_id"], SESSION_ID)
+        self.assertEqual(answer["question_id"], "q-1")
+        self.assertIn("已提交回答", self.transport.texts_to(GROUP_CHAT_ID)[-1])
+
+    def test_group_question_reply_from_admin_is_answered(self) -> None:
+        self._start_group_question()
+
+        self.handler.on_message(make_group_message("1", sender=OTHER_OPEN_ID))
+
+        self.assertEqual(len(self.rest.question_answers), 1)
 
 
 if __name__ == "__main__":

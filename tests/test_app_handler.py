@@ -33,6 +33,7 @@ from kite.feishu_transport import (
 from kite.prompt_ownership import CERTAINTY_BEST_EFFORT, PromptOwnership
 from kite.runtime_loop import RuntimeLoop
 from kite.stores.binding_store import BindingStore
+from kite.stores.group_config_store import GroupConfigStore
 from kite.stores.pending_attachment_store import PendingAttachmentStore
 
 ADMIN_OPEN_ID = "ou_admin"
@@ -302,6 +303,7 @@ class AppHandlerTestCase(unittest.TestCase):
         self.data_dir = pathlib.Path(self.tempdir.name)
         self.store = BindingStore(self.data_dir)
         self.attachment_store = PendingAttachmentStore(self.data_dir)
+        self.group_config_store = GroupConfigStore(self.data_dir)
         self.transport = FakeTransport()
         self.rest = FakeKapRestClient()
         self.loop = RuntimeLoop(name="test-loop")
@@ -316,6 +318,7 @@ class AppHandlerTestCase(unittest.TestCase):
             rest=self.rest,
             binding_store=self.store,
             attachment_store=self.attachment_store,
+            group_config_store=self.group_config_store,
             runtime_loop=self.loop,
             config={
                 "admin_open_ids": sorted(admins if admins is not None else {ADMIN_OPEN_ID}),
@@ -409,6 +412,7 @@ class IdentityTests(AppHandlerTestCase):
             rest=self.rest,
             binding_store=self.store,
             attachment_store=PendingAttachmentStore(self.data_dir),
+            group_config_store=self.group_config_store,
             runtime_loop=self.loop,
             config={"admin_open_ids": [], "default_working_dir": DEFAULT_CWD},
             init_token=INIT_TOKEN,
@@ -1030,6 +1034,7 @@ class E3SeamTests(AppHandlerTestCase):
             rest=self.rest,
             binding_store=self.store,
             attachment_store=PendingAttachmentStore(self.data_dir),
+            group_config_store=self.group_config_store,
             runtime_loop=self.loop,
             config={"admin_open_ids": [ADMIN_OPEN_ID], "default_working_dir": DEFAULT_CWD},
             init_token=INIT_TOKEN,
@@ -1060,6 +1065,7 @@ class E3SeamTests(AppHandlerTestCase):
             rest=self.rest,
             binding_store=self.store,
             attachment_store=PendingAttachmentStore(self.data_dir),
+            group_config_store=self.group_config_store,
             runtime_loop=self.loop,
             config={"admin_open_ids": [ADMIN_OPEN_ID], "default_working_dir": DEFAULT_CWD},
             init_token=INIT_TOKEN,

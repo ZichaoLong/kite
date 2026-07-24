@@ -72,6 +72,7 @@ class CommandSpecTests(unittest.TestCase):
                 "/attach",
                 "/mode",
                 "/plan",
+                "/group",
                 "/status",
                 "/abort",
                 "/init",

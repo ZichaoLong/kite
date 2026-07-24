@@ -26,6 +26,7 @@ from kite.runtime_loop import RuntimeLoop
 from kite.runtime_status import read_runtime_status
 from kite.stores.binding_store import BindingStore
 from kite.stores.event_cursor_store import EventCursorStore
+from kite.stores.group_config_store import GroupConfigStore
 from kite.stores.pending_attachment_store import PendingAttachmentStore
 from kite.stores.terminal_result_store import TerminalResultStore
 from test_app_handler import FakeKapRestClient, FakeTransport
@@ -313,6 +314,7 @@ class ControlPlaneSubmitTests(unittest.TestCase):
             rest=self.rest,
             binding_store=self.store,
             attachment_store=PendingAttachmentStore(self.data_dir),
+            group_config_store=GroupConfigStore(self.data_dir),
             runtime_loop=self.loop,
             config={"admin_open_ids": ["ou_admin"], "default_working_dir": "/work"},
             init_token="test-init-token",
@@ -547,6 +549,7 @@ class ControlPlaneImageSendTests(unittest.TestCase):
             rest=self.rest,
             binding_store=self.store,
             attachment_store=PendingAttachmentStore(self.data_dir),
+            group_config_store=GroupConfigStore(self.data_dir),
             runtime_loop=self.loop,
             config=config,
             init_token="test-init-token",

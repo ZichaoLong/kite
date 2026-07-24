@@ -77,6 +77,11 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
         "切换计划模式（plan mode）；不带参数时取反。",
     ),
     CommandSpec(
+        "/group",
+        "/group 〈activate|deactivate〉",
+        "激活/停用当前群聊（仅管理员，在群聊中使用）；激活后成员 @机器人 发送文字即可提交 prompt。",
+    ),
+    CommandSpec(
         "/status",
         "/status",
         "查看绑定、会话工作状态与队列。",
@@ -139,7 +144,7 @@ def build_help_text() -> str:
     for spec in COMMAND_SPECS:
         lines.append(f"`{spec.usage}` — {spec.summary}")
     lines.append("")
-    lines.append("直接发送文字即作为 prompt 提交给当前绑定的会话。")
+    lines.append("直接发送文字即作为 prompt 提交给当前绑定的会话；群聊中需先 /group activate，并 @机器人 发送。")
     return "\n".join(lines)
 
 
