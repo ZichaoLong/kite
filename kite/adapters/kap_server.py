@@ -224,6 +224,9 @@ class SessionSnapshot:
     in_flight_turn_id: int | None = None
     pending_approvals: tuple[ApprovalRequestView, ...] = ()
     pending_questions: tuple[QuestionRequestView, ...] = ()
+    # Assistant text of the in-flight turn's current step (volatile healing:
+    # step-relative, exactly like the delta offsets, so it re-baselines both).
+    in_flight_assistant_text: str = ""
 
     @property
     def cursor(self) -> EventCursor:
@@ -534,6 +537,54 @@ _DURABLE_EVENT_TYPES = frozenset(
         "event.session.work_changed",
     }
 )
+
+
+# ---------------------------------------------------------------------------
+# Typed volatile events (the streaming side-channel; docs/contracts/streaming-cards.md)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class AssistantDelta:
+    """One normalized volatile ``assistant.delta`` frame.
+
+    ``offset`` is the pre-append offset of this delta within the turn's
+    current step, stamped by the server's in-flight tracker (it resets at
+    every ``turn.step.started``); it is the gap-detection input for the
+    streaming transcript. Volatile frames never advance the durable cursor.
+    """
+
+    session_id: str
+    offset: int
+    text_delta: str
+
+
+def normalize_volatile_event(event: KapEvent) -> AssistantDelta | None:
+    """Map a normalized KapEvent to a typed volatile event.
+
+    Only ``assistant.delta`` is in scope (streaming-cards contract §2:
+    thinking/tool/shell/status deltas are explicit non-goals); everything
+    else normalizes to None. A delta without a usable offset or payload is
+    dropped — the missing text must never be guessed at (the durable path
+    still produces correct cards without it, §4.3).
+    """
+    if not event.volatile or not event.session_id or event.type != "assistant.delta":
+        return None
+    payload = event.payload
+    if not isinstance(payload, dict):
+        logger.warning("volatile event %s with non-dict payload dropped", event.type)
+        return None
+    delta = payload.get("delta")
+    if not isinstance(delta, str) or not delta:
+        return None
+    if event.offset is None:
+        logger.warning("assistant.delta without an offset dropped (cannot gap-check)")
+        return None
+    return AssistantDelta(
+        session_id=event.session_id,
+        offset=event.offset,
+        text_delta=delta,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -847,6 +898,11 @@ class KapRestClient:
                 if isinstance(in_flight_turn, dict)
                 else None
             ),
+            in_flight_assistant_text=(
+                str(in_flight_turn.get("assistant_text") or "")
+                if isinstance(in_flight_turn, dict)
+                else ""
+            ),
             pending_approvals=tuple(
                 view
                 for view in (_parse_approval_request(item) for item in _as_list(data.get("pending_approvals")))
@@ -1128,6 +1184,7 @@ class KapWsClient:
         on_resync_required: Callable[[ResyncRequest], None] | None = None,
         on_connection_change: Callable[[bool], None] | None = None,
         on_error_frame: Callable[[KapErrorFrame], None] | None = None,
+        on_volatile: Callable[[AssistantDelta], None] | None = None,
         ping_timeout_seconds: float = 10.0,
     ) -> None:
         self._url = f"ws://{host}:{port}{API_PREFIX}/ws"
@@ -1143,6 +1200,7 @@ class KapWsClient:
         self._on_resync = on_resync_required
         self._on_connection_change = on_connection_change
         self._on_error_frame = on_error_frame
+        self._on_volatile = on_volatile
         self._ping_timeout = float(ping_timeout_seconds)
 
         self._stop_event = threading.Event()
@@ -1383,6 +1441,18 @@ class KapWsClient:
             return
         if event.seq is not None and not event.volatile and event.session_id:
             self._advance_cursor(event)
+        if event.volatile:
+            # The volatile side-channel (streaming-cards contract): normalized
+            # deltas go only to on_volatile; they never advance the durable
+            # cursor above and never reach the durable on_event path. Other
+            # volatile types keep flowing to on_event, which drops them.
+            volatile_event = normalize_volatile_event(event)
+            if volatile_event is not None and self._on_volatile is not None:
+                try:
+                    self._on_volatile(volatile_event)
+                except Exception:  # noqa: BLE001 - a bad callback must not kill the stream
+                    logger.exception("on_volatile callback failed for %s", event.type)
+                return
         if self._on_event is not None:
             try:
                 self._on_event(event)

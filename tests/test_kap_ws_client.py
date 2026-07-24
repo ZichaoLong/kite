@@ -232,6 +232,67 @@ class KapWsClientTests(unittest.TestCase):
         self.assertFalse(thread.is_alive())
         self.assertFalse(client.connected)
 
+    def test_volatile_assistant_delta_fires_on_volatile_without_advancing_cursor(self) -> None:
+        session = self.state.create_session("s-1")
+        self.state.append_event(session, "turn.started", {"turnId": 1})
+        deltas = []
+        client = self._start_client(on_volatile=deltas.append)
+        client.subscribe("s-1")
+        self.assertTrue(
+            wait_until(lambda: self.cursors.get("s-1") == EventCursor(1, session.epoch))
+        )
+
+        self.state.append_volatile_event(
+            session, "assistant.delta", {"turnId": 1, "delta": "你好"}, offset=0
+        )
+        self.state.append_volatile_event(
+            session, "assistant.delta", {"turnId": 1, "delta": "世界"}, offset=3
+        )
+
+        self.assertTrue(wait_until(lambda: len(deltas) == 2))
+        self.assertEqual(deltas[0].session_id, "s-1")
+        self.assertEqual(deltas[0].offset, 0)
+        self.assertEqual(deltas[0].text_delta, "你好")
+        self.assertEqual(deltas[1].offset, 3)
+        # Volatile frames never advance the durable cursor and never reach
+        # the durable on_event path.
+        self.assertEqual(self.cursors.get("s-1"), EventCursor(1, session.epoch))
+        self.assertEqual([e.type for e in self.events], [])
+
+    def test_volatile_delta_without_offset_is_dropped(self) -> None:
+        session = self.state.create_session("s-1")
+        deltas = []
+        client = self._start_client(on_volatile=deltas.append)
+        client.subscribe("s-1")
+        self.assertTrue(wait_until(lambda: client.connected))
+
+        self.state.append_volatile_event(session, "assistant.delta", {"turnId": 1, "delta": "x"})
+        self.state.append_volatile_event(
+            session, "thinking.delta", {"turnId": 1, "delta": "y"}, offset=0
+        )
+
+        # No offset (cannot gap-check) and out-of-scope types are dropped;
+        # thinking.delta still flows to on_event, which ignores it upstream.
+        time.sleep(0.3)
+        self.assertEqual(deltas, [])
+
+    def test_snapshot_parses_in_flight_assistant_text(self) -> None:
+        session = self.state.create_session("s-1")
+        session.busy = True
+        session.in_flight_turn = {
+            "turn_id": 7,
+            "assistant_text": "半截回复",
+            "thinking_text": "",
+            "running_tools": [],
+            "current_prompt_id": "p-1",
+        }
+
+        snapshot = self.rest.get_snapshot("s-1")
+
+        self.assertTrue(snapshot.in_flight)
+        self.assertEqual(snapshot.in_flight_turn_id, 7)
+        self.assertEqual(snapshot.in_flight_assistant_text, "半截回复")
+
 
 if __name__ == "__main__":
     unittest.main()

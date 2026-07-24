@@ -214,6 +214,7 @@ def build_execution_card(
     elapsed_seconds: int = 0,
     queue_length: int = 0,
     tool_lines: Sequence[str] = (),
+    reply_text: str = "",
 ) -> dict:
     """Build the execution card for one started prompt.
 
@@ -229,7 +230,10 @@ def build_execution_card(
 
     ``tool_lines`` are pre-rendered one-line summaries of tool.call.* /
     tool.result events, owned by the application layer; the builder only
-    lays them out.
+    lays them out. ``reply_text`` is the volatile streamed assistant reply
+    (streaming-cards contract); it is rendered with the runtime markdown
+    variant, which tolerates an unclosed fence mid-stream (§3.6), and every
+    patch re-renders it in full (§3.1).
     """
     elapsed_seconds = max(int(elapsed_seconds), 0)
     queue_length = max(int(queue_length), 0)
@@ -266,6 +270,14 @@ def build_execution_card(
     elements: list[dict] = [
         _markdown(sanitize_runtime_markdown_for_feishu_card("\n".join(lines)))
     ]
+
+    streamed_reply = str(reply_text or "").strip()
+    if streamed_reply:
+        # Volatile streamed reply body: sanitize only the full accumulated
+        # text (a delta may split a token); the runtime variant renders an
+        # unclosed fence tolerantly mid-stream (streaming-cards §3.6).
+        elements.append({"tag": "hr"})
+        elements.append(_markdown(sanitize_runtime_markdown_for_feishu_card(streamed_reply)))
 
     rendered_tool_lines = [str(line).strip() for line in tool_lines if str(line).strip()]
     if rendered_tool_lines:

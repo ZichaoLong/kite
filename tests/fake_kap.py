@@ -46,6 +46,9 @@ class FakeSession:
         self.journal: list[dict[str, Any]] = []
         self.active_prompt: str | None = None
         self.queued_prompts: list[str] = []
+        # Optional in-flight turn projection for the snapshot route (wire
+        # inFlightTurnSchema: turn_id / assistant_text / thinking_text / ...).
+        self.in_flight_turn: dict[str, Any] | None = None
         # Cold-session nuance: subscribe with a cursor before any resume-backed
         # REST touch yields an unexplained resync_required.
         self.warm = False
@@ -99,6 +102,32 @@ class FakeKapState:
                 "payload": payload,
             }
             session.journal.append(frame)
+            subscribers = list(self._subscribers.values())
+        for connection, session_ids in subscribers:
+            if session.id in session_ids:
+                try:
+                    connection.send(json.dumps(frame))
+                except Exception:  # noqa: BLE001 - a dead subscriber is dropped lazily
+                    pass
+        return frame
+
+    def append_volatile_event(
+        self, session: FakeSession, event_type: str, payload: Any, *, offset: int | None = None
+    ) -> dict[str, Any]:
+        """Broadcast a volatile frame (never journaled, seq stays the last
+        durable watermark — mirroring the upstream broadcaster)."""
+        with self.lock:
+            frame = {
+                "type": event_type,
+                "seq": session.seq,
+                "epoch": session.epoch,
+                "session_id": session.id,
+                "volatile": True,
+                "timestamp": "2026-01-01T00:00:00Z",
+                "payload": payload,
+            }
+            if offset is not None:
+                frame["offset"] = offset
             subscribers = list(self._subscribers.values())
         for connection, session_ids in subscribers:
             if session.id in session_ids:
@@ -263,7 +292,7 @@ class FakeKapRestHandler(BaseHTTPRequestHandler):
                 "epoch": session.epoch,
                 "session": _session_wire(session),
                 "messages": {"items": [], "has_more": False},
-                "in_flight_turn": None,
+                "in_flight_turn": session.in_flight_turn,
                 "pending_approvals": [],
                 "pending_questions": [],
             }))

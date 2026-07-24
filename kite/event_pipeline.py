@@ -35,11 +35,21 @@ Implements the outbound half of the MVP contract
   and refreshes work state / queue / in-flight cards wholesale; a failed
   rebuild freezes the session's execution cards as "状态未知" with a
   `kitectl session status` hint and never guesses (§4.2-4.3).
+- volatile streaming (docs/contracts/streaming-cards.md): assistant.delta
+  frames append into a per-prompt in-memory transcript and schedule
+  coalesced patches of the execution card's streamed body through the
+  CardPatchDispatcher (Feishu RTT never blocks the loop; renders hop back
+  onto it). An offset gap jumps straight to the snapshot-rebuild path
+  (never guess the missing text), turn.ended reconciles the authoritative
+  text over the deltas (never shrink), and an over-budget or undeliverable
+  terminal card falls back to plain text once. Volatile text is
+  enhancement, never evidence: with no deltas the durable path alone still
+  produces correct cards.
 
 Threading: every mutation runs on the RuntimeLoop. WS callbacks
-(``handle_event`` / ``handle_resync_required``), timer callbacks, and kited's
-startup recovery all hop onto the loop; blocking REST inside handlers follows
-the same pattern as the inbound path (app_handler).
+(``handle_event`` / ``handle_resync_required`` / ``handle_volatile``), timer
+callbacks, and kited's startup recovery all hop onto the loop; blocking REST
+inside handlers follows the same pattern as the inbound path (app_handler).
 
 Only normalized adapter types are consumed here; kap wire schema knowledge
 stays in kite/adapters/kap_server.py. The few REST paths the adapter does not
@@ -62,6 +72,7 @@ from kite import cards
 from kite.adapters.kap_server import (
     ApprovalRequested,
     ApprovalResolved,
+    AssistantDelta,
     DurableEvent,
     KapError,
     KapErrorFrame,
@@ -84,11 +95,14 @@ from kite.adapters.kap_server import (
 from kite.app_handler import AppHandler, KapSessionOps
 from kite.cards import ExecutionCardAnchor
 from kite.feishu_transport import CardAction, CardActionResponse, InboundMessage
+from kite.message_patch_result import MessagePatchResult
+from kite.patch_dispatcher import CardPatchDispatcher
 from kite.prompt_ownership import CERTAINTY_CERTAIN, PromptOwnership
 from kite.runtime_loop import RuntimeLoop
 from kite.stores.binding_store import BindingStore, StoredBinding
 from kite.stores.event_cursor_store import EventCursorStore
 from kite.stores.terminal_result_store import TerminalResultRecord, TerminalResultStore
+from kite.streaming_transcript import DEFAULT_STREAM_REPLY_CHAR_LIMIT, StreamingTranscript
 
 logger = logging.getLogger("kite.outbound")
 
@@ -117,6 +131,12 @@ _APPROVAL_STATUS_PROCESSING = "processing"
 # empty terminal text is retried a few times before the stub-text fallback.
 _DEFAULT_TERMINAL_EMPTY_RETRY_COUNT = 3
 _DEFAULT_TERMINAL_EMPTY_RETRY_DELAY_SECONDS = 1.0
+
+# Streaming defaults (streaming-cards contract §3.3/§3.7): per-card minimum
+# patch interval 700 ms; the terminal card enforces the utf-8 byte budget
+# before falling back to plain text (FOCUS terminal budget discipline).
+_DEFAULT_STREAM_PATCH_INTERVAL_SECONDS = 0.7
+_DEFAULT_TERMINAL_CARD_BYTE_BUDGET = 26000
 
 
 def _quote(value: str) -> str:
@@ -257,6 +277,11 @@ class _ExecutionCardState:
     queue_length: int = 0
     tool_lines: list[str] = field(default_factory=list)
     open_tools: dict[str, int] = field(default_factory=dict)  # tool_call_id -> line index
+    # Streaming throttle state (§3.3): last dispatch + the single trailing
+    # timer. The state object's identity doubles as the generation guard for
+    # stale timer flushes and stale queued renders (§3.8).
+    last_stream_patch_at: float = 0.0
+    stream_timer: Optional[TimerHandle] = None
 
 
 @dataclass(slots=True)
@@ -332,6 +357,10 @@ class EventPipeline:
         on_snapshot_rebuilt: Optional[Callable[[str, SessionSnapshot], None]] = None,
         terminal_empty_retry_count: int = _DEFAULT_TERMINAL_EMPTY_RETRY_COUNT,
         terminal_empty_retry_delay_seconds: float = _DEFAULT_TERMINAL_EMPTY_RETRY_DELAY_SECONDS,
+        stream_patch_interval_seconds: float = _DEFAULT_STREAM_PATCH_INTERVAL_SECONDS,
+        stream_reply_char_limit: int = DEFAULT_STREAM_REPLY_CHAR_LIMIT,
+        terminal_card_byte_budget: int = _DEFAULT_TERMINAL_CARD_BYTE_BUDGET,
+        patch_dispatcher: Optional[CardPatchDispatcher] = None,
     ) -> None:
         self._transport = transport
         self._rest = rest
@@ -349,6 +378,21 @@ class EventPipeline:
         self._on_snapshot_rebuilt = on_snapshot_rebuilt
         self._terminal_empty_retry_count = max(int(terminal_empty_retry_count), 0)
         self._terminal_retry_delay = max(float(terminal_empty_retry_delay_seconds), 0.0)
+        self._stream_patch_interval = max(float(stream_patch_interval_seconds), 0.0)
+        self._stream_reply_char_limit = max(int(stream_reply_char_limit), 0)
+        self._terminal_byte_budget = max(int(terminal_card_byte_budget), 0)
+        # The coalescing dispatcher moves Feishu patch RTT off the loop
+        # (streaming-cards §3.2); renders hop back onto the loop so they
+        # always read current state.
+        self._dispatcher = (
+            patch_dispatcher
+            if patch_dispatcher is not None
+            else CardPatchDispatcher(
+                self._patch_message_result,
+                render_invoker=self._loop.call,
+                timer_factory=timer_factory,
+            )
+        )
 
         self._cards: dict[str, _ExecutionCardState] = {}  # chat_id -> current card
         self._sessions: dict[str, _SessionState] = {}
@@ -359,6 +403,8 @@ class EventPipeline:
         # even when two finalize paths (live event / reconcile retry) race.
         self._terminal_delivered: set[tuple[str, str]] = set()
         self._terminal_retry_timers: dict[tuple[str, str], TimerHandle] = {}
+        # Volatile streaming transcripts, keyed by (session_id, prompt_id).
+        self._transcripts: dict[tuple[str, str], StreamingTranscript] = {}
         self._shutdown = False
 
     # ------------------------------------------------------------------
@@ -381,6 +427,11 @@ class EventPipeline:
         terminal result instead of leaving the submit ack hanging
         (fail-closed, mvp-scope §4.5 spirit)."""
         self._loop.submit(self._error_frame_impl, error)
+
+    def handle_volatile(self, delta: AssistantDelta) -> None:
+        """WS on_volatile callback: presentation-only assistant deltas; the
+        transcript mutation is serialized on the loop like everything else."""
+        self._loop.submit(self._assistant_delta, delta)
 
     def startup_recovery(self, session_ids: Sequence[str]) -> None:
         """kited restart recovery (§4.6): rebuild every bound session from a
@@ -506,6 +557,8 @@ class EventPipeline:
                 chat_id,
                 stale.anchor.prompt_id,
             )
+            self._cancel_stream_state(stale)
+            self._transcripts.pop((stale.anchor.session_id, stale.anchor.prompt_id), None)
             self._freeze_card_done(stale)
         card = cards.build_execution_card(
             session_title=session_title,
@@ -756,12 +809,21 @@ class EventPipeline:
         if not states and not standalone_when_orphaned:
             # Queued prompts never had a card; their abort is queue-shape only.
             self._ownership.forget(prompt_id)
+            self._transcripts.pop(key, None)
             return
         self._terminal_delivered.add(key)
         retry = self._terminal_retry_timers.pop(key, None)
         if retry is not None:
             retry.cancel()
+        if outcome == cards.TERMINAL_COMPLETED and text:
+            # §3.5: the completed turn's authoritative text reconciles over
+            # the delta-accumulated text (monotonic, never shrink) before the
+            # frozen card renders the final body.
+            transcript = self._transcripts.get(key)
+            if transcript is not None:
+                transcript.reconcile(text)
         for state in states:
+            self._cancel_stream_state(state)
             self._send_terminal_and_freeze(state, outcome, text)
             del self._cards[state.anchor.chat_id]
         if not states:
@@ -769,13 +831,14 @@ class EventPipeline:
             # (rebound / snapshot rebuild froze it): deliver the terminal
             # standalone so the result is never lost silently.
             for chat_id, _binding in self._attached_chats(session_id):
-                self._send_card(
+                self._deliver_terminal_card(
                     chat_id,
-                    cards.build_terminal_card(
-                        outcome=outcome,  # type: ignore[arg-type]
-                        text=text,
-                    ),
+                    outcome,
+                    text,
+                    result_id=prompt_id,
+                    checksum=cards.terminal_result_checksum(text),
                 )
+        self._transcripts.pop(key, None)
         logger.info(
             "prompt ended session_id=%s prompt_id=%s outcome=%s",
             session_id,
@@ -790,13 +853,9 @@ class EventPipeline:
         anchor = state.anchor
         result_id = anchor.prompt_id
         checksum = cards.terminal_result_checksum(text)
-        terminal_card = cards.build_terminal_card(
-            outcome=outcome,  # type: ignore[arg-type]
-            text=text,
-            terminal_result_id=result_id,
-            checksum=checksum,
+        terminal_message_id = self._deliver_terminal_card(
+            anchor.chat_id, outcome, text, result_id=result_id, checksum=checksum
         )
-        terminal_message_id = self._send_card(anchor.chat_id, terminal_card)
         self._freeze_card_done(state)
         if terminal_message_id and text:
             self._terminal_store.upsert(
@@ -811,6 +870,51 @@ class EventPipeline:
                 )
             )
 
+    def _deliver_terminal_card(
+        self,
+        chat_id: str,
+        outcome: str,
+        text: str,
+        *,
+        result_id: str,
+        checksum: str,
+    ) -> str:
+        """Deliver the terminal card; returns its message id ("" on failure).
+
+        Terminal budget discipline (streaming-cards §3.7, ported from FOCUS):
+        the serialized card must fit the utf-8 byte budget, otherwise the
+        content goes out as plain text. A failed send gets a one-time
+        plain-text content rescue (§3.4) — the result is never lost silently.
+        """
+        terminal_card = cards.build_terminal_card(
+            outcome=outcome,  # type: ignore[arg-type]
+            text=text,
+            terminal_result_id=result_id,
+            checksum=checksum,
+        )
+        content = json.dumps(terminal_card)
+        message_id = ""
+        if len(content.encode("utf-8")) <= self._terminal_byte_budget:
+            message_id = self._send_card(chat_id, terminal_card)
+        else:
+            logger.warning(
+                "terminal card over utf-8 budget (%d > %d) chat=%s; plain-text fallback",
+                len(content.encode("utf-8")),
+                self._terminal_byte_budget,
+                chat_id,
+            )
+        if not message_id and text:
+            message_id = self._send_text_get_id(chat_id, text)
+        return message_id
+
+    def _send_text_get_id(self, chat_id: str, text: str) -> str:
+        """Plain-text send returning its message id ("" on failure)."""
+        try:
+            return str(self._transport.reply_get_id(chat_id, text) or "").strip()
+        except Exception:
+            logger.exception("terminal plain-text rescue failed chat=%s", chat_id)
+            return ""
+
     def _freeze_card_done(self, state: _ExecutionCardState) -> None:
         card = cards.build_execution_card(
             session_title=state.session_title,
@@ -820,6 +924,7 @@ class EventPipeline:
             elapsed_seconds=self._elapsed(state),
             queue_length=0,
             tool_lines=state.tool_lines,
+            reply_text=self._stream_projection(state),
         )
         self._patch_card(state.anchor.card_message_id, card)
 
@@ -859,6 +964,170 @@ class EventPipeline:
         session.pending_interaction = event.pending_interaction
         if event.last_turn_reason:
             session.last_turn_reason = event.last_turn_reason
+
+    # ------------------------------------------------------------------
+    # assistant.delta -> streamed execution-card body (streaming-cards.md)
+    # ------------------------------------------------------------------
+
+    def _assistant_delta(self, delta: AssistantDelta) -> None:
+        if self._shutdown:
+            return
+        session = self._sessions.get(delta.session_id)
+        prompt_id = session.active_prompt_id if session else None
+        if not prompt_id:
+            # Target matching (§3.9): an unattributable delta mutates nothing.
+            return
+        states = self._cards_for_prompt(delta.session_id, prompt_id)
+        if not states:
+            return
+        key = (delta.session_id, prompt_id)
+        transcript = self._transcripts.get(key)
+        if transcript is None:
+            transcript = StreamingTranscript()
+            self._transcripts[key] = transcript
+        was_gapped = transcript.gapped
+        if transcript.append_delta(delta.offset, delta.text_delta):
+            # §4.1: an offset gap jumps straight to the snapshot-rebuild path
+            # (never guess the missing text), exactly once per gap episode —
+            # the gapped latch holds until the rebuild re-baselines the stream.
+            if not was_gapped:
+                logger.warning(
+                    "assistant delta offset gap session=%s prompt=%s; rebuilding from snapshot",
+                    delta.session_id,
+                    prompt_id,
+                )
+                self._rebuild_session(delta.session_id, "delta-gap")
+            return
+        for state in states:
+            self._schedule_stream_patch(state)
+
+    def _schedule_stream_patch(self, state: _ExecutionCardState) -> None:
+        """Throttle (§3.3): patch immediately when idle; inside the min
+        interval arm a single trailing timer, which renders the latest state
+        (the final state is never dropped)."""
+        if self._shutdown:
+            return
+        now = self._monotonic()
+        since_last = now - state.last_stream_patch_at
+        if since_last >= self._stream_patch_interval:
+            if state.stream_timer is not None:
+                state.stream_timer.cancel()
+                state.stream_timer = None
+            state.last_stream_patch_at = now
+            self._submit_stream_patch(state)
+            return
+        if state.stream_timer is not None:
+            return
+
+        def _fire() -> None:
+            try:
+                self._loop.submit(self._flush_stream_patch, state)
+            except Exception:  # loop closed during shutdown
+                logger.debug("stream trailing timer fired after loop close")
+
+        try:
+            state.stream_timer = self._timer_factory(
+                self._stream_patch_interval - since_last, _fire
+            )
+        except Exception:
+            logger.exception(
+                "stream trailing timer start failed chat=%s", state.anchor.chat_id
+            )
+
+    def _flush_stream_patch(self, state: _ExecutionCardState) -> None:
+        # Generation guard (§3.8): a stale timer firing after its prompt
+        # ended (or its card was replaced) is a no-op.
+        if self._cards.get(state.anchor.chat_id) is not state:
+            return
+        state.stream_timer = None
+        state.last_stream_patch_at = self._monotonic()
+        self._submit_stream_patch(state)
+
+    def _submit_stream_patch(self, state: _ExecutionCardState) -> None:
+        message_id = state.anchor.card_message_id
+        if not message_id:
+            return
+        self._dispatcher.submit(message_id, lambda: self._render_stream_card(state))
+
+    def _render_stream_card(self, state: _ExecutionCardState) -> Optional[str]:
+        """Full-snapshot render of the running card (§3.1), invoked by the
+        dispatcher on the RuntimeLoop at patch time.
+
+        Rendering at patch time means a coalesced render still produces the
+        latest content; a stale anchor (prompt ended, card replaced,
+        shutdown) returns None and the patch is skipped (§3.8).
+        """
+        if self._shutdown:
+            return None
+        if self._cards.get(state.anchor.chat_id) is not state:
+            return None
+        card = cards.build_execution_card(
+            session_title=state.session_title,
+            session_id=state.anchor.session_id,
+            prompt_text=state.prompt_text,
+            state=cards.EXECUTION_STATE_RUNNING,
+            elapsed_seconds=self._elapsed(state),
+            queue_length=state.queue_length,
+            tool_lines=state.tool_lines,
+            reply_text=self._stream_projection(state),
+        )
+        return json.dumps(card)
+
+    def _stream_projection(self, state: _ExecutionCardState) -> str:
+        transcript = self._transcripts.get(
+            (state.anchor.session_id, state.anchor.prompt_id)
+        )
+        if transcript is None:
+            return ""
+        return transcript.project_for_card(self._stream_reply_char_limit)
+
+    def _cancel_stream_state(self, state: _ExecutionCardState) -> None:
+        """Timer hygiene (§3.8): terminal/replacement transitions cancel the
+        card's trailing timer and its queued dispatcher work."""
+        if state.stream_timer is not None:
+            state.stream_timer.cancel()
+            state.stream_timer = None
+        self._dispatcher.cancel(state.anchor.card_message_id)
+
+    def _patch_message_result(self, message_id: str, content: str) -> MessagePatchResult:
+        """Structured patch IO for the dispatcher (transport edge, off-loop)."""
+        patch_message_result = getattr(self._transport, "patch_message_result", None)
+        if callable(patch_message_result):
+            try:
+                result = patch_message_result(message_id, content)
+            except Exception:
+                logger.exception("stream card patch raised message=%s", message_id)
+                return MessagePatchResult.failure()
+            if isinstance(result, MessagePatchResult):
+                return result
+            return MessagePatchResult.success() if result else MessagePatchResult.failure()
+        try:
+            ok = bool(self._transport.patch_message(message_id, content))
+        except Exception:
+            logger.exception("stream card patch raised message=%s", message_id)
+            return MessagePatchResult.failure()
+        return MessagePatchResult.success() if ok else MessagePatchResult.failure()
+
+    def _reseed_transcripts(
+        self, session_id: str, snapshot: SessionSnapshot, current_prompt: Optional[str]
+    ) -> None:
+        """Heal the volatile transcript from the snapshot watermark (§1.2).
+
+        The snapshot's in-flight assistant text is step-relative — the same
+        reference frame as the delta offsets — so it re-seeds both the
+        accumulated text and the expected offset; transcripts of prompts no
+        longer in flight are dropped.
+        """
+        in_flight_prompt = current_prompt if snapshot.in_flight and current_prompt else None
+        if in_flight_prompt:
+            transcript = self._transcripts.setdefault(
+                (session_id, in_flight_prompt), StreamingTranscript()
+            )
+            transcript.rebuild_from_snapshot(snapshot.in_flight_assistant_text)
+        for key in [
+            key for key in self._transcripts if key[0] == session_id and key[1] != in_flight_prompt
+        ]:
+            self._transcripts.pop(key, None)
 
     # ------------------------------------------------------------------
     # approval.* -> approval cards, read-only notices, timeouts
@@ -1486,6 +1755,9 @@ class EventPipeline:
         current_prompt = snapshot.current_prompt_id or queue.active_prompt_id
         if snapshot.in_flight and snapshot.in_flight_turn_id is not None and current_prompt:
             session.turn_prompts[snapshot.in_flight_turn_id] = current_prompt
+        # Heal the volatile transcript from the snapshot watermark BEFORE the
+        # wholesale card refresh below renders it (streaming-cards §1.2).
+        self._reseed_transcripts(session_id, snapshot, current_prompt)
 
         for chat_id, _binding in self._attached_chats(session_id):
             state = self._cards.get(chat_id)
@@ -1503,6 +1775,7 @@ class EventPipeline:
                         "anchored prompt %s no longer in flight after rebuild; freezing",
                         state.anchor.prompt_id,
                     )
+                    self._cancel_stream_state(state)
                     self._freeze_card_done(state)
                     self._create_execution_card(
                         chat_id,
@@ -1526,6 +1799,7 @@ class EventPipeline:
                     "session idle after rebuild; freezing anchored card prompt=%s",
                     state.anchor.prompt_id,
                 )
+                self._cancel_stream_state(state)
                 self._freeze_card_done(state)
                 del self._cards[chat_id]
 
@@ -1606,6 +1880,7 @@ class EventPipeline:
         for chat_id, state in list(self._cards.items()):
             if state.anchor.session_id != session_id:
                 continue
+            self._cancel_stream_state(state)
             card = cards.build_execution_card(
                 session_title=state.session_title,
                 session_id=session_id,
@@ -1614,6 +1889,7 @@ class EventPipeline:
                 elapsed_seconds=self._elapsed(state),
                 queue_length=0,
                 tool_lines=state.tool_lines,
+                reply_text=self._stream_projection(state),
             )
             self._patch_card(state.anchor.card_message_id, card)
             del self._cards[chat_id]
@@ -1661,6 +1937,7 @@ class EventPipeline:
             elapsed_seconds=self._elapsed(state),
             queue_length=state.queue_length,
             tool_lines=state.tool_lines,
+            reply_text=self._stream_projection(state),
         )
         self._patch_card(state.anchor.card_message_id, card)
 
@@ -1726,6 +2003,14 @@ class EventPipeline:
         swept = self.sweep_all_interactions(reason="KITE 服务已停止")
         if swept:
             logger.info("shutdown sweep closed %d pending interaction(s)", swept)
+        # Timer hygiene (streaming-cards §3.8): trailing stream timers and the
+        # dispatcher's retry timers are cancelled; queued renders guard on the
+        # shutdown flag and become no-ops.
+        for state in self._cards.values():
+            if state.stream_timer is not None:
+                state.stream_timer.cancel()
+                state.stream_timer = None
+        self._dispatcher.shutdown()
         for timer in self._terminal_retry_timers.values():
             timer.cancel()
         self._terminal_retry_timers.clear()

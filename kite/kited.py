@@ -315,6 +315,9 @@ def run(
                 on_error_frame=(
                     outbound.pipeline.handle_error_frame if outbound else None
                 ),
+                on_volatile=(
+                    outbound.pipeline.handle_volatile if outbound else None
+                ),
             )
             ws.start()
             if outbound is not None:

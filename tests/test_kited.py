@@ -183,6 +183,9 @@ class _FakePipeline:
     def handle_error_frame(self, frame) -> None:
         pass
 
+    def handle_volatile(self, delta) -> None:
+        pass
+
 
 class _FakeSwap:
     """Duck-typed stand-in for SwappableKapRest / WsSubscriptionHook."""
