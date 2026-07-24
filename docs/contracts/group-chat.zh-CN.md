@@ -86,6 +86,6 @@
 
 1. **发送者显示名**：面向群的通知（审批/question 路由提示）经通讯录 API
    (`contact:user.base:readonly`）解析发起者显示名，走带 TTL 的
-   read-through 缓存（fail-soft 回退为截短的 open_id；不占状态轴——缓存
-   可弃、按需重建）。层：应用层；恢复：无需重建；测试：缓存命中/TTL/
-   负缓存/回退，以及有/无可解析名两种通知文案。
+   read-through 缓存。回退链与 FOCUS 同构：`name` 或 `nickname` → 回退
+   `open_id[:8]`（机器人发送者为 `机器人:{id[:8]}`);fail-soft，不占状态轴。
+   测试：缓存命中/TTL/负缓存/回退链，以及有/无可解析名两种通知文案。

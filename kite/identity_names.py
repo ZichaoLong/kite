@@ -14,12 +14,14 @@ from typing import Callable, Optional
 
 
 class IdentityNames:
-    """open_id -> display name cache.
+    """open_id -> display name cache (FOCUS's sender-name chain, isomorphic).
 
-    ``fetcher`` does one upstream lookup (``FeishuTransport.fetch_user_name``)
-    and returns None on failure. Positive results cache for ``ttl_seconds``,
-    failures negative-cache for ``negative_ttl_seconds`` (transient contact
-    API errors must not stampede). ``name_of`` never raises.
+    ``fetcher`` does one upstream lookup (``FeishuTransport.fetch_user_name``,
+    which already applies the ``name or nickname`` field order) and returns
+    None on failure. Positive results cache for ``ttl_seconds``, failures
+    negative-cache for ``negative_ttl_seconds`` (transient contact API errors
+    must not stampede). ``name_of`` never raises; the fallback chain mirrors
+    FOCUS: human -> ``open_id[:8]``, bot sender -> ``机器人:{id[:8]}``.
     """
 
     def __init__(
@@ -37,15 +39,15 @@ class IdentityNames:
         # open_id -> (expires_at, name or None when negative-cached)
         self._cache: dict[str, tuple[float, Optional[str]]] = {}
 
-    def name_of(self, open_id: str) -> str:
-        """The display name, or a short fallback when unresolvable."""
+    def name_of(self, open_id: str, *, sender_type: str = "user") -> str:
+        """The display name, or the chain-appropriate fallback."""
         normalized = str(open_id or "").strip()
         if not normalized:
-            return "未知用户"
+            return "unknown"
         now = self._clock()
         cached = self._cache.get(normalized)
         if cached is not None and cached[0] > now:
-            return cached[1] if cached[1] is not None else self._fallback(normalized)
+            return cached[1] if cached[1] is not None else self._fallback(normalized, sender_type)
         try:
             name = self._fetcher(normalized)
         except Exception:  # noqa: BLE001 - name lookup must never break a flow
@@ -55,8 +57,10 @@ class IdentityNames:
             self._cache[normalized] = (now + self._ttl, resolved)
             return resolved
         self._cache[normalized] = (now + self._negative_ttl, None)
-        return self._fallback(normalized)
+        return self._fallback(normalized, sender_type)
 
     @staticmethod
-    def _fallback(open_id: str) -> str:
-        return open_id[:13] + "…" if len(open_id) > 13 else open_id
+    def _fallback(open_id: str, sender_type: str) -> str:
+        if sender_type == "app":
+            return f"机器人:{open_id[:8]}"
+        return open_id[:8]

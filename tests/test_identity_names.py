@@ -37,10 +37,13 @@ class IdentityNamesTests(unittest.TestCase):
     def test_failure_falls_back_and_negative_caches(self) -> None:
         names = self._resolver(fail=True)
         first = names.name_of("ou_abcdefgh12345")
-        self.assertTrue(first.startswith("ou_abcdefgh"))
-        self.assertIn("…", first)
+        self.assertEqual(first, "ou_abcde")  # open_id[:8], FOCUS's chain
         names.name_of("ou_abcdefgh12345")
         self.assertEqual(self.calls, ["ou_abcdefgh12345"])  # negative-cached
+
+    def test_bot_sender_fallback_prefix(self) -> None:
+        names = self._resolver(fail=True)
+        self.assertEqual(names.name_of("ou_abcdefgh12345", sender_type="app"), "机器人:ou_abcde")
 
     def test_none_result_falls_back(self) -> None:
         names = self._resolver(name=None)
@@ -48,7 +51,7 @@ class IdentityNamesTests(unittest.TestCase):
 
     def test_empty_open_id(self) -> None:
         names = self._resolver()
-        self.assertEqual(names.name_of(""), "未知用户")
+        self.assertEqual(names.name_of(""), "unknown")
         self.assertEqual(self.calls, [])
 
 

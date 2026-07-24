@@ -98,8 +98,8 @@ via kitectl.
 
 1. **Sender display names**: group-facing notices (approval/question routing
    hints) resolve the initiator's display name via the contact API
-   (`contact:user.base:readonly`) through a TTL'd read-through cache
-   (fail-soft fallback to a shortened open_id; no state axis — the cache is
-   disposable and rebuilt on demand). Layer: application; recovery: nothing
-   to rebuild; tests: cache hit/TTL/negative-cache/fallback, notice wording
-   with and without a resolvable name.
+   (`contact:user.base:readonly`) through a TTL'd read-through cache. The
+   chain is FOCUS-isomorphic: `name` or `nickname` → fallback `open_id[:8]`
+   (bot senders `机器人:{id[:8]}`); fail-soft, no state axis. Tests: cache
+   hit/TTL/negative-cache/fallback chain, notice wording with and without a
+   resolvable name.

@@ -370,7 +370,9 @@ class FeishuTransport:
                 logger.warning("user info fetch failed open_id=%s: code=%s", normalized, resp.code)
                 return None
             data = json.loads(resp.raw.content)
-            name = ((data.get("user") or {}).get("name"))
+            user = data.get("user") or {}
+            # FOCUS's field order: canonical name first, nickname as fallback.
+            name = user.get("name") or user.get("nickname")
             return name.strip() if isinstance(name, str) and name.strip() else None
         except Exception as exc:  # noqa: BLE001 - best-effort lookup
             logger.warning("user info fetch raised open_id=%s: %s", normalized, exc)

@@ -710,6 +710,16 @@ class BotIdentityTests(unittest.TestCase):
 
         self.assertEqual(transport.fetch_user_name("ou_x"), "张三")
 
+    def test_fetch_user_name_falls_back_to_nickname(self) -> None:
+        transport = _make_transport()
+        response = Mock()
+        response.success.return_value = True
+        response.raw.content = json.dumps({"user": {"name": "", "nickname": "小三"}})
+        transport.client = Mock()
+        transport.client.request.return_value = response
+
+        self.assertEqual(transport.fetch_user_name("ou_x"), "小三")
+
     def test_fetch_user_name_failure_returns_none(self) -> None:
         transport = _make_transport()
         response = Mock()
