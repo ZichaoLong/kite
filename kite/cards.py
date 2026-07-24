@@ -308,19 +308,28 @@ def build_execution_card(
         )
 
     if state == EXECUTION_STATE_RUNNING and prompt_id:
+        # Card schema V2 has no `action` container (the old-format tag Feishu
+        # rejects with 230099); buttons go in a column_set (verified live).
         elements.append(
             {
-                "tag": "action",
-                "actions": [
+                "tag": "column_set",
+                "columns": [
                     {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": "取消执行"},
-                        "type": "danger",
-                        "value": {
-                            "action": ACTION_PROMPT_ABORT,
-                            "prompt_id": prompt_id,
-                            "session_id": session_id,
-                        },
+                        "tag": "column",
+                        "width": "auto",
+                        "vertical_align": "center",
+                        "elements": [
+                            {
+                                "tag": "button",
+                                "text": {"tag": "plain_text", "content": "取消执行"},
+                                "type": "danger",
+                                "value": {
+                                    "action": ACTION_PROMPT_ABORT,
+                                    "prompt_id": prompt_id,
+                                    "session_id": session_id,
+                                },
+                            }
+                        ],
                     }
                 ],
             }
