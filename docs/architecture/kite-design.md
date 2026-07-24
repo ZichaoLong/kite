@@ -220,7 +220,9 @@ FOCUS's wrapper design; the command names `kite` (local entrypoint) and `kcode`
   hinder KITE's own evolution; keep the freedom to start over at any time.
 - At install/startup, detect the upstream version; when it differs from the
   "verified version", **warn but do not block**. Current verified version:
-  **kimi 0.28.1** (spike passed 2026-07-21;
+  **kimi 0.29.0** (0.28.1 spike passed 2026-07-21; 0.29.0 snapshot-diffed
+  2026-07-24 — additive routes `GET /fs:content`, `GET /oauth/usage`;
+  contract test re-passed;
   `docs/verification/spike-results.md`).
 - CI guardrail: snapshot-diff `/openapi.json` and the WS operation catalog
   pulled from the target kap-server, and run adapter contract tests (loopback

@@ -68,7 +68,7 @@ DEFAULT_KAP_HOST = "127.0.0.1"
 
 # The kimi-code version KITE's adapter was last verified against
 # (docs/architecture/kite-design.md §10: follow, don't pin — warn, don't block).
-VERIFIED_KIMI_VERSION = "0.28.1"
+VERIFIED_KIMI_VERSION = "0.29.0"
 
 # Env vars passed through to the kap-server child process. Everything else is
 # dropped so the child environment is explicit and reproducible.

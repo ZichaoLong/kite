@@ -185,7 +185,9 @@ gate。登记在 `docs/decisions/concurrency-model.md`，等产品证明需要�
   不指望长期停留在一个旧版本上——那反而不利于 KITE 的后续演进；保留
   随时重来的自由度。
 - 安装/启动时检测上游版本，与"已验证版本"不符时**警告但不阻止运行**。
-  当前已验证版本：**kimi 0.28.1**(2026-07-21 spike 通过；
+  当前已验证版本：**kimi 0.29.0**(0.28.1 spike 通过于 2026-07-21;
+  0.29.0 于 2026-07-24 快照 diff——新增路由 `GET /fs:content`、
+  `GET /oauth/usage`，纯增量；合同测试复过；
   `docs/verification/spike-results.md`)。
 - CI 护栏：对目标 kap-server 拉取 `/openapi.json` 与 WS 操作目录做快照
   diff，并跑适配层合同测试（loopback 真实 kap-server)。快照 diff 是
