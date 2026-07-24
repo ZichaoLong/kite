@@ -653,6 +653,143 @@ class PromptSendTests(KitectlTestCase):
         self.assertIn("kited error unauthorized", err)
 
 
+class ImageSendTests(KitectlTestCase):
+    """`image send` is a client of kited's loopback control plane (§3).
+
+    Same discipline as PromptSendTests: the daemon side is faked with a real
+    ControlPlaneServer over a scripted dispatch.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        (self.config_dir / "control.token").write_text(
+            "test-control-token\n", encoding="utf-8"
+        )
+        self.received: list[tuple[str, dict]] = []
+        self.dispatch_error: Exception | None = None
+        self.dispatch_response: dict = {
+            "session_id": "s-abc",
+            "image_key": "img_v3_fake",
+            "delivered": [
+                {"chat_id": "chat-1", "message_id": "om_1"},
+                {"chat_id": "chat-2", "message_id": "om_2"},
+            ],
+            "failed": [],
+        }
+        self.control_server = ControlPlaneServer(
+            data_dir=self.data_dir,
+            dispatch=self._dispatch,
+            auth_token=lambda: "test-control-token",
+        )
+        self.control_server.start()
+        self.addCleanup(self.control_server.stop)
+        self.image_path = self.root / "img.png"
+        self.image_path.write_bytes(b"\x89PNG-fake")
+
+    def _dispatch(self, method: str, params: dict) -> dict:
+        self.received.append((method, params))
+        if self.dispatch_error is not None:
+            raise self.dispatch_error
+        return self.dispatch_response
+
+    def test_send_happy_path_reports_delivery(self) -> None:
+        code, out, _ = self._run_cli(
+            "image", "send", "--chat", "chat-1", "--path", str(self.image_path)
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.received), 1)
+        method, params = self.received[0]
+        self.assertEqual(method, "image/send")
+        self.assertEqual(params["chat_id"], "chat-1")
+        self.assertEqual(params["path"], str(self.image_path))
+        self.assertIn("session_id: s-abc", out)
+        self.assertIn("image_key: img_v3_fake", out)
+        self.assertIn("delivered: chat-1 (om_1), chat-2 (om_2)", out)
+        self.assertNotIn("failed:", out)
+
+    def test_send_absolutizes_relative_paths(self) -> None:
+        code, _, _ = self._run_cli("image", "send", "--chat", "chat-1", "--path", "img.png")
+
+        self.assertEqual(code, 0)
+        params = self.received[0][1]
+        self.assertTrue(os.path.isabs(params["path"]))
+        self.assertTrue(params["path"].endswith("img.png"))
+
+    def test_send_partial_failure_reports_and_exits_1(self) -> None:
+        self.dispatch_response = {
+            "session_id": "s-abc",
+            "image_key": "img_v3_fake",
+            "delivered": [{"chat_id": "chat-1", "message_id": "om_1"}],
+            "failed": [{"chat_id": "chat-2", "error": "send_failed"}],
+        }
+
+        code, out, _ = self._run_cli(
+            "image", "send", "--chat", "chat-1", "--path", str(self.image_path)
+        )
+
+        self.assertEqual(code, 1)
+        self.assertIn("delivered: chat-1 (om_1)", out)
+        self.assertIn("failed: chat-2 (send_failed)", out)
+
+    def test_send_business_error_is_exit_1(self) -> None:
+        self.dispatch_error = ControlError(
+            "image path does not exist or is not a file: /nope.png",
+            code="invalid_path",
+        )
+
+        code, _, err = self._run_cli(
+            "image", "send", "--chat", "chat-1", "--path", str(self.image_path)
+        )
+
+        self.assertEqual(code, 1)
+        self.assertIn("kited error invalid_path", err)
+
+    def test_send_daemon_down_is_fail_closed(self) -> None:
+        self.control_server.stop()  # also unpublishes the metadata file
+
+        code, _, err = self._run_cli(
+            "image", "send", "--chat", "chat-1", "--path", str(self.image_path)
+        )
+
+        self.assertEqual(code, 2)
+        self.assertIn("kited is not running", err)
+        self.assertEqual(self.received, [])
+
+    def test_send_outcome_unknown_is_exit_3(self) -> None:
+        dropper = DropConnectionServer()
+        self.addCleanup(dropper.close)
+        self.control_server.stop()
+        (self.data_dir / "control_plane.json").write_text(
+            json.dumps({"port": dropper.port, "pid": os.getpid(), "started_at": time.time()}),
+            encoding="utf-8",
+        )
+
+        code, _, err = self._run_cli(
+            "image", "send", "--chat", "chat-1", "--path", str(self.image_path)
+        )
+
+        self.assertEqual(code, 3)
+        self.assertIn("may have been delivered", err)
+
+    def test_send_with_wrong_token_surfaces_unauthorized(self) -> None:
+        (self.config_dir / "control.token").write_text("wrong-token\n", encoding="utf-8")
+
+        code, _, err = self._run_cli(
+            "image", "send", "--chat", "chat-1", "--path", str(self.image_path)
+        )
+
+        self.assertEqual(code, 1)
+        self.assertIn("kited error unauthorized", err)
+        self.assertEqual(self.received, [])
+
+    def test_send_requires_chat_and_path(self) -> None:
+        with self.assertRaises(SystemExit):
+            self._run_cli("image", "send", "--chat", "chat-1")
+        with self.assertRaises(SystemExit):
+            self._run_cli("image", "send", "--path", str(self.image_path))
+
+
 class ConfigShowTests(KitectlTestCase):
     def test_show_redacts_secrets_recursively(self) -> None:
         (self.config_dir / "system.yaml").write_text(

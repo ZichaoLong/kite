@@ -43,6 +43,7 @@ from kite.prompt_ownership import PromptOwnership
 from kite.runtime_loop import RuntimeLoop
 from kite.stores.binding_store import BindingStore
 from kite.stores.event_cursor_store import EventCursorStore
+from kite.stores.pending_attachment_store import PendingAttachmentStore
 from kite.stores.terminal_result_store import TerminalResultStore
 
 ADMIN_OPEN_ID = "ou_admin"
@@ -455,6 +456,7 @@ class PipelineTestCase(unittest.TestCase):
             transport=self.transport,
             rest=self.rest,
             binding_store=self.store,
+            attachment_store=PendingAttachmentStore(self.data_dir),
             runtime_loop=self.loop,
             config={
                 "admin_open_ids": [ADMIN_OPEN_ID, OTHER_OPEN_ID],

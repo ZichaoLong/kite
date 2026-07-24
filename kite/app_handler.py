@@ -9,6 +9,11 @@ Implements the MVP inbound contract (docs/contracts/mvp-scope.md):
   cwd=default_working_dir and binds it) -> submit the prompt carrying the
   binding's permission_mode + plan_mode explicitly -> record prompt
   ownership -> minimal ack;
+- attachment messages (images, docs/contracts/images.md §2): staged into
+  the bound session's cwd by AttachmentDomain with a TTL'd pending record;
+  the next text prompt from the same (sender, chat) consumes them as native
+  kap image content parts (base64 source) plus staged paths as text
+  context, with consume-once + restore-on-submit-failure;
 - the loopback control plane's prompt/submit endpoint reuses that same
   submit discipline for `kitectl prompt send` (minus the Feishu ack), so
   CLI-sent prompts record ownership exactly like Feishu-originated ones
@@ -44,6 +49,7 @@ from __future__ import annotations
 
 import hmac
 import logging
+import pathlib
 import urllib.parse
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional
@@ -57,6 +63,7 @@ from kite.adapters.kap_server import (
     PromptQueueState,
     SessionSummary,
 )
+from kite.attachment_domain import AttachmentDomain, AttachmentPorts
 from kite.command_surface import (
     build_help_text,
     build_usage_text,
@@ -69,6 +76,7 @@ from kite.feishu_card_markdown import sanitize_runtime_markdown_for_feishu_card
 from kite.feishu_transport import (
     CardAction,
     CardActionResponse,
+    DownloadedMessageResource,
     FeishuTransport,
     InboundAttachment,
     InboundMessage,
@@ -89,6 +97,7 @@ from kite.stores.binding_store import (
     BindingStore,
     StoredBinding,
 )
+from kite.stores.pending_attachment_store import PendingAttachmentStore
 
 logger = logging.getLogger("kite.app")
 
@@ -171,10 +180,30 @@ class KapSessionOps:
         permission_mode: str,
         plan_mode: bool,
     ) -> SubmitPromptResult:
+        return self.submit_prompt_content(
+            session_id,
+            [{"type": "text", "text": text}],
+            permission_mode=permission_mode,
+            plan_mode=plan_mode,
+        )
+
+    def submit_prompt_content(
+        self,
+        session_id: str,
+        content: list[dict[str, Any]],
+        *,
+        permission_mode: str,
+        plan_mode: bool,
+    ) -> SubmitPromptResult:
         # permission_mode / plan_mode / model are carried explicitly on every
         # prompt (kite-design.md §7; spike-results §0 for the model part).
+        # The content-part wire shape is the upstream promptSubmissionSchema:
+        # text parts and native image parts with a base64 source
+        # (packages/protocol/src/rest/prompt.ts + message.ts
+        # imageSourceSchema; kap-server converts base64 to a data-URI core
+        # part and compresses inline, so no upload step exists or is needed).
         payload: dict[str, Any] = {
-            "content": [{"type": "text", "text": text}],
+            "content": content,
             "permission_mode": permission_mode,
             "plan_mode": plan_mode,
         }
@@ -262,6 +291,7 @@ class AppHandler(TransportHandler):
         transport: FeishuTransport,
         rest: Any,
         binding_store: BindingStore,
+        attachment_store: PendingAttachmentStore,
         runtime_loop: RuntimeLoop,
         config: Mapping[str, Any],
         init_token: str,
@@ -276,6 +306,19 @@ class AppHandler(TransportHandler):
         self._loop = runtime_loop
         self._default_working_dir = kite_config.default_working_dir(config)
         self._admins: set[str] = kite_config.admin_open_ids(config)
+        self._attachment_max_bytes = kite_config.attachment_max_bytes(config)
+        # Inbound image staging (docs/contracts/images.md §2): on_attachment
+        # stages into the session cwd; the next text prompt consumes.
+        self._attachment_domain = AttachmentDomain(
+            ports=AttachmentPorts(
+                download=self._download_image_resource,
+                reply=self._reply,
+                resolve_cwd=self._resolve_attachment_cwd,
+            ),
+            store=attachment_store,
+            ttl_seconds=kite_config.attachment_ttl_seconds(config),
+            max_bytes=self._attachment_max_bytes,
+        )
         self._init_token = str(init_token or "").strip()
         if not self._init_token:
             logger.error("init token is empty; /init can never succeed")
@@ -392,11 +435,22 @@ class AppHandler(TransportHandler):
         if not self._is_admin(attachment.sender_open_id):
             self._reply(attachment.chat_id, _NON_ADMIN_TEXT, parent_message_id=attachment.message_id)
             return
-        self._reply(
-            attachment.chat_id,
-            "KITE 暂不支持图片、文件等附件消息，请直接发送文字。",
-            parent_message_id=attachment.message_id,
+        self._attachment_domain.handle_attachment(attachment)
+
+    def _download_image_resource(
+        self, message_id: str, resource_key: str
+    ) -> DownloadedMessageResource:
+        return self._transport.download_message_resource(
+            message_id, resource_key, resource_type="image"
         )
+
+    def _resolve_attachment_cwd(self, chat_id: str) -> str:
+        """The bound session's cwd for staging; "" when the chat is unbound."""
+        binding = self._binding_store.load(chat_id)
+        if binding is None:
+            return ""
+        info = self._ops.get_session(binding["session_id"])
+        return str(info.cwd or "")
 
     def _on_card_action_impl(self, action: CardAction) -> CardActionResponse:
         name = str(action.value.get("action") or "").strip()
@@ -460,38 +514,74 @@ class AppHandler(TransportHandler):
                 "发送 /sessions 查看可用会话并切换；KITE 不会自动新建会话。",
             )
             return
+        # Pending staged images are consumed by this prompt (images contract
+        # §2.3): an expired/missing/stale-cwd record blocks the prompt
+        # fail-closed; otherwise the prompt carries the composed text plus
+        # native base64 image parts.
+        prepared = self._attachment_domain.prepare_prompt(
+            sender_open_id=message.sender_open_id,
+            chat_id=chat_id,
+            text=text,
+            cwd=info.cwd or "",
+        )
+        if prepared.blocking_text:
+            self._reply_to(message, prepared.blocking_text)
+            return
+        content: list[dict[str, Any]] = [{"type": "text", "text": prepared.text}]
+        content.extend(
+            {
+                "type": "image",
+                "source": {
+                    "kind": "base64",
+                    "media_type": image.media_type,
+                    "data": image.data_base64,
+                },
+            }
+            for image in prepared.images
+        )
         try:
-            result = self._ops.submit_prompt(
+            result = self._ops.submit_prompt_content(
                 session_id,
-                text,
+                content,
                 permission_mode=binding["permission_mode"],
                 plan_mode=binding["plan_mode"],
             )
         except KapTransportError:
+            # Submit failed: restore the consumed records so a retry still
+            # has them (contract §5.1); staged files are kept.
+            self._attachment_domain.restore_consumed(prepared.consumed)
             self._reply_to(message, _KAP_UNREACHABLE_TEXT)
             return
         except KapError as exc:
             # Business error on submit (mvp-scope §4.5): report the upstream
             # msg; no prompt started, so no card exists to transition.
+            self._attachment_domain.restore_consumed(prepared.consumed)
             self._reply_to(message, f"提交失败：{exc.msg}")
             return
         if result.status == "blocked":
             # Upstream rejects blocked submissions before a turn launches.
+            self._attachment_domain.restore_consumed(prepared.consumed)
             self._reply_to(message, "提交被 kap-server 拒绝（blocked），该 prompt 未执行。")
             return
+        if prepared.consumed:
+            # Successful submit: consumption deletes the staged files
+            # (contract §2.5); the image bytes live in the kap message.
+            self._attachment_domain.discard_consumed_files(prepared.consumed)
         self._ownership.record(result.prompt_id, chat_id)
         logger.info(
-            "prompt submitted chat_id=%s session_id=%s prompt_id=%s status=%s",
+            "prompt submitted chat_id=%s session_id=%s prompt_id=%s status=%s attachments=%d",
             chat_id,
             session_id,
             result.prompt_id,
             result.status,
+            len(prepared.consumed),
         )
         prefix = f"已创建并绑定新会话 `{session_id}`。\n" if created else ""
+        suffix = f"（附带 {len(prepared.consumed)} 张图片）" if prepared.consumed else ""
         if result.status == "queued":
-            self._reply_to(message, f"{prefix}已加入队列，等待执行。")
+            self._reply_to(message, f"{prefix}已加入队列，等待执行。{suffix}")
         else:
-            self._reply_to(message, f"{prefix}已提交，正在执行。")
+            self._reply_to(message, f"{prefix}已提交，正在执行。{suffix}")
 
     def _create_and_bind(self, chat_id: str, text: str) -> Optional[StoredBinding]:
         try:
@@ -643,6 +733,90 @@ class AppHandler(TransportHandler):
             "session_id": session_id,
             "status": result.status,
             "owner_recorded": owner_recorded,
+        }
+
+    # ------------------------------------------------------------------
+    # Control-plane image delivery (kitectl -> kited)
+    # ------------------------------------------------------------------
+
+    def send_image_control(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        """Control-plane entry for `kitectl image send` (images contract §3).
+
+        Uploads the local image once and sends an image message to every
+        attached chat bound to the same session as ``chat_id``; a per-chat
+        failure is isolated in the result, never raised. Raises ControlError
+        (code/msg) for validation/upload failures.
+        """
+        return self._loop.call(self._send_image_control_impl, params)
+
+    def _send_image_control_impl(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        chat_id = str(params.get("chat_id") or "").strip()
+        raw_path = str(params.get("path") or "").strip()
+        if not chat_id:
+            raise ControlError("chat_id must not be empty", code="invalid_params")
+        if not raw_path:
+            raise ControlError("path must not be empty", code="invalid_params")
+        binding = self._binding_store.load(chat_id)
+        if binding is None:
+            raise ControlError(
+                f"no binding for chat {chat_id}; bind the chat from Feishu first",
+                code="no_binding",
+            )
+        image_path = pathlib.Path(raw_path).expanduser()
+        if not image_path.is_file():
+            raise ControlError(
+                f"image path does not exist or is not a file: {image_path}",
+                code="invalid_path",
+            )
+        size = image_path.stat().st_size
+        if size > self._attachment_max_bytes:
+            raise ControlError(
+                f"image is {size} bytes, over the {self._attachment_max_bytes} byte cap",
+                code="image_too_large",
+            )
+        # Fan-out: every attached chat bound to the same session (contract
+        # §3.1, FOCUS thread_image_delivery upload-once discipline).
+        targets = sorted(
+            candidate
+            for candidate, candidate_binding in self._binding_store.load_all().items()
+            if candidate_binding["session_id"] == binding["session_id"]
+            and candidate_binding["attached"]
+        )
+        if not targets:
+            raise ControlError(
+                f"no attached chats bound to session {binding['session_id']}",
+                code="no_targets",
+            )
+        image_key = str(self._transport.upload_image(str(image_path)) or "").strip()
+        if not image_key:
+            raise ControlError(f"image upload failed: {image_path}", code="upload_failed")
+        delivered: list[dict[str, str]] = []
+        failed: list[dict[str, str]] = []
+        for target_chat_id in targets:
+            try:
+                message_id = str(
+                    self._transport.send_image_by_key(target_chat_id, image_key) or ""
+                ).strip()
+            except Exception as exc:  # noqa: BLE001 - per-chat failure isolation
+                logger.exception("image send failed chat=%s", target_chat_id)
+                failed.append({"chat_id": target_chat_id, "error": str(exc) or "send_failed"})
+                continue
+            if message_id:
+                delivered.append({"chat_id": target_chat_id, "message_id": message_id})
+            else:
+                failed.append({"chat_id": target_chat_id, "error": "send_failed"})
+        logger.info(
+            "control-plane image sent session_id=%s image_key=%s delivered=%d failed=%d",
+            binding["session_id"],
+            image_key,
+            len(delivered),
+            len(failed),
+        )
+        return {
+            "session_id": binding["session_id"],
+            "image_key": image_key,
+            "delivered": delivered,
+            "failed": failed,
         }
 
     # ------------------------------------------------------------------

@@ -8,10 +8,12 @@ temp dir and a real RuntimeLoop are used, so the serialization discipline
 
 from __future__ import annotations
 
+import base64
 import os
 import pathlib
 import re
 import tempfile
+import time
 import unittest
 
 import yaml
@@ -22,10 +24,16 @@ from kite.app_handler import (
     ACTION_SESSION_SWITCH,
     AppHandler,
 )
-from kite.feishu_transport import CardAction, InboundAttachment, InboundMessage
+from kite.feishu_transport import (
+    CardAction,
+    DownloadedMessageResource,
+    InboundAttachment,
+    InboundMessage,
+)
 from kite.prompt_ownership import CERTAINTY_BEST_EFFORT, PromptOwnership
 from kite.runtime_loop import RuntimeLoop
 from kite.stores.binding_store import BindingStore
+from kite.stores.pending_attachment_store import PendingAttachmentStore
 
 ADMIN_OPEN_ID = "ou_admin"
 CHAT_ID = "oc_chat"
@@ -42,6 +50,17 @@ class FakeTransport:
     def __init__(self) -> None:
         self.replies: list[dict] = []
         self.cards: list[dict] = []
+        self.downloads: list[tuple[str, str, str]] = []
+        self.download_result = DownloadedMessageResource(
+            content=b"\x89PNG-fake-image-bytes",
+            file_name="photo.png",
+            content_type="image/png",
+        )
+        self.download_error: Exception | None = None
+        self.uploads: list[str] = []
+        self.upload_result: str | None = "img_key_fake"
+        self.sent_images: list[tuple[str, str]] = []
+        self.fail_image_chats: set[str] = set()
 
     def reply(self, chat_id: str, text: str, *, parent_message_id: str = "", reply_in_thread: bool = False) -> bool:
         self.replies.append(
@@ -53,6 +72,24 @@ class FakeTransport:
         self.cards.append(
             {"chat_id": chat_id, "card": card, "parent_message_id": parent_message_id}
         )
+
+    def download_message_resource(
+        self, message_id: str, file_key: str, *, resource_type: str
+    ) -> DownloadedMessageResource:
+        self.downloads.append((message_id, file_key, resource_type))
+        if self.download_error is not None:
+            raise self.download_error
+        return self.download_result
+
+    def upload_image(self, local_path: str) -> str | None:
+        self.uploads.append(local_path)
+        return self.upload_result
+
+    def send_image_by_key(self, chat_id: str, image_key: str) -> str | None:
+        if chat_id in self.fail_image_chats:
+            return None
+        self.sent_images.append((chat_id, image_key))
+        return f"om_img_{len(self.sent_images)}"
 
     def last_text(self) -> str:
         assert self.replies, "expected at least one text reply"
@@ -218,13 +255,20 @@ def make_message(
     )
 
 
-def make_attachment(*, sender: str = ADMIN_OPEN_ID, chat_id: str = CHAT_ID) -> InboundAttachment:
+def make_attachment(
+    *,
+    sender: str = ADMIN_OPEN_ID,
+    chat_id: str = CHAT_ID,
+    message_id: str = "om_att",
+    attachment_type: str = "image",
+    resource_key: str = "img_key",
+) -> InboundAttachment:
     return InboundAttachment(
-        message_id="om_att",
+        message_id=message_id,
         chat_id=chat_id,
         chat_type="p2p",
-        attachment_type="image",
-        resource_key="img_key",
+        attachment_type=attachment_type,
+        resource_key=resource_key,
         file_name="",
         sender_open_id=sender,
         sender_user_id="u_1",
@@ -257,6 +301,7 @@ class AppHandlerTestCase(unittest.TestCase):
         self.addCleanup(self.tempdir.cleanup)
         self.data_dir = pathlib.Path(self.tempdir.name)
         self.store = BindingStore(self.data_dir)
+        self.attachment_store = PendingAttachmentStore(self.data_dir)
         self.transport = FakeTransport()
         self.rest = FakeKapRestClient()
         self.loop = RuntimeLoop(name="test-loop")
@@ -270,6 +315,7 @@ class AppHandlerTestCase(unittest.TestCase):
             transport=self.transport,
             rest=self.rest,
             binding_store=self.store,
+            attachment_store=self.attachment_store,
             runtime_loop=self.loop,
             config={
                 "admin_open_ids": sorted(admins if admins is not None else {ADMIN_OPEN_ID}),
@@ -362,6 +408,7 @@ class IdentityTests(AppHandlerTestCase):
             transport=self.transport,
             rest=self.rest,
             binding_store=self.store,
+            attachment_store=PendingAttachmentStore(self.data_dir),
             runtime_loop=self.loop,
             config={"admin_open_ids": [], "default_working_dir": DEFAULT_CWD},
             init_token=INIT_TOKEN,
@@ -982,6 +1029,7 @@ class E3SeamTests(AppHandlerTestCase):
             transport=self.transport,
             rest=self.rest,
             binding_store=self.store,
+            attachment_store=PendingAttachmentStore(self.data_dir),
             runtime_loop=self.loop,
             config={"admin_open_ids": [ADMIN_OPEN_ID], "default_working_dir": DEFAULT_CWD},
             init_token=INIT_TOKEN,
@@ -1011,6 +1059,7 @@ class E3SeamTests(AppHandlerTestCase):
             transport=self.transport,
             rest=self.rest,
             binding_store=self.store,
+            attachment_store=PendingAttachmentStore(self.data_dir),
             runtime_loop=self.loop,
             config={"admin_open_ids": [ADMIN_OPEN_ID], "default_working_dir": DEFAULT_CWD},
             init_token=INIT_TOKEN,
@@ -1048,15 +1097,134 @@ class E3SeamTests(AppHandlerTestCase):
 
 
 class AttachmentTests(AppHandlerTestCase):
-    def test_attachment_gets_polite_not_supported(self) -> None:
-        self.handler.on_attachment(make_attachment())
-        self.assertIn("暂不支持", self.transport.last_text())
-        self.assertEqual(self.transport.replies[-1]["parent_message_id"], "om_att")
-        self.assertEqual(self.rest.calls, [])
+    """Image attachment inbound wiring (docs/contracts/images.md §2, §4).
+
+    The bound session's cwd must be a real directory for staging, so these
+    tests point the session at a temp work dir.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.work_dir = self.data_dir / "work"
+        self.work_dir.mkdir()
+
+    def _bind_with_real_cwd(self, session_id: str = "s-1") -> None:
+        self.rest.add_session(session_id, cwd=str(self.work_dir))
+        self.bind(session_id)
+
+    def _staged_files(self) -> list[pathlib.Path]:
+        stage_dir = self.work_dir / "_feishu_attachments"
+        if not stage_dir.is_dir():
+            return []
+        return sorted(path for path in stage_dir.iterdir() if not path.name.startswith("."))
 
     def test_attachment_from_non_admin_is_rejected(self) -> None:
         self.handler.on_attachment(make_attachment(sender="ou_stranger"))
         self.assertIn("仅对管理员开放", self.transport.last_text())
+        self.assertEqual(self.attachment_store.list_all(), ())
+
+    def test_image_without_binding_gets_bind_guidance(self) -> None:
+        self.handler.on_attachment(make_attachment())
+        self.assertIn("尚未绑定会话", self.transport.last_text())
+        self.assertEqual(self.transport.replies[-1]["parent_message_id"], "om_att")
+        # Nothing downloaded, nothing staged, no record.
+        self.assertEqual(self.transport.downloads, [])
+        self.assertEqual(self._staged_files(), [])
+        self.assertEqual(self.attachment_store.list_all(), ())
+
+    def test_unsupported_type_gets_explicit_rejection(self) -> None:
+        self._bind_with_real_cwd()
+        self.handler.on_attachment(make_attachment(attachment_type="file"))
+        self.assertIn("暂不支持文件附件", self.transport.last_text())
+        self.assertEqual(self.transport.downloads, [])
+        self.assertEqual(self.attachment_store.list_all(), ())
+
+    def test_image_stages_into_session_cwd_and_acks_saved(self) -> None:
+        self._bind_with_real_cwd()
+        self.handler.on_attachment(make_attachment())
+        self.assertIn("已保存，发送文字即可附带", self.transport.last_text())
+        self.assertEqual(self.transport.downloads, [("om_att", "img_key", "image")])
+        staged = self._staged_files()
+        self.assertEqual(len(staged), 1)
+        self.assertTrue(staged[0].name.endswith("-photo.png"))
+        self.assertEqual(staged[0].read_bytes(), b"\x89PNG-fake-image-bytes")
+        records = self.attachment_store.list_all()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].local_path, str(staged[0].resolve()))
+        self.assertEqual(records[0].media_type, "image/png")
+        self.assertGreater(records[0].expires_at, records[0].created_at)
+
+    def test_text_prompt_consumes_pending_image_as_native_parts(self) -> None:
+        self._bind_with_real_cwd()
+        self.handler.on_attachment(make_attachment())
+        staged_path = self._staged_files()[0]
+
+        self.send("帮我看看这张图")
+
+        submission = self.rest.submissions[-1]
+        content = submission["body"]["content"]
+        self.assertEqual(len(content), 2)
+        # Text part: composed context (staged path) + the user text.
+        self.assertEqual(content[0]["type"], "text")
+        self.assertIn(str(staged_path), content[0]["text"])
+        self.assertIn("photo.png", content[0]["text"])
+        self.assertIn("用户请求：\n帮我看看这张图", content[0]["text"])
+        # Native image part: base64 source (kap imageSourceSchema).
+        self.assertEqual(content[1]["type"], "image")
+        self.assertEqual(content[1]["source"]["kind"], "base64")
+        self.assertEqual(content[1]["source"]["media_type"], "image/png")
+        self.assertEqual(
+            base64.b64decode(content[1]["source"]["data"]),
+            b"\x89PNG-fake-image-bytes",
+        )
+        # Consume-once: the record is gone and the staged file is deleted.
+        self.assertEqual(self.attachment_store.list_all(), ())
+        self.assertEqual(self._staged_files(), [])
+        self.assertIn("附带 1 张图片", self.transport.last_text())
+
+    def test_submit_failure_restores_pending_image_for_retry(self) -> None:
+        self._bind_with_real_cwd()
+        self.handler.on_attachment(make_attachment())
+        self.rest.submit_error = KapError(50001, "kap exploded")
+
+        self.send("看看这张图")
+
+        self.assertIn("提交失败", self.transport.last_text())
+        # Restored: the record and the staged file survive the failure.
+        records = self.attachment_store.list_all()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(len(self._staged_files()), 1)
+
+        self.rest.submit_error = None
+        self.send("再看看")
+
+        submission = self.rest.submissions[-1]
+        kinds = [part["type"] for part in submission["body"]["content"]]
+        self.assertEqual(kinds, ["text", "image"])
+        self.assertEqual(self.attachment_store.list_all(), ())
+        self.assertEqual(self._staged_files(), [])
+
+    def test_expired_attachment_blocks_prompt_and_is_swept(self) -> None:
+        self._bind_with_real_cwd()
+        handler = self._make_handler(
+            config={
+                "admin_open_ids": [ADMIN_OPEN_ID],
+                "default_working_dir": DEFAULT_CWD,
+                "attachment_ttl_seconds": 1,
+            }
+        )
+        handler.on_attachment(make_attachment())
+        self.assertEqual(len(self._staged_files()), 1)
+        time.sleep(1.2)
+
+        handler.on_message(make_message("看看这张图"))
+
+        self.assertIn("附件已过期，请重新发送", self.transport.last_text())
+        # Blocked fail-closed: nothing was submitted.
+        self.assertEqual(self.rest.submissions, [])
+        # Expired record + staged file are swept.
+        self.assertEqual(self.attachment_store.list_all(), ())
+        self.assertEqual(self._staged_files(), [])
 
 
 if __name__ == "__main__":

@@ -23,6 +23,12 @@ Implemented slice (docs/contracts/mvp-scope.md §2 kitectl row, §6):
                                 prompt. Exit codes: 2 daemon down / setup, 3
                                 outcome unknown (may be delivered — verify
                                 before retrying), 1 business error.
+  - `kitectl image send`      — upload a local image once and send it to every
+                                attached chat bound to the same session as
+                                --chat, through the same control plane
+                                (docs/contracts/images.md §3). Same exit-code
+                                taxonomy; a partial fan-out failure exits 1
+                                with the per-chat report.
 
 Read-only commands talk to kap-server REST directly: the `kap:` section of
 system.yaml provides address/home, the instance registry is the source of
@@ -429,16 +435,9 @@ def _cmd_binding_list(_args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_prompt_send(args: argparse.Namespace) -> int:
-    text = args.text
-    if not text.strip():
-        _die("prompt text must not be empty")
-    data_dir = default_data_root()
-    # kitectl is a client of the daemon here (docs/decisions/control-plane.md):
-    # the submit must serialize through kited so prompt ownership is recorded
-    # in the daemon's map. Never fall back to direct kap REST — that would
-    # reintroduce the second writer on the ownership axis.
-    metadata = discover_live_control_metadata(data_dir)
+def _control_client() -> ControlClient:
+    """Discover the live daemon's control plane and build an authenticated client."""
+    metadata = discover_live_control_metadata(default_data_root())
     if metadata is None:
         _die("kited is not running (no live control plane); start it with `kitectl service start`")
     token_path = kite_config.control_token_path()
@@ -446,12 +445,23 @@ def _cmd_prompt_send(args: argparse.Namespace) -> int:
         token = token_path.read_text(encoding="utf-8").strip()
     except OSError:
         _die(f"no control-plane token at {token_path}; is kited running?")
+    return ControlClient(port=metadata.port, token=token)
+
+
+def _cmd_prompt_send(args: argparse.Namespace) -> int:
+    text = args.text
+    if not text.strip():
+        _die("prompt text must not be empty")
+    # kitectl is a client of the daemon here (docs/decisions/control-plane.md):
+    # the submit must serialize through kited so prompt ownership is recorded
+    # in the daemon's map. Never fall back to direct kap REST — that would
+    # reintroduce the second writer on the ownership axis.
     params: dict[str, Any] = {"text": text}
     if args.chat is not None:
         params["chat_id"] = args.chat
     else:
         params["session_id"] = args.session
-    client = ControlClient(port=metadata.port, token=token)
+    client = _control_client()
     try:
         data = client.request("prompt/submit", params)
     except ControlRefusedError:
@@ -477,6 +487,63 @@ def _cmd_prompt_send(args: argparse.Namespace) -> int:
     print(f"status: {data.get('status', '')}")
     print(f"owner_recorded: {'yes' if data.get('owner_recorded') else 'no'}")
     return 0
+
+
+def _cmd_image_send(args: argparse.Namespace) -> int:
+    raw_path = str(args.path or "").strip()
+    if not raw_path:
+        _die("image path must not be empty")
+    # Absolutize client-side: the daemon's cwd differs from kitectl's, so a
+    # relative path would resolve against the wrong directory. Existence and
+    # the byte cap are validated daemon-side (one authoritative check).
+    path = str(pathlib.Path(raw_path).expanduser().resolve())
+    client = _control_client()
+    try:
+        data = client.request("image/send", {"chat_id": args.chat, "path": path})
+    except ControlRefusedError:
+        # The daemon went away between discovery and connect; nothing was sent.
+        _die("kited is not running (control plane refused the connection); the image was not sent")
+    except ControlOutcomeUnknownError as exc:
+        _die(
+            f"{exc}\nthe image may have been delivered; "
+            "check the target chats before retrying",
+            exit_code=3,
+        )
+    except ControlError as exc:
+        _die(f"kited error {exc.code}: {exc.msg}", exit_code=1)
+    if not isinstance(data, dict):
+        _die(
+            "kited accepted the image but returned a malformed response; "
+            "check the target chats before retrying",
+            exit_code=3,
+        )
+    delivered = data.get("delivered") if isinstance(data.get("delivered"), list) else []
+    failed = data.get("failed") if isinstance(data.get("failed"), list) else []
+    print(f"session_id: {data.get('session_id', '')}")
+    print(f"image_key: {data.get('image_key', '')}")
+    if delivered:
+        print(
+            "delivered: "
+            + ", ".join(
+                f"{item.get('chat_id', '')} ({item.get('message_id', '')})"
+                for item in delivered
+                if isinstance(item, dict)
+            )
+        )
+    else:
+        print("delivered: (none)")
+    if failed:
+        print(
+            "failed: "
+            + ", ".join(
+                f"{item.get('chat_id', '')} ({item.get('error', '')})"
+                for item in failed
+                if isinstance(item, dict)
+            )
+        )
+    # Per-chat failures are data in the report (contract §3.1); a partial
+    # delivery still exits non-zero so scripts notice.
+    return 1 if failed else 0
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -576,6 +643,26 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     send_parser.add_argument("--text", required=True, help="prompt text")
     send_parser.set_defaults(func=_cmd_prompt_send)
+
+    image_parser = subparsers.add_parser("image", help="image delivery (control plane)")
+    image_sub = image_parser.add_subparsers(dest="image_command", required=True)
+    image_send_parser = image_sub.add_parser(
+        "send",
+        help="upload a local image once and send it to every attached chat "
+        "bound to the same session as --chat (docs/contracts/images.md §3)",
+    )
+    image_send_parser.add_argument(
+        "--chat",
+        required=True,
+        metavar="CHAT_ID",
+        help="bound chat; the image goes to every attached chat of its session",
+    )
+    image_send_parser.add_argument(
+        "--path",
+        required=True,
+        help="local image file (the daemon validates existence and the byte cap)",
+    )
+    image_send_parser.set_defaults(func=_cmd_image_send)
     return parser
 
 

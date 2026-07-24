@@ -17,6 +17,12 @@ app_secret: "xxx"
 # auto-approves). Default: 300.
 # approval_timeout_seconds: 300
 
+# Inbound image attachments (docs/contracts/images.md): how long a staged
+# image stays pending consumption, and the post-download byte cap per image
+# (also the cap for `kitectl image send`). Defaults: 600 / 20971520 (20 MB).
+# attachment_ttl_seconds: 600
+# attachment_max_bytes: 20971520
+
 # kap-server connection (all optional; defaults shown):
 # kap:
 #   host: 127.0.0.1   # loopback only; kap-server has no TLS

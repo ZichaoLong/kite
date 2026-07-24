@@ -24,6 +24,11 @@ _CONTROL_TOKEN_FILENAME = "control.token"
 # upstream as rejected (never auto-approved). See docs/contracts/mvp-scope.md.
 DEFAULT_APPROVAL_TIMEOUT_SECONDS = 300
 
+# Inbound attachment staging (docs/contracts/images.md §2): pending records
+# expire after this TTL and staged bytes are capped post-download.
+DEFAULT_ATTACHMENT_TTL_SECONDS = 600
+DEFAULT_ATTACHMENT_MAX_BYTES = 20 * 1024 * 1024
+
 
 def config_dir() -> Path:
     raw = os.environ.get("KITE_CONFIG_DIR", "").strip()
@@ -171,6 +176,30 @@ def approval_timeout_seconds(config: Mapping[str, Any]) -> int:
         raise ValueError("approval_timeout_seconds must be a positive integer") from exc
     if isinstance(raw, bool) or value <= 0:
         raise ValueError("approval_timeout_seconds must be a positive integer")
+    return value
+
+
+def attachment_ttl_seconds(config: Mapping[str, Any]) -> int:
+    """Seconds a staged inbound attachment stays pending consumption."""
+    raw = config.get("attachment_ttl_seconds", DEFAULT_ATTACHMENT_TTL_SECONDS)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("attachment_ttl_seconds must be a positive integer") from exc
+    if isinstance(raw, bool) or value <= 0:
+        raise ValueError("attachment_ttl_seconds must be a positive integer")
+    return value
+
+
+def attachment_max_bytes(config: Mapping[str, Any]) -> int:
+    """Post-download byte cap for one inbound attachment (fail-closed)."""
+    raw = config.get("attachment_max_bytes", DEFAULT_ATTACHMENT_MAX_BYTES)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("attachment_max_bytes must be a positive integer") from exc
+    if isinstance(raw, bool) or value <= 0:
+        raise ValueError("attachment_max_bytes must be a positive integer")
     return value
 
 

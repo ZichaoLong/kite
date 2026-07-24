@@ -58,6 +58,7 @@ from kite.runtime_loop import RuntimeLoop
 from kite.runtime_status import RuntimeStatusWriter
 from kite.stores.binding_store import BindingStore
 from kite.stores.event_cursor_store import EventCursorStore
+from kite.stores.pending_attachment_store import PendingAttachmentStore
 from kite.stores.terminal_result_store import TerminalResultStore
 
 logger = logging.getLogger("kite.kited")
@@ -169,6 +170,7 @@ def build_outbound_runtime(
         transport=transport,
         rest=rest_proxy,
         binding_store=binding_store,
+        attachment_store=PendingAttachmentStore(data_dir),
         runtime_loop=loop,
         config=config,
         init_token=init_token,
@@ -204,6 +206,8 @@ def _control_dispatch(outbound: OutboundRuntime) -> Callable[[str, dict[str, Any
     def dispatch(method: str, params: dict[str, Any]) -> Any:
         if method == "prompt/submit":
             return outbound.handler.submit_prompt_control(params)
+        if method == "image/send":
+            return outbound.handler.send_image_control(params)
         raise ControlError(f"unknown control method: {method}", code="unknown_method")
 
     return dispatch

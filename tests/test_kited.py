@@ -26,6 +26,7 @@ from kite.runtime_loop import RuntimeLoop
 from kite.runtime_status import read_runtime_status
 from kite.stores.binding_store import BindingStore
 from kite.stores.event_cursor_store import EventCursorStore
+from kite.stores.pending_attachment_store import PendingAttachmentStore
 from kite.stores.terminal_result_store import TerminalResultStore
 from test_app_handler import FakeKapRestClient, FakeTransport
 
@@ -311,6 +312,7 @@ class ControlPlaneSubmitTests(unittest.TestCase):
             transport=self.transport,
             rest=self.rest,
             binding_store=self.store,
+            attachment_store=PendingAttachmentStore(self.data_dir),
             runtime_loop=self.loop,
             config={"admin_open_ids": ["ou_admin"], "default_working_dir": "/work"},
             init_token="test-init-token",
@@ -513,6 +515,137 @@ class ControlPlaneSubmitTests(unittest.TestCase):
         assert entry is not None
         self.assertEqual(entry.chat_id, "chat-1")
         self.assertEqual(entry.certainty, CERTAINTY_CERTAIN)
+
+
+class ControlPlaneImageSendTests(unittest.TestCase):
+    """The kited-side image/send endpoint discipline (images contract §3).
+
+    A real AppHandler + BindingStore + RuntimeLoop over the scriptable fake
+    transport: upload-once fan-out to every attached chat of the session,
+    per-chat failure isolation, and fail-closed validation.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.data_dir = pathlib.Path(self._tmp.name)
+        self.store = BindingStore(self.data_dir)
+        self.transport = FakeTransport()
+        self.rest = FakeKapRestClient()
+        self.loop = RuntimeLoop(name="test-runtime")
+        self.addCleanup(self.loop.stop)
+        self.handler = self._make_handler()
+        self.dispatch = kited._control_dispatch(SimpleNamespace(handler=self.handler))
+        self.image_path = self.data_dir / "img.png"
+        self.image_path.write_bytes(b"\x89PNG-fake")
+
+    def _make_handler(self, **config_overrides) -> AppHandler:
+        config = {"admin_open_ids": ["ou_admin"], "default_working_dir": "/work"}
+        config.update(config_overrides)
+        return AppHandler(
+            transport=self.transport,
+            rest=self.rest,
+            binding_store=self.store,
+            attachment_store=PendingAttachmentStore(self.data_dir),
+            runtime_loop=self.loop,
+            config=config,
+            init_token="test-init-token",
+            persist_admins=lambda ids: None,
+        )
+
+    def _bind(self, chat_id: str, session_id: str, *, attached: bool = True) -> None:
+        self.store.save(
+            chat_id,
+            {
+                "session_id": session_id,
+                "attached": attached,
+                "permission_mode": "auto",
+                "plan_mode": False,
+            },
+        )
+
+    def _send(self, params: dict) -> dict:
+        return self.dispatch("image/send", params)
+
+    def test_fanout_uploads_once_and_delivers_to_attached_chats(self) -> None:
+        self._bind("chat-1", "s-1")
+        self._bind("chat-2", "s-1")
+        self._bind("chat-3", "s-1", attached=False)  # detached: not a target
+        self._bind("chat-4", "s-2")  # other session: not a target
+
+        result = self._send({"chat_id": "chat-1", "path": str(self.image_path)})
+
+        self.assertEqual(result["session_id"], "s-1")
+        self.assertEqual(result["image_key"], "img_key_fake")
+        self.assertEqual(result["failed"], [])
+        self.assertEqual(
+            [item["chat_id"] for item in result["delivered"]], ["chat-1", "chat-2"]
+        )
+        # Upload happened exactly once; sends fanned out per chat.
+        self.assertEqual(self.transport.uploads, [str(self.image_path)])
+        self.assertEqual(
+            self.transport.sent_images,
+            [("chat-1", "img_key_fake"), ("chat-2", "img_key_fake")],
+        )
+
+    def test_one_failing_chat_is_isolated_in_the_result(self) -> None:
+        self._bind("chat-1", "s-1")
+        self._bind("chat-2", "s-1")
+        self.transport.fail_image_chats.add("chat-2")
+
+        result = self._send({"chat_id": "chat-1", "path": str(self.image_path)})
+
+        self.assertEqual([item["chat_id"] for item in result["delivered"]], ["chat-1"])
+        self.assertEqual(
+            result["failed"], [{"chat_id": "chat-2", "error": "send_failed"}]
+        )
+
+    def test_upload_failure_raises_and_sends_nothing(self) -> None:
+        self._bind("chat-1", "s-1")
+        self.transport.upload_result = None
+
+        with self.assertRaises(ControlError) as ctx:
+            self._send({"chat_id": "chat-1", "path": str(self.image_path)})
+
+        self.assertEqual(ctx.exception.code, "upload_failed")
+        self.assertEqual(self.transport.sent_images, [])
+
+    def test_validation_errors(self) -> None:
+        self._bind("chat-1", "s-1")
+        cases = [
+            ({"path": str(self.image_path)}, "invalid_params"),
+            ({"chat_id": "chat-1"}, "invalid_params"),
+            ({"chat_id": "chat-ghost", "path": str(self.image_path)}, "no_binding"),
+            ({"chat_id": "chat-1", "path": str(self.data_dir / "gone.png")}, "invalid_path"),
+            ({"chat_id": "chat-1", "path": str(self.data_dir)}, "invalid_path"),
+        ]
+        for params, code in cases:
+            with self.subTest(params=params):
+                with self.assertRaises(ControlError) as ctx:
+                    self._send(params)
+                self.assertEqual(ctx.exception.code, code)
+        self.assertEqual(self.transport.uploads, [])
+
+    def test_over_cap_image_is_rejected(self) -> None:
+        self.handler = self._make_handler(attachment_max_bytes=4)
+        self.dispatch = kited._control_dispatch(SimpleNamespace(handler=self.handler))
+        self._bind("chat-1", "s-1")
+
+        with self.assertRaises(ControlError) as ctx:
+            self._send({"chat_id": "chat-1", "path": str(self.image_path)})
+
+        self.assertEqual(ctx.exception.code, "image_too_large")
+        self.assertIn("byte cap", ctx.exception.msg)
+        self.assertEqual(self.transport.uploads, [])
+
+    def test_no_attached_chat_is_an_error(self) -> None:
+        self._bind("chat-1", "s-1", attached=False)
+
+        with self.assertRaises(ControlError) as ctx:
+            self._send({"chat_id": "chat-1", "path": str(self.image_path)})
+
+        self.assertEqual(ctx.exception.code, "no_targets")
+        self.assertEqual(self.transport.uploads, [])
 
 
 if __name__ == "__main__":
