@@ -9,12 +9,14 @@ temp dir and a real RuntimeLoop are used, so the serialization discipline
 from __future__ import annotations
 
 import base64
+import json
 import os
 import pathlib
 import re
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 
 import yaml
 
@@ -28,14 +30,17 @@ from kite.feishu_transport import (
     CardAction,
     DownloadedMessageResource,
     InboundAttachment,
+    InboundMergeForward,
     InboundMessage,
 )
+from kite.identity_names import IdentityNames
 from kite.prompt_ownership import CERTAINTY_BEST_EFFORT, PromptOwnership
 from kite.runtime_loop import RuntimeLoop
 from kite.stores.binding_store import BindingStore
 from kite.stores.group_config_store import GroupConfigStore
 from kite.stores.pending_attachment_store import PendingAttachmentStore
 from kite.stores.terminal_result_store import TerminalResultRecord, TerminalResultStore
+from test_forward_aggregator import FakeTimer
 
 ADMIN_OPEN_ID = "ou_admin"
 CHAT_ID = "oc_chat"
@@ -63,6 +68,9 @@ class FakeTransport:
         self.upload_result: str | None = "img_key_fake"
         self.sent_images: list[tuple[str, str]] = []
         self.fail_image_chats: set[str] = set()
+        self.merge_forward_items: list = []
+        self.merge_forward_error: Exception | None = None
+        self.merge_forward_fetches: list[str] = []
 
     def reply(self, chat_id: str, text: str, *, parent_message_id: str = "", reply_in_thread: bool = False) -> bool:
         self.replies.append(
@@ -92,6 +100,12 @@ class FakeTransport:
             return None
         self.sent_images.append((chat_id, image_key))
         return f"om_img_{len(self.sent_images)}"
+
+    def fetch_merge_forward_items(self, message_id: str) -> list:
+        self.merge_forward_fetches.append(message_id)
+        if self.merge_forward_error is not None:
+            raise self.merge_forward_error
+        return list(self.merge_forward_items)
 
     def last_text(self) -> str:
         assert self.replies, "expected at least one text reply"
@@ -297,6 +311,47 @@ def make_card_action(
     )
 
 
+def make_merge_forward(
+    *,
+    sender: str = ADMIN_OPEN_ID,
+    chat_id: str = CHAT_ID,
+    chat_type: str = "p2p",
+    message_id: str = "om_fwd",
+) -> InboundMergeForward:
+    return InboundMergeForward(
+        message_id=message_id,
+        chat_id=chat_id,
+        chat_type=chat_type,
+        sender_open_id=sender,
+        sender_user_id="u_1",
+        sender_type="user",
+        thread_id="",
+        root_id="",
+        parent_id="",
+        create_time=0,
+    )
+
+
+def make_forward_item(
+    message_id: str,
+    *,
+    msg_type: str = "text",
+    text: str = "",
+    sender_id: str = "ou_alice",
+    sender_type: str = "user",
+    create_time: int = 1712476800000,
+    upper_message_id: str = "",
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        message_id=message_id,
+        msg_type=msg_type,
+        upper_message_id=upper_message_id,
+        sender=SimpleNamespace(id=sender_id, sender_type=sender_type),
+        create_time=create_time,
+        body=SimpleNamespace(content=json.dumps({"text": text}, ensure_ascii=False)),
+    )
+
+
 class AppHandlerTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
@@ -311,7 +366,13 @@ class AppHandlerTestCase(unittest.TestCase):
         self.addCleanup(self.loop.stop)
         self.persisted_admins: list[set[str]] = []
         self.bound_sessions: list[str] = []
+        self.forward_timers: list[FakeTimer] = []
         self.handler = self._make_handler()
+
+    def _forward_timer_factory(self, timeout: float, callback, args: list[str]) -> FakeTimer:
+        timer = FakeTimer(timeout, callback, args)
+        self.forward_timers.append(timer)
+        return timer
 
     def _make_handler(self, *, admins: set[str] | None = None, **overrides) -> AppHandler:
         kwargs = dict(
@@ -328,6 +389,7 @@ class AppHandlerTestCase(unittest.TestCase):
             init_token=INIT_TOKEN,
             on_session_bound=self.bound_sessions.append,
             persist_admins=lambda ids: self.persisted_admins.append(set(ids)),
+            forward_timer_factory=self._forward_timer_factory,
         )
         kwargs.update(overrides)
         return AppHandler(**kwargs)
@@ -1275,6 +1337,131 @@ class AttachmentTests(AppHandlerTestCase):
         # Expired record + staged file are swept.
         self.assertEqual(self.attachment_store.list_all(), ())
         self.assertEqual(self._staged_files(), [])
+
+
+# ---------------------------------------------------------------------------
+# Merge-forward aggregation (p2p only; groups drop at ingress)
+# ---------------------------------------------------------------------------
+
+
+class MergeForwardTests(AppHandlerTestCase):
+    def _bind(self) -> None:
+        self.rest.add_session("s-1")
+        self.bind("s-1")
+
+    def test_p2p_admin_flow_end_to_end(self) -> None:
+        self._bind()
+        handler = self._make_handler(
+            names=IdentityNames(lambda open_id: {"ou_alice": "Alice"}.get(open_id))
+        )
+        self.transport.merge_forward_items = [
+            make_forward_item("om_c1", text="看看这段对话", sender_id="ou_alice"),
+        ]
+
+        handler.on_merge_forward(make_merge_forward(message_id="om_fwd"))
+
+        # Buffered, not yet submitted: the window is still open.
+        self.assertEqual(self.transport.merge_forward_fetches, ["om_fwd"])
+        self.assertEqual(len(self.forward_timers), 1)
+        self.assertEqual(self.rest.submissions, [])
+
+        self.forward_timers[-1].fire()
+
+        self.assertEqual(len(self.rest.submissions), 1)
+        submission = self.rest.submissions[0]
+        self.assertEqual(submission["session_id"], "s-1")
+        content = submission["body"]["content"]
+        self.assertEqual([part["type"] for part in content], ["text"])
+        text = content[0]["text"]
+        self.assertIn("<forwarded_messages>", text)
+        self.assertIn("</forwarded_messages>", text)
+        self.assertIn("Alice:", text)
+        self.assertIn("看看这段对话", text)
+        # The ack threads to the original merge_forward message.
+        self.assertIn("已提交", self.transport.last_text())
+        self.assertEqual(self.transport.replies[-1]["parent_message_id"], "om_fwd")
+        # Ownership is recorded like any Feishu-originated prompt.
+        entry = handler.prompt_ownership.entry_of(submission["prompt_id"])
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertEqual(entry.chat_id, CHAT_ID)
+        self.assertEqual(entry.sender_open_id, ADMIN_OPEN_ID)
+
+    def test_two_bundles_merge_into_one_prompt(self) -> None:
+        self._bind()
+        self.transport.merge_forward_items = [make_forward_item("om_c1", text="第一段")]
+
+        self.handler.on_merge_forward(make_merge_forward(message_id="om_fwd1"))
+        self.transport.merge_forward_items = [make_forward_item("om_c2", text="第二段")]
+        self.handler.on_merge_forward(make_merge_forward(message_id="om_fwd2"))
+
+        self.assertEqual(len(self.forward_timers), 2)
+        self.assertTrue(self.forward_timers[0].cancelled)
+
+        self.forward_timers[-1].fire()
+
+        self.assertEqual(len(self.rest.submissions), 1)
+        text = self.rest.submissions[0]["body"]["content"][0]["text"]
+        self.assertIn("第一段", text)
+        self.assertIn("第二段", text)
+        self.assertEqual(self.transport.replies[-1]["parent_message_id"], "om_fwd2")
+
+    def test_group_merge_forward_dropped_without_prompt_path(self) -> None:
+        self.group_config_store.activate("oc_group", activated_by=ADMIN_OPEN_ID)
+        self.rest.add_session("s-1")
+        self.bind("s-1", chat_id="oc_group")
+        self.transport.merge_forward_items = [make_forward_item("om_c1", text="群里的转发")]
+
+        self.handler.on_merge_forward(
+            make_merge_forward(chat_id="oc_group", chat_type="group", message_id="om_fwdg")
+        )
+
+        # mention_only: a forward carries no @mention, so it is dropped at
+        # ingress — no fetch, no buffer, no prompt, no reply.
+        self.assertEqual(self.transport.merge_forward_fetches, [])
+        self.assertEqual(self.forward_timers, [])
+        self.assertEqual(self.rest.calls, [])
+        self.assertEqual(self.transport.replies, [])
+
+    def test_non_admin_merge_forward_rejected(self) -> None:
+        self.handler.on_merge_forward(make_merge_forward(sender="ou_stranger"))
+
+        self.assertIn("仅对管理员开放", self.transport.last_text())
+        self.assertEqual(self.transport.merge_forward_fetches, [])
+        self.assertEqual(self.forward_timers, [])
+        self.assertEqual(self.rest.calls, [])
+
+    def test_fetch_failure_replies_and_buffers_nothing(self) -> None:
+        self.transport.merge_forward_error = RuntimeError("network down")
+
+        self.handler.on_merge_forward(make_merge_forward())
+
+        self.assertIn("获取合并转发内容失败", self.transport.last_text())
+        self.assertEqual(self.forward_timers, [])
+        self.assertEqual(self.rest.submissions, [])
+
+    def test_empty_items_replies_and_buffers_nothing(self) -> None:
+        self.transport.merge_forward_items = []
+
+        self.handler.on_merge_forward(make_merge_forward())
+
+        self.assertIn("未包含可识别的内容", self.transport.last_text())
+        self.assertEqual(self.forward_timers, [])
+        self.assertEqual(self.rest.submissions, [])
+
+    def test_close_cancels_pending_window(self) -> None:
+        self._bind()
+        self.transport.merge_forward_items = [make_forward_item("om_c1", text="x")]
+
+        self.handler.on_merge_forward(make_merge_forward())
+        self.assertEqual(len(self.forward_timers), 1)
+
+        self.handler.close()
+
+        self.assertTrue(self.forward_timers[-1].cancelled)
+        # A late fire after close finds no pending entry and submits nothing.
+        self.forward_timers[-1].fire()
+        self.assertEqual(self.rest.submissions, [])
 
 
 if __name__ == "__main__":

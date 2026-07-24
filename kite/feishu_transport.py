@@ -13,8 +13,10 @@ transport now dispatches to a ``TransportHandler`` instead. Deliberate cuts
 
 - Group-mode state machine (all / mention_only / assistant), group activation
   and per-group ACL: FOCUS kept them in the base class via GroupChatStore.
-- Merge-forward buffering and reassembly (ForwardAggregator): merge_forward
-  events are logged and skipped here.
+- Merge-forward buffering and reassembly: the transport dispatches a
+  normalized merge_forward event and fetches bundle children on demand; the
+  aggregation window and tree expansion live in the application layer
+  (``kite/forward_aggregator.py``, wired by AppHandler).
 - Group history recovery / assistant context building (GroupHistoryRecovery).
 - Admin gating and non-admin p2p bootstrap filtering: every normalized
   message is dispatched; access policy is the handler's job.
@@ -49,6 +51,7 @@ from lark_oapi.api.im.v1 import (
     CreateMessageRequest,
     CreateMessageRequestBody,
     DeleteMessageRequest,
+    GetMessageRequest,
     GetMessageResourceRequest,
     P2ImChatDisbandedV1,
     P2ImChatMemberBotDeletedV1,
@@ -177,6 +180,28 @@ class InboundAttachment:
 
 
 @dataclass(frozen=True, slots=True)
+class InboundMergeForward:
+    """A normalized inbound merge_forward message (a forwarded bundle).
+
+    The event content is the fixed string "Merged and Forwarded Message"
+    (not JSON); the child messages are fetched on demand via
+    ``FeishuTransport.fetch_merge_forward_items`` and expanded by the
+    application layer (``kite/forward_aggregator.py``).
+    """
+
+    message_id: str
+    chat_id: str
+    chat_type: str
+    sender_open_id: str
+    sender_user_id: str
+    sender_type: str
+    thread_id: str
+    root_id: str
+    parent_id: str
+    create_time: int
+
+
+@dataclass(frozen=True, slots=True)
 class CardAction:
     """A normalized card button click / form submission.
 
@@ -247,6 +272,14 @@ class TransportHandler(ABC):
 
     def on_attachment(self, attachment: InboundAttachment) -> None:
         """Handle an inbound attachment message."""
+
+    def on_merge_forward(self, message: InboundMergeForward) -> None:
+        """Handle an inbound merge_forward message (default: log and drop)."""
+        logger.info(
+            "merge_forward dropped by default handler: chat=%s message_id=%s",
+            message.chat_id,
+            message.message_id,
+        )
 
     def on_card_action(self, action: CardAction) -> CardActionResponse:
         """Handle a card button click / form submission."""
@@ -608,14 +641,23 @@ class FeishuTransport:
             logger.info("skipping duplicate message: message_id=%s", message_id)
             return
 
-        # Cut: FOCUS buffered merge_forward events here and reassembled them
-        # with the follow-up text (ForwardAggregator, group-mode aware). That
-        # is application logic; the transport logs and skips.
+        # merge_forward content is the fixed string "Merged and Forwarded
+        # Message" (not JSON), so it dispatches before content parsing; the
+        # handler fetches and expands the bundle (kite/forward_aggregator.py).
         if msg_type == "merge_forward":
-            logger.info(
-                "skipping merge_forward message at transport layer: chat=%s message_id=%s",
-                chat_id,
-                message_id,
+            self._handler.on_merge_forward(
+                InboundMergeForward(
+                    message_id=message_id,
+                    chat_id=chat_id,
+                    chat_type=chat_type,
+                    sender_open_id=sender_open_id,
+                    sender_user_id=sender_user_id,
+                    sender_type=sender_type,
+                    thread_id=thread_id,
+                    root_id=root_id,
+                    parent_id=parent_id,
+                    create_time=create_time,
+                )
             )
             return
 
@@ -1074,6 +1116,29 @@ class FeishuTransport:
             file_key,
             resource_type="file",
         ).content
+
+    def fetch_merge_forward_items(self, message_id: str) -> list[Any]:
+        """Fetch the flattened message list of a merge_forward bundle.
+
+        ``GET /open-apis/im/v1/messages/{message_id}`` on a merge_forward
+        message returns the bundle root plus every descendant in one flat
+        list (``upper_message_id`` links children to parents); the
+        application layer rebuilds the tree from it. Raises RuntimeError on
+        failure (FOCUS ``get_message_items``, same contract).
+        """
+        normalized = str(message_id or "").strip()
+        if not normalized:
+            return []
+        request = GetMessageRequest.builder().message_id(normalized).build()
+        try:
+            response = self.client.im.v1.message.get(request)
+        except Exception as e:
+            raise RuntimeError(f"merge_forward fetch failed (SDK exception): {e}") from e
+        if not response.success():
+            raise RuntimeError(
+                f"merge_forward fetch failed: code={response.code}, msg={response.msg}"
+            )
+        return list(getattr(response.data, "items", None) or [])
 
     # ---- startup ----
 

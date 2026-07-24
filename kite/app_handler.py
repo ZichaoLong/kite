@@ -24,6 +24,12 @@ Implements the MVP inbound contract (docs/contracts/mvp-scope.md):
   (first use creates+binds), slash commands stay admin-only except /abort
   (initiator-or-admin actor check), and non-@ messages are ignored entirely.
   Group activation config lives in the GroupConfigStore (state axis 5);
+- merge_forward bundles (p2p only): each merge_forward message's children
+  are fetched and buffered per (sender, chat) by the ForwardAggregator; a
+  short window later the expanded `<forwarded_messages>` transcript enters
+  the normal prompt path (admin-gated like any p2p text). Groups drop
+  forwards at ingress — a forward never carries an @mention, so the
+  mention_only ingress matrix drops it by definition;
 - the MVP slash commands (/new /sessions /switch /detach /attach /mode
   /plan /group /status /abort /help /init); in-flight-work-sensitive commands run
   the reason-coded preflights in kite/preflights.py (/new denies with an
@@ -86,15 +92,18 @@ from kite.feishu_transport import (
     DownloadedMessageResource,
     FeishuTransport,
     InboundAttachment,
+    InboundMergeForward,
     InboundMessage,
     TransportHandler,
 )
+from kite.forward_aggregator import ForwardAggregator, MergedForwardBatch
+from kite.identity_names import IdentityNames
 from kite.prompt_ownership import (
     CERTAINTY_BEST_EFFORT,
     PromptOwnership,
     PromptOwnershipEntry,
 )
-from kite.runtime_loop import RuntimeLoop
+from kite.runtime_loop import RuntimeLoop, RuntimeLoopClosedError
 from kite.stores.binding_store import (
     DEFAULT_ATTACHED,
     DEFAULT_PERMISSION_MODE,
@@ -315,6 +324,8 @@ class AppHandler(TransportHandler):
         on_session_bound: Optional[Callable[[str], None]] = None,
         persist_admins: Optional[Callable[[set[str]], None]] = None,
         terminal_store: Any = None,
+        names: Optional[IdentityNames] = None,
+        forward_timer_factory: Any = None,
     ) -> None:
         self._transport = transport
         self._ops = KapSessionOps(rest, model=prompt_model)
@@ -336,6 +347,19 @@ class AppHandler(TransportHandler):
             store=attachment_store,
             ttl_seconds=kite_config.attachment_ttl_seconds(config),
             max_bytes=self._attachment_max_bytes,
+        )
+        # Merge-forward aggregation (FOCUS forward_aggregator port, p2p
+        # only): merge_forward children buffer for a short window, then the
+        # merged transcript enters the prompt path as one message. Test
+        # doubles can inject a fake timer factory; production kited injects
+        # the shared IdentityNames cache.
+        if names is None:
+            names = IdentityNames(getattr(transport, "fetch_user_name", lambda _open_id: None))
+        self._names = names
+        self._forward_aggregator = ForwardAggregator(
+            on_batch=self._on_forward_batch,
+            name_of=self._names.name_of,
+            timer_factory=forward_timer_factory,
         )
         self._init_token = str(init_token or "").strip()
         if not self._init_token:
@@ -396,6 +420,16 @@ class AppHandler(TransportHandler):
                 "failed to handle attachment chat=%s message_id=%s",
                 attachment.chat_id,
                 attachment.message_id,
+            )
+
+    def on_merge_forward(self, message: InboundMergeForward) -> None:
+        try:
+            self._loop.call(self._on_merge_forward_impl, message)
+        except Exception:
+            logger.exception(
+                "failed to handle merge_forward chat=%s message_id=%s",
+                message.chat_id,
+                message.message_id,
             )
 
     def on_card_action(self, action: CardAction) -> CardActionResponse:
@@ -521,6 +555,93 @@ class AppHandler(TransportHandler):
             self._reply(attachment.chat_id, _NON_ADMIN_TEXT, parent_message_id=attachment.message_id)
             return
         self._attachment_domain.handle_attachment(attachment)
+
+    def _on_merge_forward_impl(self, message: InboundMergeForward) -> None:
+        if message.chat_type == "group":
+            # mention_only ingress matrix (group-chat §3.2): a forward never
+            # carries an @mention, so group forwards are dropped here by
+            # definition — no prompt, no reply, no buffer.
+            logger.info(
+                "merge_forward dropped in group chat=%s message_id=%s",
+                message.chat_id,
+                message.message_id,
+            )
+            return
+        if not self._is_admin(message.sender_open_id):
+            self._reply(message.chat_id, _NON_ADMIN_TEXT, parent_message_id=message.message_id)
+            return
+        try:
+            items = self._transport.fetch_merge_forward_items(message.message_id)
+        except Exception as exc:
+            logger.warning(
+                "merge_forward fetch failed chat=%s message_id=%s: %s",
+                message.chat_id,
+                message.message_id,
+                exc,
+            )
+            self._reply(
+                message.chat_id,
+                "获取合并转发内容失败，请稍后重试。",
+                parent_message_id=message.message_id,
+            )
+            return
+        if not items:
+            self._reply(
+                message.chat_id,
+                "合并转发的消息中未包含可识别的内容。",
+                parent_message_id=message.message_id,
+            )
+            return
+        self._forward_aggregator.buffer(
+            sender_open_id=message.sender_open_id,
+            chat_id=message.chat_id,
+            message_id=message.message_id,
+            items=items,
+        )
+
+    def _on_forward_batch(self, batch: MergedForwardBatch) -> None:
+        """Aggregator flush callback (timer thread): re-enter the RuntimeLoop."""
+        try:
+            self._loop.call(self._submit_merged_forward, batch)
+        except RuntimeLoopClosedError:
+            logger.info(
+                "runtime loop closed, merged forward dropped: chat=%s", batch.chat_id
+            )
+        except Exception:
+            logger.exception(
+                "failed to submit merged forward chat=%s message_id=%s",
+                batch.chat_id,
+                batch.message_id,
+            )
+
+    def _submit_merged_forward(self, batch: MergedForwardBatch) -> None:
+        """The flushed transcript enters the normal p2p prompt path."""
+        if not self._is_admin(batch.sender_open_id):
+            # Defense in depth: the admin gate ran at ingress; the admin set
+            # cannot shrink at runtime, so this never fires in practice.
+            logger.info(
+                "merged forward from non-admin dropped: chat=%s", batch.chat_id
+            )
+            return
+        message = InboundMessage(
+            message_id=batch.message_id,
+            chat_id=batch.chat_id,
+            chat_type="p2p",
+            msg_type="merge_forward",
+            text=batch.text,
+            sender_open_id=batch.sender_open_id,
+            sender_user_id="",
+            sender_type="user",
+            bot_mentioned=False,
+            mentions=[],
+            thread_id="",
+            root_id="",
+            parent_id="",
+            create_time=0,
+        )
+        if self.try_handle_interaction_reply(message):
+            return
+        self._handle_prompt(message)
 
     def _download_image_resource(
         self, message_id: str, resource_key: str
@@ -1423,6 +1544,14 @@ class AppHandler(TransportHandler):
             )
         self._ownership.rebuild(entries)
         logger.info("prompt ownership rebuilt best-effort: %d entries", len(entries))
+
+    def close(self) -> None:
+        """kited shutdown: cancel pending forward-aggregation timers.
+
+        Buffered-but-unflushed forwards are dropped (fail-closed): a prompt
+        submitted mid-shutdown could not deliver its cards anyway.
+        """
+        self._forward_aggregator.close()
 
     # ------------------------------------------------------------------
     # Small helpers

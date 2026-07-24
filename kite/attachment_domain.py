@@ -48,15 +48,15 @@ ATTACHMENT_STAGE_DIRNAME = "_feishu_attachments"
 
 # Per-type explicit rejection texts (contract §2.1). file/audio/media are
 # downloadable by the transport but not admitted in the first cut;
-# folder/sticker/merge_forward cannot be downloaded over the Feishu API at
-# all.
+# folder/sticker cannot be downloaded over the Feishu API at all.
+# merge_forward is not an attachment: it dispatches to on_merge_forward and
+# never reaches this domain (kite/forward_aggregator.py).
 _UNSUPPORTED_ATTACHMENT_TEXTS = {
     "file": "暂不支持文件附件（当前仅支持图片）。如需处理本地文件，请放入会话工作目录后用文字说明路径。",
     "audio": "暂不支持音频附件（当前仅支持图片）。",
     "media": "暂不支持音视频附件（当前仅支持图片）。",
     "folder": "文件夹消息无法通过飞书 API 下载，暂不支持。",
     "sticker": "暂不支持表情包作为附件。",
-    "merge_forward": "暂不支持合并转发消息作为附件。",
 }
 
 _EXPIRED_BLOCK_TEXT = "附件已过期，请重新发送。"

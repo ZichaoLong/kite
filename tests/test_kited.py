@@ -208,6 +208,9 @@ class _FakeControlHandler:
     def rebuild_prompt_ownership(self) -> None:
         pass
 
+    def close(self) -> None:
+        pass
+
     def submit_prompt_control(self, params: dict) -> dict:
         self.submit_calls.append(dict(params))
         return {

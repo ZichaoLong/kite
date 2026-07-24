@@ -202,7 +202,6 @@ class StagingTests(AttachmentDomainTestCase):
             "media": "暂不支持音视频附件",
             "folder": "文件夹消息无法通过飞书 API 下载",
             "sticker": "暂不支持表情包",
-            "merge_forward": "暂不支持合并转发",
             "post": "暂不支持 `post` 类型的附件",
         }
         for attachment_type, expected in expectations.items():

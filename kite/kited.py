@@ -85,6 +85,10 @@ class _TransportHandlerProxy(TransportHandler):
         if self.impl is not None:
             self.impl.on_attachment(attachment)
 
+    def on_merge_forward(self, message: Any) -> None:
+        if self.impl is not None:
+            self.impl.on_merge_forward(message)
+
     def on_card_action(self, action: Any) -> Any:
         if self.impl is not None:
             return self.impl.on_card_action(action)
@@ -157,6 +161,9 @@ def build_outbound_runtime(
             "as failed terminal cards"
         )
     terminal_store = TerminalResultStore(data_dir)
+    # One shared display-name cache: the pipeline's routing hints and the
+    # forward aggregator's transcript sender names read through it.
+    names = IdentityNames(transport.fetch_user_name)
     pipeline = EventPipeline(
         transport=transport,
         rest=rest_proxy,
@@ -167,7 +174,7 @@ def build_outbound_runtime(
         cursor_store=EventCursorStore(data_dir),
         approval_timeout_seconds=kite_config.approval_timeout_seconds(config),
         question_timeout_seconds=cards.DEFAULT_QUESTION_TIMEOUT_SECONDS,
-        names=IdentityNames(transport.fetch_user_name),
+        names=names,
     )
     handler = OutboundAppHandler(
         event_pipeline=pipeline,
@@ -183,6 +190,7 @@ def build_outbound_runtime(
         prompt_ownership=ownership,
         on_session_bound=ws_hook,
         terminal_store=terminal_store,
+        names=names,
     )
     handler_proxy.impl = handler
 
@@ -392,7 +400,10 @@ def run(
             # pending approvals/questions upstream — the rest proxy must stay
             # live until it has run (the barrier drains the loop), then the
             # timers are cancelled and the loop stops. The Feishu transport
-            # thread is daemonic (lark has no stop()).
+            # thread is daemonic (lark has no stop()). The handler's close()
+            # first cancels pending forward-aggregation timers so no flush
+            # can dispatch into a stopping loop.
+            outbound.handler.close()
             outbound.pipeline.shutdown()
             outbound.runtime_loop.call(lambda: None)
             outbound.rest_proxy.set_client(None)

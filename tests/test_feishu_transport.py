@@ -12,6 +12,7 @@ from kite.feishu_transport import (
     CardActionResponse,
     FeishuTransport,
     InboundAttachment,
+    InboundMergeForward,
     InboundMessage,
     TransportHandler,
 )
@@ -21,6 +22,7 @@ class _RecordingHandler(TransportHandler):
     def __init__(self) -> None:
         self.messages: list[InboundMessage] = []
         self.attachments: list[InboundAttachment] = []
+        self.merge_forwards: list[InboundMergeForward] = []
         self.card_actions: list[CardAction] = []
         self.card_action_response = CardActionResponse()
         self.card_action_error: Exception | None = None
@@ -36,6 +38,9 @@ class _RecordingHandler(TransportHandler):
 
     def on_attachment(self, attachment: InboundAttachment) -> None:
         self.attachments.append(attachment)
+
+    def on_merge_forward(self, message: InboundMergeForward) -> None:
+        self.merge_forwards.append(message)
 
     def on_card_action(self, action: CardAction) -> CardActionResponse:
         self.card_actions.append(action)
@@ -243,7 +248,7 @@ class InboundDispatchTests(unittest.TestCase):
 
         self.assertEqual(handler.messages, [])
 
-    def test_merge_forward_skipped_at_transport(self) -> None:
+    def test_merge_forward_dispatches_normalized_event(self) -> None:
         handler = _RecordingHandler()
         transport = _make_transport(handler)
 
@@ -252,11 +257,41 @@ class InboundDispatchTests(unittest.TestCase):
                 message_id="om-fwd",
                 msg_type="merge_forward",
                 raw_content="Merged and Forwarded Message",
+                thread_id="omt-1",
+                root_id="om-root",
+                parent_id="om-parent",
             )
         )
 
+        # merge_forward never reaches the message or attachment callbacks.
         self.assertEqual(handler.messages, [])
         self.assertEqual(handler.attachments, [])
+        self.assertEqual(len(handler.merge_forwards), 1)
+        forward = handler.merge_forwards[0]
+        self.assertEqual(forward.message_id, "om-fwd")
+        self.assertEqual(forward.chat_id, "oc-1")
+        self.assertEqual(forward.chat_type, "p2p")
+        self.assertEqual(forward.sender_open_id, "ou-1")
+        self.assertEqual(forward.sender_user_id, "u-1")
+        self.assertEqual(forward.sender_type, "user")
+        self.assertEqual(forward.thread_id, "omt-1")
+        self.assertEqual(forward.root_id, "om-root")
+        self.assertEqual(forward.parent_id, "om-parent")
+        self.assertEqual(forward.create_time, 1712476800000)
+
+    def test_merge_forward_duplicate_dispatched_once(self) -> None:
+        handler = _RecordingHandler()
+        transport = _make_transport(handler)
+        event = _message_event(
+            message_id="om-fwd-dup",
+            msg_type="merge_forward",
+            raw_content="Merged and Forwarded Message",
+        )
+
+        transport._on_raw_message(event)
+        transport._on_raw_message(event)
+
+        self.assertEqual(len(handler.merge_forwards), 1)
 
     def test_image_message_dispatches_attachment(self) -> None:
         handler = _RecordingHandler()
@@ -613,6 +648,44 @@ class AttachmentDownloadTests(unittest.TestCase):
 
         with self.assertRaises(RuntimeError):
             transport.download_message_resource("om-1", "file-key-1", resource_type="file")
+
+
+class MergeForwardFetchTests(unittest.TestCase):
+    def _transport_with_mock_client(self) -> tuple[FeishuTransport, Mock]:
+        transport = _make_transport()
+        transport.client = Mock()
+        return transport, transport.client
+
+    def test_fetch_merge_forward_items(self) -> None:
+        transport, client = self._transport_with_mock_client()
+        items = [SimpleNamespace(message_id="om-root"), SimpleNamespace(message_id="om-child")]
+        client.im.v1.message.get.return_value = _ok_response(items=items)
+
+        fetched = transport.fetch_merge_forward_items("om-root")
+
+        self.assertEqual(fetched, items)
+        request = client.im.v1.message.get.call_args.args[0]
+        self.assertEqual(request.message_id, "om-root")
+
+    def test_fetch_merge_forward_items_empty_id_returns_empty(self) -> None:
+        transport, client = self._transport_with_mock_client()
+
+        self.assertEqual(transport.fetch_merge_forward_items(""), [])
+        client.im.v1.message.get.assert_not_called()
+
+    def test_fetch_merge_forward_items_failure_raises(self) -> None:
+        transport, client = self._transport_with_mock_client()
+        client.im.v1.message.get.return_value = _fail_response()
+
+        with self.assertRaises(RuntimeError):
+            transport.fetch_merge_forward_items("om-root")
+
+    def test_fetch_merge_forward_items_sdk_exception_raises(self) -> None:
+        transport, client = self._transport_with_mock_client()
+        client.im.v1.message.get.side_effect = RuntimeError("network down")
+
+        with self.assertRaises(RuntimeError):
+            transport.fetch_merge_forward_items("om-root")
 
 
 class ImageUploadTests(unittest.TestCase):
