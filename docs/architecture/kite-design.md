@@ -149,7 +149,9 @@ Carry over FOCUS experience, rewritten to kap event semantics:
   at any moment, anchored by `{chat_id, session_id, prompt_id,
   card_message_id}`; prompt-scoped events must match prompt_id to modify the
   card (kap's prompt FIFO semantics make this simpler than FOCUS's turn
-  matching: queued prompts do not create a card; only started ones do).
+  matching: queued prompts do not create a card; only started ones do). The
+  running card carries a 取消执行 button (same permission rule as `/abort`;
+  mvp-scope aligned item 9).
 - **Terminal result card**: when a prompt finishes (completed/aborted/failed),
   send a separate terminal result card and freeze the execution card; the
   terminal text is stored locally for `/last`-style commands to read.

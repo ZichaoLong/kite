@@ -241,6 +241,15 @@ def run(
     recovered = False
     if outbound is not None:
         outbound.runtime_loop.start()
+        # Group mention triggering needs the bot's own open_id; discover it
+        # before any inbound message can arrive (fail-closed when missing).
+        discovered_open_id = outbound.transport.fetch_bot_open_id()
+        if discovered_open_id:
+            outbound.transport.set_bot_open_id(discovered_open_id)
+        else:
+            logger.error(
+                "bot identity discovery failed; group mention triggering stays disabled"
+            )
         outbound.transport_thread.start()
         outbound.pipeline.set_snapshot_rebuilt_hook(
             lambda _sid, _snap: status.update(ws={"last_resync_at": time.time()})

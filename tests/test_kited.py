@@ -228,6 +228,10 @@ class KitedControlPlaneTests(KitedRunTests):
         self.fake_outbound = SimpleNamespace(
             runtime_loop=RuntimeLoop(name="test-runtime"),
             transport_thread=threading.Thread(target=lambda: None, daemon=True),
+            transport=SimpleNamespace(
+                fetch_bot_open_id=lambda: "ou-fake-bot",
+                set_bot_open_id=lambda open_id: None,
+            ),
             pipeline=_FakePipeline(),
             rest_proxy=_FakeSwap(),
             ws_hook=_FakeSwap(),

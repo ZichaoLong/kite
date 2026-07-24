@@ -662,5 +662,44 @@ class StartTests(unittest.TestCase):
             _make_transport(feishu_ws_proxy="bogus")
 
 
+class BotIdentityTests(unittest.TestCase):
+    def test_fetch_bot_open_id_success(self) -> None:
+        transport = _make_transport()
+        response = Mock()
+        response.success.return_value = True
+        response.raw.content = json.dumps({"bot": {"open_id": "ou_discovered"}})
+        transport.client = Mock()
+        transport.client.request.return_value = response
+
+        self.assertEqual(transport.fetch_bot_open_id(), "ou_discovered")
+
+    def test_fetch_bot_open_id_failure_returns_none(self) -> None:
+        transport = _make_transport()
+        response = Mock()
+        response.success.return_value = False
+        response.code = 500
+        response.msg = "err"
+        transport.client = Mock()
+        transport.client.request.return_value = response
+
+        self.assertIsNone(transport.fetch_bot_open_id())
+
+    def test_fetch_bot_open_id_exception_returns_none(self) -> None:
+        transport = _make_transport()
+        transport.client = Mock()
+        transport.client.request.side_effect = RuntimeError("boom")
+
+        self.assertIsNone(transport.fetch_bot_open_id())
+
+    def test_set_bot_open_id_enables_mention_detection(self) -> None:
+        transport = _make_transport(bot_open_id="")
+        mentions = [{"key": "@_user_1", "name": "KiteBot", "id": {"open_id": "ou_x"}}]
+        self.assertFalse(transport._is_bot_mentioned(mentions))
+
+        transport.set_bot_open_id("ou_x")
+
+        self.assertTrue(transport._is_bot_mentioned(mentions))
+
+
 if __name__ == "__main__":
     unittest.main()

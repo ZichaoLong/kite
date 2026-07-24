@@ -541,6 +541,8 @@ class AppHandler(TransportHandler):
             return self.handle_approval_action(action)
         if name in QUESTION_CARD_ACTIONS:
             return self.handle_question_action(action)
+        if name == cards.ACTION_PROMPT_ABORT:
+            return self.handle_abort_action(action)
         logger.info("ignoring unknown card action: %r", name)
         return CardActionResponse()
 
@@ -1331,6 +1333,14 @@ class AppHandler(TransportHandler):
         logger.info(
             "question card action ignored (outbound path not wired): action=%s value=%s",
             action.value.get("action"),
+            action.value,
+        )
+        return CardActionResponse()
+
+    def handle_abort_action(self, action: CardAction) -> CardActionResponse:
+        """E3 seam: execution-card cancel button. Default is a no-op-with-log."""
+        logger.info(
+            "abort card action ignored (outbound path not wired): value=%s",
             action.value,
         )
         return CardActionResponse()

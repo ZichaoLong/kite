@@ -77,6 +77,7 @@ TerminalOutcome = Literal["completed", "aborted", "failed"]
 # resolves rejected+feedback).
 ACTION_APPROVAL_RESOLVE = "approval_resolve"
 ACTION_APPROVAL_REJECT_WITH_FEEDBACK = "approval_reject_with_feedback"
+ACTION_PROMPT_ABORT = "prompt_abort"
 
 # kap approval decisions (packages/protocol/src/approval.ts).
 APPROVAL_DECISION_APPROVED = "approved"
@@ -215,13 +216,16 @@ def build_execution_card(
     queue_length: int = 0,
     tool_lines: Sequence[str] = (),
     reply_text: str = "",
+    prompt_id: str = "",
 ) -> dict:
     """Build the execution card for one started prompt.
 
     - running: live card, patched as durable events arrive; header carries the
       elapsed seconds and the body shows the FIFO queue length behind the
       active prompt (mvp-scope §3: no interrupt surface, the queue is only
-      *shown*).
+      *shown*). When ``prompt_id`` is given, the running card carries a
+      取消执行 button (same permission rule as /abort: initiator or admin;
+      idempotent — an already-finished prompt answers "已结束").
     - frozen-done: the prompt finished; the card stays as the frozen process
       record next to the separate terminal card.
     - frozen-unknown: the WS stream broke and the snapshot rebuild failed —
@@ -299,6 +303,25 @@ def build_execution_card(
                 },
                 "elements": [
                     _markdown(sanitize_runtime_markdown_for_feishu_card(tool_text))
+                ],
+            }
+        )
+
+    if state == EXECUTION_STATE_RUNNING and prompt_id:
+        elements.append(
+            {
+                "tag": "action",
+                "actions": [
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "取消执行"},
+                        "type": "danger",
+                        "value": {
+                            "action": ACTION_PROMPT_ABORT,
+                            "prompt_id": prompt_id,
+                            "session_id": session_id,
+                        },
+                    }
                 ],
             }
         )

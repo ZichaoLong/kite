@@ -143,3 +143,6 @@ explicitly; "best-effort" silent degradation is forbidden:
    responded upstream (approvals → rejected, questions → dismissed) and the
    cards are patched to expired/closed locally, even when kap is unreachable
    (2026-07-23).
+9. The running execution card carries a 取消执行 button (same permission
+   rule as `/abort`: initiator or admin); clicks are idempotent — an
+   already-finished prompt answers "已结束" (40402) (2026-07-24).

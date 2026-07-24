@@ -315,6 +315,40 @@ class FeishuTransport:
             .register_p2_application_bot_menu_v6(self._on_raw_bot_menu) \
             .build()
 
+    def set_bot_open_id(self, open_id: str) -> None:
+        """Install a (newly discovered) bot open_id at runtime."""
+        normalized = str(open_id or "").strip()
+        if normalized:
+            self._configured_bot_open_id = normalized
+            self._bot_open_id_error_logged = False
+
+    def fetch_bot_open_id(self) -> str | None:
+        """Discover this bot's open_id via ``GET /open-apis/bot/v3/info/``.
+
+        Group mention triggering needs the bot's own open_id; discovering it
+        beats configuring it (FOCUS's `_fetch_bot_open_id`, same contract:
+        failure returns None and the caller keeps the fail-closed default).
+        """
+        try:
+            req = lark.BaseRequest.builder() \
+                .http_method(lark.HttpMethod.GET) \
+                .uri("/open-apis/bot/v3/info/") \
+                .token_types({lark.AccessTokenType.TENANT}) \
+                .build()
+            resp = self.client.request(req)
+            if not resp.success():
+                logger.warning("bot info fetch failed: code=%s msg=%s", resp.code, resp.msg)
+                return None
+            data = json.loads(resp.raw.content)
+            open_id = (data.get("bot") or {}).get("open_id")
+            if isinstance(open_id, str) and open_id.strip():
+                logger.info("bot identity discovered: open_id=%s", open_id)
+                return open_id.strip()
+            return None
+        except Exception as exc:  # noqa: BLE001 - discovery is best-effort
+            logger.warning("bot info fetch raised: %s", exc)
+            return None
+
     # ---- inbound: dedup ----
 
     def _is_duplicate(self, message_id: str) -> bool:

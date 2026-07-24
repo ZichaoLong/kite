@@ -125,7 +125,8 @@ gate。登记在 `docs/decisions/concurrency-model.md`，等产品证明需要�
 - **单锚点执行卡**：同一 chat 任一时刻最多一张当前执行卡，由
   `{chat_id, session_id, prompt_id, card_message_id}` 锚定；prompt-scoped
   事件必须匹配 prompt_id 才能改卡（kap 的 prompt FIFO 语义使这比 FOCUS 的
-  turn 匹配更简单： queued prompt 不建卡，started 才建）。
+  turn 匹配更简单： queued prompt 不建卡，started 才建）。执行中的卡片带
+  "取消执行"按钮（与 `/abort` 同权限；mvp-scope 已对齐 9)。
 - **终态卡**:prompt 完成（completed/aborted/失败）后发独立终态卡，执行卡
   定格；终态文本落本地 store 供 `/last` 类命令读取。
 - **审批卡**:approval.requested → 三键卡（批准/拒绝/反馈）,REST 响应后

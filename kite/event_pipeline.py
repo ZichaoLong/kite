@@ -95,7 +95,7 @@ from kite.adapters.kap_server import (
     TurnStarted,
     normalize_durable_event,
 )
-from kite.app_handler import AppHandler, KapSessionOps
+from kite.app_handler import AppHandler, KAP_ERROR_PROMPT_NOT_PENDING, KapSessionOps
 from kite.cards import ExecutionCardAnchor
 from kite.feishu_transport import CardAction, CardActionResponse, InboundMessage
 from kite.message_patch_result import MessagePatchResult
@@ -568,6 +568,7 @@ class EventPipeline:
             session_id=session_id,
             prompt_text=prompt_text,
             queue_length=queue_length,
+            prompt_id=prompt_id,
         )
         message_id = self._send_card(chat_id, card)
         if not message_id:
@@ -1073,6 +1074,7 @@ class EventPipeline:
             queue_length=state.queue_length,
             tool_lines=state.tool_lines,
             reply_text=self._stream_projection(state),
+            prompt_id=state.anchor.prompt_id,
         )
         return json.dumps(card)
 
@@ -1384,6 +1386,47 @@ class EventPipeline:
                 "群聊中需 @机器人 回复）。"
             )
         return CardActionResponse()
+
+    def handle_abort_action(
+        self,
+        action: CardAction,
+        *,
+        is_admin: Optional[Callable[[str], bool]] = None,
+    ) -> CardActionResponse:
+        """Execution-card cancel button (AppHandler seam; runs on the loop).
+
+        Same permission rule as /abort: the prompt initiator or an admin
+        (group-chat §3.3 actor check; bystanders get a denial toast). The
+        click is idempotent: an already-finished prompt answers "已结束"
+        (upstream 40402), never an error.
+        """
+        prompt_id = str(action.value.get("prompt_id") or "").strip()
+        session_id = str(action.value.get("session_id") or "").strip()
+        if not prompt_id or not session_id:
+            logger.warning("abort action with malformed value: %r", action.value)
+            return CardActionResponse(toast="操作无效。", toast_type="error")
+        if not self._is_interaction_actor(prompt_id, action.operator_open_id, is_admin):
+            logger.warning(
+                "abort action by non-actor prompt=%s operator=%s",
+                prompt_id,
+                action.operator_open_id,
+            )
+            return CardActionResponse(
+                toast="只有该 prompt 的发起者或管理员可以取消执行。", toast_type="error"
+            )
+        try:
+            self._session_ops.abort_prompt(session_id, prompt_id)
+        except KapError as exc:
+            if exc.code == KAP_ERROR_PROMPT_NOT_PENDING:
+                return CardActionResponse(toast="该 prompt 已结束。")
+            logger.warning("abort action upstream error prompt=%s: %s", prompt_id, exc)
+            return CardActionResponse(toast=f"中止失败：{exc.msg}", toast_type="error")
+        except KapTransportError:
+            return CardActionResponse(
+                toast="中止失败：无法连接 kap-server，请稍后重试。", toast_type="error"
+            )
+        logger.info("abort requested from card session=%s prompt=%s", session_id, prompt_id)
+        return CardActionResponse(toast="已发起中止。")
 
     def _is_interaction_actor(
         self,
@@ -2002,6 +2045,7 @@ class EventPipeline:
             queue_length=state.queue_length,
             tool_lines=state.tool_lines,
             reply_text=self._stream_projection(state),
+            prompt_id=state.anchor.prompt_id,
         )
         self._patch_card(state.anchor.card_message_id, card)
 
@@ -2181,6 +2225,11 @@ class OutboundAppHandler(AppHandler):
         # The actor check (group-chat §3.3) needs the admin set, which the
         # handler owns; the pipeline owns the pending-approval state.
         return self._event_pipeline.handle_approval_action(action, is_admin=self._is_admin)
+
+    def handle_abort_action(self, action: CardAction) -> CardActionResponse:
+        # Same split as approvals: the pipeline owns the abort, the handler
+        # owns the admin set for the actor check.
+        return self._event_pipeline.handle_abort_action(action, is_admin=self._is_admin)
 
     def try_handle_interaction_reply(self, message: InboundMessage) -> bool:
         return self._event_pipeline.try_handle_interaction_reply(

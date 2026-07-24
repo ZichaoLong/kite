@@ -4,6 +4,7 @@ import unittest
 from kite.cards import (
     ACTION_APPROVAL_REJECT_WITH_FEEDBACK,
     ACTION_APPROVAL_RESOLVE,
+    ACTION_PROMPT_ABORT,
     APPROVAL_ALREADY_PROCESSED_NOTICE,
     EXECUTION_STATE_FROZEN_DONE,
     EXECUTION_STATE_FROZEN_UNKNOWN,
@@ -117,6 +118,31 @@ class ExecutionCardTests(unittest.TestCase):
         text = "\n".join(_collect_markdown(card))
         self.assertIn("我的会话", text)
         self.assertIn("帮我修复测试", text)
+
+    def test_running_card_with_prompt_id_has_cancel_button(self) -> None:
+        card = self._build(state=EXECUTION_STATE_RUNNING, prompt_id="p-1")
+        buttons = _collect_buttons(card)
+        self.assertEqual(len(buttons), 1)
+        self.assertEqual(buttons[0]["text"]["content"], "取消执行")
+        self.assertEqual(buttons[0]["type"], "danger")
+        self.assertEqual(
+            buttons[0]["value"],
+            {
+                "action": ACTION_PROMPT_ABORT,
+                "prompt_id": "p-1",
+                "session_id": "sess-1234567890",
+            },
+        )
+
+    def test_running_card_without_prompt_id_has_no_button(self) -> None:
+        card = self._build(state=EXECUTION_STATE_RUNNING)
+        self.assertEqual(_collect_buttons(card), [])
+
+    def test_frozen_cards_have_no_button(self) -> None:
+        for state in (EXECUTION_STATE_FROZEN_DONE, EXECUTION_STATE_FROZEN_UNKNOWN):
+            with self.subTest(state=state):
+                card = self._build(state=state, prompt_id="p-1")
+                self.assertEqual(_collect_buttons(card), [])
 
     def test_running_card_without_elapsed(self) -> None:
         card = self._build()

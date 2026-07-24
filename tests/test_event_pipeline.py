@@ -126,6 +126,8 @@ class FakeInteractionRest:
         self.dismiss_error: Exception | None = None
         self.prompts_error: Exception | None = None
         self.messages_error: Exception | None = None
+        self.abort_error: Exception | None = None
+        self.aborts: list[tuple[str, str]] = []
         # Fired inside the approval-resolve POST, before it returns (used to
         # re-enter the handler mid-flight for the click-guard tests).
         self.resolve_hook: object = None
@@ -220,6 +222,12 @@ class FakeInteractionRest:
                 "content": [],
                 "created_at": "2026-01-01T00:00:00Z",
             }
+        match = re.fullmatch(r"/sessions/([^/]+)/prompts/([^/]+):abort", path)
+        if method == "POST" and match:
+            if self.abort_error is not None:
+                raise self.abort_error
+            self.aborts.append((match.group(1), match.group(2)))
+            return {"aborted": True}
         raise AssertionError(f"unexpected kap call: {method} {path}")
 
     def get(self, path: str) -> object:
@@ -1792,6 +1800,55 @@ class GroupActorTests(PipelineTestCase):
         self.handler.on_message(make_group_message("1", sender=OTHER_OPEN_ID))
 
         self.assertEqual(len(self.rest.question_answers), 1)
+
+
+# ---------------------------------------------------------------------------
+# Execution-card cancel button (same actor rule as /abort)
+# ---------------------------------------------------------------------------
+
+
+class AbortActionTests(PipelineTestCase):
+    def _action(self, *, operator: str = ADMIN_OPEN_ID, prompt_id: str = "p-1") -> CardAction:
+        return make_card_action(
+            {"action": cards.ACTION_PROMPT_ABORT, "prompt_id": prompt_id, "session_id": SESSION_ID},
+            operator=operator,
+        )
+
+    def test_initiator_click_aborts(self) -> None:
+        self.bind(CHAT_ID)
+        self.ownership.record("p-1", CHAT_ID, sender_open_id=ADMIN_OPEN_ID)
+        response = self.handler.handle_abort_action(self._action())
+        self.assertEqual(self.rest.aborts, [(SESSION_ID, "p-1")])
+        self.assertIn("已发起中止", response.toast or "")
+
+    def test_admin_click_aborts_when_not_initiator(self) -> None:
+        self.bind(CHAT_ID)
+        self.ownership.record("p-1", CHAT_ID, sender_open_id="ou_someone_else")
+        response = self.handler.handle_abort_action(self._action())
+        self.assertEqual(self.rest.aborts, [(SESSION_ID, "p-1")])
+        self.assertIn("已发起中止", response.toast or "")
+
+    def test_bystander_click_denied_without_rest_call(self) -> None:
+        self.bind(CHAT_ID)
+        self.ownership.record("p-1", CHAT_ID, sender_open_id=ADMIN_OPEN_ID)
+        response = self.handler.handle_abort_action(self._action(operator="ou_bystander"))
+        self.assertEqual(self.rest.aborts, [])
+        self.assertIn("发起者或管理员", response.toast or "")
+
+    def test_finished_prompt_answers_ended(self) -> None:
+        self.bind(CHAT_ID)
+        self.ownership.record("p-1", CHAT_ID, sender_open_id=ADMIN_OPEN_ID)
+        self.rest.abort_error = KapError(40402, "one or more prompts are not pending")
+        response = self.handler.handle_abort_action(self._action())
+        self.assertIn("已结束", response.toast or "")
+
+    def test_malformed_value_is_an_error_toast(self) -> None:
+        self.bind(CHAT_ID)
+        response = self.handler.handle_abort_action(
+            make_card_action({"action": cards.ACTION_PROMPT_ABORT, "prompt_id": ""})
+        )
+        self.assertEqual(self.rest.aborts, [])
+        self.assertIn("操作无效", response.toast or "")
 
 
 if __name__ == "__main__":
