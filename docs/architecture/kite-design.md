@@ -105,6 +105,12 @@ more (registered 2026-07-23, before any code — see
    inbound attachments keyed by `(sender_open_id, chat_id)`. Files are
    validated at consume time; expired/missing blocks the prompt
    (fail-closed).
+7. **assistant log** (local, persistent; Phase 2 assistant group mode):
+   per-chat JSONL message log with a monotonic `seq`, plus the trigger
+   **boundary triple** `{seq, created_at, message_ids}` (same-millisecond
+   messages make a bare timestamp unsafe as a cursor). After a restart the
+   log covers recent history and the boundary dedups the Feishu REST
+   history backfill exactly (`docs/contracts/group-chat.md` §1).
 
 **Reserved concepts (not implemented)**: interaction owner (write-exclusive
 lease), cross-instance loaded gate. Registered in

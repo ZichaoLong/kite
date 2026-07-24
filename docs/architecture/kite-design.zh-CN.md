@@ -90,6 +90,11 @@ MVP 承认四条轴，每条都有明确 owner。Phase 2 新增两条（2026-07-
 6. **附件暂存**（本地，持久，带 TTL;Phase 2)：以 `(sender_open_id,
    chat_id)` 为键的待消费入站附件。消费时校验文件；过期/缺失阻断
    prompt(fail-closed)。
+7. **assistant 日志**（本地，持久；Phase 2 assistant 群模式）：每群
+   JSONL 消息日志（单调 `seq`）加触发**边界三元组** `{seq,
+   created_at, message_ids}`（同毫秒多消息使裸时间戳不能充当
+   cursor)。重启后日志覆盖近期历史，边界与飞书 REST 历史回填精确
+   去重（`docs/contracts/group-chat.md` §1)。
 
 **预留概念（不实现）**:interaction owner（写入独占租约）、跨实例 loaded
 gate。登记在 `docs/decisions/concurrency-model.md`，等产品证明需要时再引入；
