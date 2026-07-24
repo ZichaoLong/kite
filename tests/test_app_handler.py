@@ -569,6 +569,33 @@ class BindingCommandTests(AppHandlerTestCase):
         self.assertIn("用法", self.transport.last_text())
         self.assertEqual(self.rest.calls, [])
 
+    def test_new_denied_while_prompt_active(self) -> None:
+        self.bind("s-old")
+        self.rest.set_prompts("s-old", active="p-1")
+        self.send("/new")
+        self.assertIn("请先 /abort 或等待完成", self.transport.last_text())
+        binding = self.store.load(CHAT_ID)
+        assert binding is not None
+        self.assertEqual(binding["session_id"], "s-old")
+        # No new session was created upstream.
+        self.assertNotIn(("POST", "/sessions"), [(m, p) for m, p, _ in self.rest.calls])
+
+    def test_new_allowed_when_only_queued_prompts(self) -> None:
+        self.bind("s-old")
+        self.rest.set_prompts("s-old", active=None, queued=("p-2",))
+        self.send("/new")
+        self.assertIn("已创建并绑定新会话", self.transport.last_text())
+
+    def test_new_preflight_unverifiable_is_fail_closed(self) -> None:
+        self.bind("s-old")
+        self.rest.prompts_error = KapTransportError("down")
+        self.send("/new")
+        self.assertIn("无法连接 kap-server", self.transport.last_text())
+        binding = self.store.load(CHAT_ID)
+        assert binding is not None
+        self.assertEqual(binding["session_id"], "s-old")
+        self.assertNotIn(("POST", "/sessions"), [(m, p) for m, p, _ in self.rest.calls])
+
     def test_switch_rebinds_and_announces(self) -> None:
         self.rest.add_session("s-2", title="Beta")
         self.send("/switch s-2")
@@ -619,6 +646,28 @@ class BindingCommandTests(AppHandlerTestCase):
         self.assertFalse(binding["attached"])
         self.assertEqual(binding["session_id"], "s-1")
         self.assertIn("已暂停", self.transport.last_text())
+        self.assertNotIn("仍在继续", self.transport.last_text())
+
+    def test_detach_notes_active_prompt_continues(self) -> None:
+        self.bind("s-1")
+        self.rest.set_prompts("s-1", active="p-1")
+        self.send("/detach")
+        text = self.transport.last_text()
+        self.assertIn("已暂停", text)
+        self.assertIn("执行中的 prompt 仍在继续，推送已暂停", text)
+        binding = self.store.load(CHAT_ID)
+        assert binding is not None
+        self.assertFalse(binding["attached"])
+
+    def test_detach_when_prompts_unverifiable_still_detaches(self) -> None:
+        self.bind("s-1")
+        self.rest.prompts_error = KapTransportError("down")
+        self.send("/detach")
+        self.assertIn("已暂停", self.transport.last_text())
+        self.assertNotIn("仍在继续", self.transport.last_text())
+        binding = self.store.load(CHAT_ID)
+        assert binding is not None
+        self.assertFalse(binding["attached"])
 
     def test_detach_when_already_detached(self) -> None:
         self.bind("s-1", attached=False)

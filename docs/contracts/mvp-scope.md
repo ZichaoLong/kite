@@ -137,3 +137,9 @@ explicitly; "best-effort" silent degradation is forbidden:
 6. Spike Milestone 0 passed on kimi 0.28.1 (2026-07-21;
    `docs/verification/spike-results.md`); the `/abort` row now covers the
    observed 40402 re-abort behavior.
+7. `/new` is denied while the bound session has an active prompt (fail-closed:
+   in-flight work must not lose its visibility) (2026-07-23).
+8. kited shutdown fail-closes all pending approvals/questions: they are
+   responded upstream (approvals → rejected, questions → dismissed) and the
+   cards are patched to expired/closed locally, even when kap is unreachable
+   (2026-07-23).

@@ -36,6 +36,7 @@ from kite.event_pipeline import (
     SwappableKapRest,
     TimerHandle,
     WsSubscriptionHook,
+    _PendingApproval,
 )
 from kite.feishu_transport import CardAction, InboundMessage
 from kite.prompt_ownership import PromptOwnership
@@ -123,6 +124,9 @@ class FakeInteractionRest:
         self.dismiss_error: Exception | None = None
         self.prompts_error: Exception | None = None
         self.messages_error: Exception | None = None
+        # Fired inside the approval-resolve POST, before it returns (used to
+        # re-enter the handler mid-flight for the click-guard tests).
+        self.resolve_hook: object = None
         self._prompt_counter = 0
 
     # -- scripting helpers ----------------------------------------------------
@@ -145,6 +149,11 @@ class FakeInteractionRest:
     # -- KapRestClient surface ------------------------------------------------
 
     def call(self, method: str, path: str, body: object = None) -> object:
+        if method == "POST" and path == "/sessions":
+            payload = body if isinstance(body, dict) else {}
+            session_id = f"s-new-{len(self.sessions) + 1}"
+            self.add_session(session_id, title=str(payload.get("title") or "新会话"))
+            return self.sessions[session_id]
         match = re.fullmatch(r"/sessions/([^/]+)", path)
         if method == "GET" and match:
             session = self.sessions.get(match.group(1))
@@ -174,6 +183,8 @@ class FakeInteractionRest:
         if method == "POST" and match:
             if self.resolve_error is not None:
                 raise self.resolve_error
+            if self.resolve_hook is not None:
+                self.resolve_hook()  # type: ignore[operator]
             self.approval_resolutions.append(
                 {"session_id": match.group(1), "approval_id": match.group(2), "body": body}
             )
@@ -802,7 +813,7 @@ class ApprovalTests(PipelineTestCase):
         self.assertIsNotNone(response.card)
         self.assertIn("已批准", json.dumps(response.card, ensure_ascii=False))
         self.assertEqual(self.timers.live, [])
-        # A repeated click inside the idempotency window is a notice, not an error.
+        # A repeated click after the entry closed is a notice, not an error.
         second = self.handler.on_card_action(
             make_card_action(
                 {
@@ -813,7 +824,7 @@ class ApprovalTests(PipelineTestCase):
                 }
             )
         )
-        self.assertEqual(second.toast, cards.APPROVAL_ALREADY_PROCESSED_NOTICE)
+        self.assertEqual(second.toast, cards.APPROVAL_STALE_NOTICE)
         self.assertEqual(len(self.rest.approval_resolutions), 1)
 
     def test_40902_on_resolve_freezes_card_with_notice(self) -> None:
@@ -1297,6 +1308,309 @@ class ErrorFrameTests(PipelineTestCase):
         self.flush()
         self.assertEqual(self.transport.cards_to(CHAT_ID), [])
         self.assertEqual(self.transport.texts_to(CHAT_ID), [])
+
+
+# ---------------------------------------------------------------------------
+# Terminal reconcile: retry-on-empty + delivery dedup (FOCUS recovery port)
+# ---------------------------------------------------------------------------
+
+
+class TerminalReconcileTests(PipelineTestCase):
+    def _end_completed(self) -> None:
+        self.feed(kap_event("turn.ended", {"turnId": 1, "reason": "completed"}))
+
+    def test_empty_terminal_text_retries_then_uses_late_text(self) -> None:
+        self.rest.assistant_text = ""
+        self.bind(CHAT_ID)
+        message_id = self.start_prompt()
+
+        self._end_completed()
+
+        # No terminal card yet: the empty read scheduled a retry instead.
+        self.assertEqual(len(self.transport.cards_to(CHAT_ID)), 1)
+        self.assertEqual(len(self.timers.created), 1)
+        self.assertEqual(self.timers.created[0].delay, 1.0)
+
+        self.rest.assistant_text = "迟到的最终答复"
+        self.timers.created[0].fire()
+        self.flush()
+
+        sent = self.transport.cards_to(CHAT_ID)
+        self.assertEqual(len(sent), 2)  # execution card + terminal card
+        self.assertIn("迟到的最终答复", json.dumps(sent[-1]["content"], ensure_ascii=False))
+        # The card got a queue-refresh patch in the reconcile window, then
+        # the freeze patch; the text was persisted; no further retry.
+        patches = self.transport.patches_to(message_id)
+        self.assertEqual(len(patches), 2)
+        self.assertIn("已结束", json.dumps(patches[-1], ensure_ascii=False))
+        self.assertEqual(len(self.timers.created), 1)
+        records = self.terminal_store.list_all()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].final_reply_text, "迟到的最终答复")
+
+    def test_empty_terminal_text_falls_back_to_stub_after_retries(self) -> None:
+        self.rest.assistant_text = ""
+        self.bind(CHAT_ID)
+        self.start_prompt()
+
+        self._end_completed()
+        # Default: 3 retries (delay 1.0s each) before the stub fallback.
+        for expected_timers in (1, 2, 3):
+            self.assertEqual(len(self.timers.created), expected_timers)
+            self.assertEqual(self.timers.created[-1].delay, 1.0)
+            self.assertEqual(len(self.transport.cards_to(CHAT_ID)), 1)
+            self.timers.created[-1].fire()
+            self.flush()
+
+        self.assertEqual(len(self.timers.created), 3)
+        sent = self.transport.cards_to(CHAT_ID)
+        self.assertEqual(len(sent), 2)
+        self.assertIn("无最终输出", json.dumps(sent[-1]["content"], ensure_ascii=False))
+        # Stub text is not persisted as a result.
+        self.assertEqual(len(self.terminal_store.list_all()), 0)
+
+    def test_abort_during_retry_window_wins_the_dedup(self) -> None:
+        self.rest.assistant_text = ""
+        self.bind(CHAT_ID)
+        self.start_prompt()
+        self._end_completed()
+        self.assertEqual(len(self.timers.created), 1)
+
+        self.feed(
+            kap_event("prompt.aborted", {"promptId": "p-1", "abortedAt": "2026-01-01T00:00:00Z"})
+        )
+
+        # One terminal card (the abort); the pending retry was cancelled.
+        self.assertEqual(len(self.transport.cards_to(CHAT_ID)), 2)
+        terminal = json.dumps(self.transport.cards_to(CHAT_ID)[-1]["content"], ensure_ascii=False)
+        self.assertIn("已中止", terminal)
+        self.assertTrue(self.timers.created[0].cancelled)
+        # A late retry fire is a no-op: still exactly one terminal card.
+        self.timers.created[0].fire()
+        self.flush()
+        self.assertEqual(len(self.transport.cards_to(CHAT_ID)), 2)
+
+    def test_retry_never_pins_new_prompt_text_on_old_terminal(self) -> None:
+        self.rest.assistant_text = ""
+        self.bind(CHAT_ID)
+        self.start_prompt()
+        self._end_completed()
+        self.assertEqual(len(self.timers.created), 1)
+
+        # A newer prompt takes over the session before the retry fires.
+        self.rest.set_prompts(SESSION_ID, active="p-2")
+        self.feed(turn_started(turn_id=2, prompt="另一个任务"))
+        self.rest.assistant_text = "新 prompt 的部分输出"
+
+        self.timers.created[0].fire()
+        self.flush()
+
+        # p-1's terminal is delivered standalone with stub text — the newer
+        # prompt's text must never land on the old prompt's terminal card
+        # (monotonic rule: never deliver stale text).
+        sent = self.transport.cards_to(CHAT_ID)
+        self.assertEqual(len(sent), 3)  # p-1 card, p-2 card, p-1 terminal
+        terminal = json.dumps(sent[-1]["content"], ensure_ascii=False)
+        self.assertIn("无最终输出", terminal)
+        self.assertNotIn("新 prompt 的部分输出", terminal)
+        self.assertEqual(len(self.terminal_store.list_all()), 0)
+
+
+# ---------------------------------------------------------------------------
+# Approval click two-phase guard (FOCUS interaction_request_controller port)
+# ---------------------------------------------------------------------------
+
+
+class ApprovalClickGuardTests(PipelineTestCase):
+    def _start_and_request_approval(self) -> None:
+        self.bind(CHAT_ID)
+        self.start_prompt()
+        self.ownership.record("p-1", CHAT_ID)
+        self.feed(approval_requested())
+
+    def _approve_action(self, approval_id: str = "a-1") -> CardAction:
+        return make_card_action(
+            {
+                "action": cards.ACTION_APPROVAL_RESOLVE,
+                "decision": cards.APPROVAL_DECISION_APPROVED,
+                "approval_id": approval_id,
+                "prompt_id": "p-1",
+            }
+        )
+
+    def test_second_click_while_processing_gets_processing_notice(self) -> None:
+        self._start_and_request_approval()
+        nested_toasts: list[str | None] = []
+
+        def click_again_mid_flight() -> None:
+            nested_toasts.append(self.handler.on_card_action(self._approve_action()).toast)
+
+        self.rest.resolve_hook = click_again_mid_flight
+
+        response = self.handler.on_card_action(self._approve_action())
+
+        self.assertEqual(nested_toasts, [cards.APPROVAL_PROCESSING_NOTICE])
+        # The mid-flight click never double-submits: exactly one resolution.
+        self.assertEqual(len(self.rest.approval_resolutions), 1)
+        self.assertIn("已批准", response.toast or "")
+
+    def test_transport_failure_rolls_back_to_pending_and_allows_retry(self) -> None:
+        self._start_and_request_approval()
+        self.rest.resolve_error = KapTransportError("connection refused")
+
+        first = self.handler.on_card_action(self._approve_action())
+
+        self.assertEqual(first.toast_type, "error")
+        self.assertIn("无法连接 kap-server", first.toast or "")
+        self.assertEqual(self.rest.approval_resolutions, [])
+
+        self.rest.resolve_error = None
+        second = self.handler.on_card_action(self._approve_action())
+
+        self.assertIn("已批准", second.toast or "")
+        self.assertEqual(len(self.rest.approval_resolutions), 1)
+
+    def test_click_on_missing_entry_gets_stale_notice_not_error(self) -> None:
+        self._start_and_request_approval()
+
+        response = self.handler.on_card_action(self._approve_action("a-ghost"))
+
+        self.assertEqual(response.toast, cards.APPROVAL_STALE_NOTICE)
+        self.assertNotEqual(response.toast_type, "error")
+        self.assertEqual(self.rest.approval_resolutions, [])
+
+
+# ---------------------------------------------------------------------------
+# Fail-close sweep: unbind (/new /switch) + shutdown entry points
+# ---------------------------------------------------------------------------
+
+
+class SweepTests(PipelineTestCase):
+    def _pending_approval_and_question(self) -> str:
+        """A bound chat with one tracked pending approval + question.
+
+        Returns the approval card's message id."""
+        self.bind(CHAT_ID)
+        self.start_prompt()
+        self.ownership.record("p-1", CHAT_ID)
+        self.feed(approval_requested())
+        self.feed(question_requested())
+        return self.transport.cards_to(CHAT_ID)[-1]["message_id"]
+
+    def test_new_sweeps_old_session_pending_interactions(self) -> None:
+        approval_card_id = self._pending_approval_and_question()
+        # /new's preflight only passes when the old session is idle upstream.
+        self.rest.set_prompts(SESSION_ID, active=None)
+
+        self.handler.on_message(make_message("/new"))
+
+        binding = self.store.load(CHAT_ID)
+        assert binding is not None
+        self.assertEqual(binding["session_id"], "s-new-2")
+        # The old session's approval was rejected upstream and expired locally.
+        self.assertEqual(
+            self.rest.approval_resolutions,
+            [{"session_id": SESSION_ID, "approval_id": "a-1", "body": {"decision": "rejected"}}],
+        )
+        patch = json.dumps(self.transport.patches_to(approval_card_id)[-1], ensure_ascii=False)
+        self.assertIn("已过期", patch)
+        self.assertIn("已切换到其他会话", patch)
+        # The question was dismissed upstream and closed with a notice.
+        self.assertEqual(self.rest.dismissals, [(SESSION_ID, "q-1")])
+        self.assertTrue(
+            any("已关闭" in text for text in self.transport.texts_to(CHAT_ID))
+        )
+        self.assertEqual(self.timers.live, [])
+
+    def test_switch_sweeps_old_session_pending_interactions(self) -> None:
+        approval_card_id = self._pending_approval_and_question()
+        self.rest.add_session("s-2", title="Beta")
+
+        self.handler.on_message(make_message("/switch s-2"))
+
+        binding = self.store.load(CHAT_ID)
+        assert binding is not None
+        self.assertEqual(binding["session_id"], "s-2")
+        self.assertEqual(
+            self.rest.approval_resolutions,
+            [{"session_id": SESSION_ID, "approval_id": "a-1", "body": {"decision": "rejected"}}],
+        )
+        patch = json.dumps(self.transport.patches_to(approval_card_id)[-1], ensure_ascii=False)
+        self.assertIn("已过期", patch)
+        self.assertEqual(self.rest.dismissals, [(SESSION_ID, "q-1")])
+        self.assertEqual(self.timers.live, [])
+
+    def test_unbind_sweep_only_touches_interactions_routed_to_that_chat(self) -> None:
+        self._pending_approval_and_question()
+        # Another chat's pending approval on the SAME session (multi-chat
+        # binding is an admin-only shape, but the sweep must not eat it).
+        self.loop.call(
+            self.pipeline._approvals.__setitem__,
+            "a-other",
+            _PendingApproval(
+                approval_id="a-other",
+                session_id=SESSION_ID,
+                prompt_id="p-1",
+                owner_chat_id=CHAT_ID_2,
+                card_message_id="",
+                timer=None,
+            ),
+        )
+        self.rest.add_session("s-2", title="Beta")
+
+        self.handler.on_message(make_message("/switch s-2"))
+
+        self.assertEqual(
+            self.rest.approval_resolutions,
+            [{"session_id": SESSION_ID, "approval_id": "a-1", "body": {"decision": "rejected"}}],
+        )
+        self.assertTrue(self.loop.call(lambda: "a-other" in self.pipeline._approvals))
+
+    def test_shutdown_sweeps_all_pending_interactions(self) -> None:
+        approval_card_id = self._pending_approval_and_question()
+
+        self.pipeline.shutdown()
+        self.flush()
+
+        self.assertEqual(
+            self.rest.approval_resolutions,
+            [{"session_id": SESSION_ID, "approval_id": "a-1", "body": {"decision": "rejected"}}],
+        )
+        patch = json.dumps(self.transport.patches_to(approval_card_id)[-1], ensure_ascii=False)
+        self.assertIn("已过期", patch)
+        self.assertIn("KITE 服务已停止", patch)
+        self.assertEqual(self.rest.dismissals, [(SESSION_ID, "q-1")])
+        texts = self.transport.texts_to(CHAT_ID)
+        self.assertTrue(any("已关闭" in text and "KITE 服务已停止" in text for text in texts))
+        self.assertEqual(self.timers.live, [])
+
+    def test_shutdown_sweep_patches_cards_expired_when_kap_unreachable(self) -> None:
+        approval_card_id = self._pending_approval_and_question()
+        self.rest.resolve_error = KapTransportError("connection refused")
+        self.rest.dismiss_error = KapTransportError("connection refused")
+
+        self.pipeline.shutdown()
+        self.flush()
+
+        # Upstream responds failed, but nothing stays clickable locally.
+        self.assertEqual(self.rest.approval_resolutions, [])
+        self.assertEqual(self.rest.dismissals, [])
+        patch = json.dumps(self.transport.patches_to(approval_card_id)[-1], ensure_ascii=False)
+        self.assertIn("已过期", patch)
+        texts = self.transport.texts_to(CHAT_ID)
+        self.assertTrue(any("已关闭" in text for text in texts))
+        self.assertEqual(self.timers.live, [])
+
+    def test_sweep_marks_card_handled_when_upstream_already_resolved(self) -> None:
+        approval_card_id = self._pending_approval_and_question()
+        self.rest.resolve_error = KapError(40902, "approval a-1 already resolved")
+
+        self.pipeline.shutdown()
+        self.flush()
+
+        patch = json.dumps(self.transport.patches_to(approval_card_id)[-1], ensure_ascii=False)
+        self.assertIn("已处理", patch)
+        self.assertNotIn("已过期", patch)
 
 
 if __name__ == "__main__":

@@ -9,17 +9,28 @@ Implements the outbound half of the MVP contract
   wire event carries no prompt id); tool.call.* and queue-depth changes patch
   only the anchor-matching card; turn.ended / prompt.aborted send a separate
   terminal card (text persisted in the terminal result store) and freeze the
-  execution card.
+  execution card. The terminal text fetch is snapshot-authoritative with
+  retry-on-empty (the turn-end-vs-final-flush race is normal): an empty read
+  is retried via the timer factory before the card falls back to stub text,
+  and delivery is deduped per (session, prompt) so a second finalize path
+  always skips (never two terminal cards, never stale text over real text).
 - approval.requested routes by prompt ownership: a certain owner gets the
   three-button card, other attached chats get a read-only notice, and a
   best-effort/unknown owner gets an explicitly expired card (fail-closed,
   §4.6 — never routed on a guess). approval.resolved from ANY client freezes
-  the card. An approval unanswered for ``approval_timeout_seconds`` is
+  the card. Card clicks are two-phase guarded (pending -> processing ->
+  resolved; a mid-flight second click gets a "正在处理中" notice, a click on
+  a missing entry gets "已失效或已处理" — never an error, never a
+  double-submit). An approval unanswered for ``approval_timeout_seconds`` is
   resolved to upstream as rejected and the initiator is notified — never
   auto-approved (§3).
 - question.requested is the MVP text pass-through: numbered options to the
   owner chat; numbered replies are claimed via ``try_handle_interaction_reply``
   and answered over REST; timeout auto-dismisses with a notice.
+- fail-close sweep: /new /switch unbinds sweep the old session's pending
+  approvals/questions routed to that chat, and kited shutdown sweeps all of
+  them — responded upstream (approval rejected, question dismissed) and the
+  cards patched to expired/closed (locally even when kap is unreachable).
 - resync_required / startup recovery rebuilds from REST snapshot + prompts
   and refreshes work state / queue / in-flight cards wholesale; a failed
   rebuild freezes the session's execution cards as "状态未知" with a
@@ -94,6 +105,18 @@ _MAX_TOOL_LINES = 30
 _LATEST_ASSISTANT_PAGE_SIZE = 20
 
 _KAP_UNREACHABLE_TOAST = "无法连接 kap-server，操作未完成，请稍后再试。"
+
+# Pending-approval click phases (interaction_request_controller discipline):
+# a click flips pending -> processing before the REST resolve so a second
+# click is a notice, never a double-submit; transport failure rolls back.
+_APPROVAL_STATUS_PENDING = "pending"
+_APPROVAL_STATUS_PROCESSING = "processing"
+
+# Terminal reconcile defaults (execution_recovery_controller discipline):
+# turn.ended routinely wins the race against the final message flush, so an
+# empty terminal text is retried a few times before the stub-text fallback.
+_DEFAULT_TERMINAL_EMPTY_RETRY_COUNT = 3
+_DEFAULT_TERMINAL_EMPTY_RETRY_DELAY_SECONDS = 1.0
 
 
 def _quote(value: str) -> str:
@@ -258,6 +281,7 @@ class _PendingApproval:
     card_message_id: str  # "" when the card send failed (timer still runs)
     timer: Optional[TimerHandle]
     resolved: bool = False
+    status: str = _APPROVAL_STATUS_PENDING
 
 
 @dataclass(slots=True)
@@ -306,6 +330,8 @@ class EventPipeline:
         timer_factory: Callable[[float, Callable[[], None]], TimerHandle] = _threading_timer_factory,
         monotonic: Callable[[], float] = time.monotonic,
         on_snapshot_rebuilt: Optional[Callable[[str, SessionSnapshot], None]] = None,
+        terminal_empty_retry_count: int = _DEFAULT_TERMINAL_EMPTY_RETRY_COUNT,
+        terminal_empty_retry_delay_seconds: float = _DEFAULT_TERMINAL_EMPTY_RETRY_DELAY_SECONDS,
     ) -> None:
         self._transport = transport
         self._rest = rest
@@ -321,12 +347,18 @@ class EventPipeline:
         self._timer_factory = timer_factory
         self._monotonic = monotonic
         self._on_snapshot_rebuilt = on_snapshot_rebuilt
+        self._terminal_empty_retry_count = max(int(terminal_empty_retry_count), 0)
+        self._terminal_retry_delay = max(float(terminal_empty_retry_delay_seconds), 0.0)
 
         self._cards: dict[str, _ExecutionCardState] = {}  # chat_id -> current card
         self._sessions: dict[str, _SessionState] = {}
         self._approvals: dict[str, _PendingApproval] = {}
         self._questions: dict[str, _PendingQuestion] = {}
         self._pending_feedback: dict[tuple[str, str], _PendingFeedback] = {}
+        # Terminal delivery dedup: one terminal card per (session, prompt)
+        # even when two finalize paths (live event / reconcile retry) race.
+        self._terminal_delivered: set[tuple[str, str]] = set()
+        self._terminal_retry_timers: dict[tuple[str, str], TimerHandle] = {}
         self._shutdown = False
 
     # ------------------------------------------------------------------
@@ -358,7 +390,8 @@ class EventPipeline:
             self._loop.submit(self._rebuild_session, session_id, "startup")
 
     def shutdown(self) -> None:
-        """Cancel all pending timers (kited clean shutdown)."""
+        """kited clean shutdown: fail-close sweep of every pending
+        approval/question, then cancel all pending timers."""
         self._loop.submit(self._shutdown_impl)
 
     # ------------------------------------------------------------------
@@ -539,16 +572,100 @@ class EventPipeline:
         if not prompt_id:
             return
         if event.reason == "completed":
-            outcome = cards.TERMINAL_COMPLETED
-            text = self._fetch_terminal_text(event.session_id)
+            # The turn-end-vs-final-flush race is normal, not an edge case:
+            # reconcile the terminal text (retry-on-empty) before the card
+            # falls back to stub text.
+            self._terminal_reconcile(event.session_id, prompt_id, attempt=1)
         elif event.reason == "cancelled":
-            outcome = cards.TERMINAL_ABORTED
-            text = ""
+            self._finish_prompt(event.session_id, prompt_id, cards.TERMINAL_ABORTED, "")
         else:
-            outcome = cards.TERMINAL_FAILED
-            text = event.error_message
-        self._finish_prompt(event.session_id, prompt_id, outcome, text)
+            self._finish_prompt(
+                event.session_id, prompt_id, cards.TERMINAL_FAILED, event.error_message
+            )
         self._refresh_queue_depth(event.session_id)
+
+    def _terminal_reconcile(self, session_id: str, prompt_id: str, attempt: int) -> None:
+        """Snapshot-authoritative terminal text fetch with retry-on-empty.
+
+        Attempt 1 runs synchronously from turn.ended; an empty fetch is
+        retried via the timer factory up to ``terminal_empty_retry_count``
+        times, then the terminal card goes out with stub text (the builder's
+        fallback). Delivery is deduped by ``_finish_prompt``; once the
+        session has moved on to a newer active prompt the fetch is skipped —
+        the latest assistant text can no longer be attributed to this prompt
+        (monotonic rule: never pin stale text on its terminal card).
+        """
+        key = (session_id, prompt_id)
+        self._terminal_retry_timers.pop(key, None)  # the timer that fired is spent
+        if key in self._terminal_delivered:
+            return
+        session = self._sessions.get(session_id)
+        moved_on = bool(
+            session is not None
+            and session.active_prompt_id
+            and session.active_prompt_id != prompt_id
+        )
+        if not moved_on:
+            text = self._fetch_terminal_text(session_id)
+            if text:
+                self._finish_prompt(
+                    session_id,
+                    prompt_id,
+                    cards.TERMINAL_COMPLETED,
+                    text,
+                    standalone_when_orphaned=True,
+                )
+                return
+            if attempt <= self._terminal_empty_retry_count:
+                self._schedule_terminal_retry(session_id, prompt_id, attempt + 1)
+                return
+            logger.warning(
+                "terminal text still empty after %d retries session=%s prompt=%s; "
+                "falling back to stub text",
+                self._terminal_empty_retry_count,
+                session_id,
+                prompt_id,
+            )
+        else:
+            logger.warning(
+                "session %s moved on to prompt %s during terminal reconcile of %s; "
+                "closing with stub text",
+                session_id,
+                session.active_prompt_id if session else None,
+                prompt_id,
+            )
+        self._finish_prompt(
+            session_id,
+            prompt_id,
+            cards.TERMINAL_COMPLETED,
+            "",
+            standalone_when_orphaned=True,
+        )
+
+    def _schedule_terminal_retry(self, session_id: str, prompt_id: str, next_attempt: int) -> None:
+        key = (session_id, prompt_id)
+
+        def _fire() -> None:
+            try:
+                self._loop.submit(self._terminal_reconcile, session_id, prompt_id, next_attempt)
+            except Exception:  # loop closed during shutdown
+                logger.debug("terminal retry fired after loop close: %s", prompt_id)
+
+        try:
+            handle = self._timer_factory(self._terminal_retry_delay, _fire)
+        except Exception:
+            # Fail-closed: never leave the terminal undelivered because a
+            # timer could not be started.
+            logger.exception("terminal retry timer failed session=%s prompt=%s", session_id, prompt_id)
+            self._finish_prompt(
+                session_id,
+                prompt_id,
+                cards.TERMINAL_COMPLETED,
+                "",
+                standalone_when_orphaned=True,
+            )
+            return
+        self._terminal_retry_timers[key] = handle
 
     def _prompt_aborted(self, event: PromptAborted) -> None:
         # Covers both active and queued aborts (spike S2). Queued prompts have
@@ -616,18 +733,55 @@ class EventPipeline:
         prompt_id: str,
         outcome: str,
         text: str,
+        *,
+        standalone_when_orphaned: bool = False,
     ) -> None:
+        """Deliver the terminal card exactly once per (session, prompt).
+
+        The dedup registry is the single choke point: the live event path, a
+        reconcile retry, and any later finalize path all pass through here,
+        and the second one notices the recorded terminal and skips. Once a
+        terminal went out with real text nothing replaces it with shorter or
+        stale content (monotonic rule).
+        """
+        key = (session_id, prompt_id)
+        if key in self._terminal_delivered:
+            logger.info(
+                "terminal already delivered session=%s prompt=%s; skipping duplicate finalize",
+                session_id,
+                prompt_id,
+            )
+            return
         states = self._cards_for_prompt(session_id, prompt_id)
+        if not states and not standalone_when_orphaned:
+            # Queued prompts never had a card; their abort is queue-shape only.
+            self._ownership.forget(prompt_id)
+            return
+        self._terminal_delivered.add(key)
+        retry = self._terminal_retry_timers.pop(key, None)
+        if retry is not None:
+            retry.cancel()
         for state in states:
             self._send_terminal_and_freeze(state, outcome, text)
             del self._cards[state.anchor.chat_id]
-        if states:
-            logger.info(
-                "prompt ended session_id=%s prompt_id=%s outcome=%s",
-                session_id,
-                prompt_id,
-                outcome,
-            )
+        if not states:
+            # The anchor vanished while the terminal reconcile was pending
+            # (rebound / snapshot rebuild froze it): deliver the terminal
+            # standalone so the result is never lost silently.
+            for chat_id, _binding in self._attached_chats(session_id):
+                self._send_card(
+                    chat_id,
+                    cards.build_terminal_card(
+                        outcome=outcome,  # type: ignore[arg-type]
+                        text=text,
+                    ),
+                )
+        logger.info(
+            "prompt ended session_id=%s prompt_id=%s outcome=%s",
+            session_id,
+            prompt_id,
+            outcome,
+        )
         self._ownership.forget(prompt_id)
 
     def _send_terminal_and_freeze(
@@ -896,12 +1050,20 @@ class EventPipeline:
     # ------------------------------------------------------------------
 
     def handle_approval_action(self, action: CardAction) -> CardActionResponse:
-        """Approval card buttons (AppHandler E3 seam; runs on the loop)."""
+        """Approval card buttons (AppHandler E3 seam; runs on the loop).
+
+        Two-phase click guard: the entry flips pending -> processing before
+        the REST resolve and rolls back on failure, so a second click while
+        processing is a "正在处理中" notice and a click on a missing entry is
+        a "已失效或已处理" notice — never an error, never a double-submit.
+        """
         name = str(action.value.get("action") or "")
         approval_id = str(action.value.get("approval_id") or "").strip()
         pending = self._approvals.get(approval_id)
         if not approval_id or pending is None or pending.resolved:
-            return CardActionResponse(toast=cards.APPROVAL_ALREADY_PROCESSED_NOTICE)
+            return CardActionResponse(toast=cards.APPROVAL_STALE_NOTICE)
+        if pending.status == _APPROVAL_STATUS_PROCESSING:
+            return CardActionResponse(toast=cards.APPROVAL_PROCESSING_NOTICE)
         if pending.owner_chat_id != action.chat_id:
             logger.warning(
                 "approval action from foreign chat approval=%s chat=%s",
@@ -931,6 +1093,7 @@ class EventPipeline:
     def _resolve_approval_from_card(
         self, pending: _PendingApproval, decision: str, *, feedback: str = ""
     ) -> CardActionResponse:
+        pending.status = _APPROVAL_STATUS_PROCESSING
         try:
             self._ops.resolve_approval(
                 pending.session_id, pending.approval_id, decision=decision, feedback=feedback
@@ -943,8 +1106,10 @@ class EventPipeline:
                     card=cards.build_approval_resolved_card(decision=""),
                     toast=cards.APPROVAL_ALREADY_PROCESSED_NOTICE,
                 )
+            pending.status = _APPROVAL_STATUS_PENDING  # roll back: the click may be retried
             return CardActionResponse(toast=f"审批处理失败：{exc.msg}", toast_type="error")
         except KapTransportError:
+            pending.status = _APPROVAL_STATUS_PENDING  # roll back on transport failure
             return CardActionResponse(toast=_KAP_UNREACHABLE_TOAST, toast_type="error")
         self._close_approval(pending)
         label = "已批准" if decision == cards.APPROVAL_DECISION_APPROVED else "已拒绝"
@@ -1062,6 +1227,106 @@ class EventPipeline:
             pending.owner_chat_id,
             f"⏰ 问题 `{question_id}` 超过 {self._question_timeout // 60} 分钟未回复，已自动关闭。",
         )
+
+    # ------------------------------------------------------------------
+    # Fail-close sweep (interaction_request_controller discipline)
+    # ------------------------------------------------------------------
+
+    def sweep_session_interactions(
+        self,
+        session_id: str,
+        *,
+        owner_chat_id: Optional[str] = None,
+        reason: str,
+    ) -> int:
+        """Sweep one session's pending approvals/questions, optionally only
+        those routed to one chat (the /new /switch unbind entry point)."""
+        return self._sweep_interactions(
+            lambda pending: pending.session_id == session_id
+            and (owner_chat_id is None or pending.owner_chat_id == owner_chat_id),
+            reason=reason,
+        )
+
+    def sweep_all_interactions(self, *, reason: str) -> int:
+        """Sweep every pending approval/question (the kited shutdown entry)."""
+        return self._sweep_interactions(lambda _pending: True, reason=reason)
+
+    def _sweep_interactions(
+        self,
+        predicate: Callable[[Any], bool],
+        *,
+        reason: str,
+    ) -> int:
+        """Fail-close sweep: respond upstream (approvals -> rejected,
+        questions -> dismissed) and patch the cards to expired/closed.
+
+        A swept card never stays clickable; when kap is unreachable the
+        upstream respond is skipped but the card is still patched expired
+        locally. Returns the number of swept entries.
+        """
+        swept = 0
+        swept_approval_ids: set[str] = set()
+        for approval_id, pending in list(self._approvals.items()):
+            if not predicate(pending):
+                continue
+            self._approvals.pop(approval_id, None)
+            self._cancel_timer(pending)
+            swept += 1
+            swept_approval_ids.add(approval_id)
+            try:
+                self._ops.resolve_approval(
+                    pending.session_id,
+                    approval_id,
+                    decision=cards.APPROVAL_DECISION_REJECTED,
+                )
+                card: Optional[dict] = cards.build_approval_expired_card(reason=reason)
+            except KapError as exc:
+                if exc.code in (KAP_ERROR_ALREADY_RESOLVED, KAP_ERROR_APPROVAL_NOT_FOUND):
+                    card = cards.build_approval_resolved_card(decision="")
+                else:
+                    logger.warning("sweep: approval %s resolve failed: %s", approval_id, exc)
+                    card = cards.build_approval_expired_card(reason=reason)
+            except KapTransportError as exc:
+                logger.warning("sweep: approval %s resolve unreachable: %s", approval_id, exc)
+                card = cards.build_approval_expired_card(reason=reason)
+            if pending.card_message_id:
+                self._patch_card(pending.card_message_id, card)
+            logger.info(
+                "approval swept session_id=%s approval_id=%s reason=%s",
+                pending.session_id,
+                approval_id,
+                reason,
+            )
+        for key, feedback in list(self._pending_feedback.items()):
+            if feedback.approval_id in swept_approval_ids:
+                self._pending_feedback.pop(key, None)
+        for question_id, pending in list(self._questions.items()):
+            if not predicate(pending):
+                continue
+            self._questions.pop(question_id, None)
+            if pending.timer is not None:
+                pending.timer.cancel()
+            swept += 1
+            try:
+                self._ops.dismiss_question(pending.session_id, question_id)
+            except KapError as exc:
+                if exc.code not in (KAP_ERROR_ALREADY_RESOLVED, KAP_ERROR_QUESTION_NOT_FOUND):
+                    logger.warning("sweep: question %s dismiss failed: %s", question_id, exc)
+            except KapTransportError as exc:
+                logger.warning("sweep: question %s dismiss unreachable: %s", question_id, exc)
+            # The MVP question surface is text (no card to patch); the
+            # closing notice is its expired/closed equivalent.
+            self._send_text(
+                pending.owner_chat_id,
+                f"问题 `{question_id}` 已关闭（{reason}）。",
+            )
+            logger.info(
+                "question swept session_id=%s question_id=%s reason=%s",
+                pending.session_id,
+                question_id,
+                reason,
+            )
+        return swept
 
     # ------------------------------------------------------------------
     # Interaction replies (AppHandler E3 seam; runs on the loop)
@@ -1454,11 +1719,16 @@ class EventPipeline:
 
     def _shutdown_impl(self) -> None:
         self._shutdown = True
-        for pending in self._approvals.values():
-            self._cancel_timer(pending)
-        for pending in self._questions.values():
-            if pending.timer is not None:
-                pending.timer.cancel()
+        # Fail-close sweep (mvp-scope aligned item 8): respond upstream
+        # (approvals rejected, questions dismissed) and patch the cards
+        # expired/closed. kited keeps kap-server up until this has run; if it
+        # is unreachable anyway, the cards are still patched locally.
+        swept = self.sweep_all_interactions(reason="KITE 服务已停止")
+        if swept:
+            logger.info("shutdown sweep closed %d pending interaction(s)", swept)
+        for timer in self._terminal_retry_timers.values():
+            timer.cancel()
+        self._terminal_retry_timers.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -1563,6 +1833,15 @@ class OutboundAppHandler(AppHandler):
 
     def try_handle_interaction_reply(self, message: InboundMessage) -> bool:
         return self._event_pipeline.try_handle_interaction_reply(message)
+
+    def on_session_unbound(self, chat_id: str, old_session_id: str) -> None:
+        # Fail-close sweep of the old session's pending approvals/questions
+        # routed to this chat (we are on the loop: commands run serialized).
+        self._event_pipeline.sweep_session_interactions(
+            old_session_id,
+            owner_chat_id=chat_id,
+            reason="发起聊天已切换到其他会话",
+        )
 
 
 class SwappableKapRest:

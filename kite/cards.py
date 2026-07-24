@@ -87,6 +87,13 @@ APPROVAL_DECISION_CANCELLED = "cancelled"
 # 40902 approval.already_resolved): a notice, not an error (design §6).
 APPROVAL_ALREADY_PROCESSED_NOTICE = "该审批已处理，请勿重复操作。"
 
+# Toasts for the two-phase click guard (pending -> processing -> done): a
+# second click while the REST resolve is in flight, and a click on an entry
+# that is gone (resolved, swept, or expired) — both notices, never errors,
+# never a double-submit.
+APPROVAL_PROCESSING_NOTICE = "正在处理中，请稍候。"
+APPROVAL_STALE_NOTICE = "该审批已失效或已处理。"
+
 # Default interaction timeouts (mvp-scope §3: approval timeout default 5
 # minutes, configurable; question auto-dismiss shares the MVP default).
 DEFAULT_APPROVAL_TIMEOUT_SECONDS = 300

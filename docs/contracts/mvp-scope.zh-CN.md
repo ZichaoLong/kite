@@ -110,3 +110,7 @@
 6. Spike 第 0 里程碑在 kimi 0.28.1 上通过（2026-07-21;
    `docs/verification/spike-results.md`);`/abort` 行已补充实测的 40402
    重复 abort 行为。
+7. `/new` 在有 active prompt 时拒绝（fail-closed 防在途工作失去可见性）(2026-07-23)。
+8. kited 停止时对全部待处理审批/问题做 fail-close 收口：上游应答（审批→拒绝、
+   问题→dismiss），kap 不可达时卡片仍在本地 patch 为已过期/已关闭
+   (2026-07-23)。
