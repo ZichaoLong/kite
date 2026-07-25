@@ -60,6 +60,8 @@ Status guidance:
   - image inbound (staged, TTL'd) and outbound (upload+fan-out) pipelines; the attachment-staging state axis
 - [`group-chat.md`](./contracts/group-chat.md) (admitted, Phase 2)
   - mention_only groups: activation, ingress matrix, actor-at-click approvals, allowlist fallout; the group-config state axis
+- [`scheduled-prompts.md`](./contracts/scheduled-prompts.md) (admitted, Phase 3)
+  - scheduled prompts: systemd --user timers routing back through `kitectl prompt send` into the control plane; display modes; termination strategy
 
 ### Architecture
 

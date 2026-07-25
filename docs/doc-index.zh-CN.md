@@ -57,6 +57,8 @@ Status guidance:
   - 图片入站（暂存、TTL）与出站（上传+扇出）管线；附件暂存状态轴
 - [`group-chat.md`](./contracts/group-chat.zh-CN.md)（已准入，Phase 2)
   - mention_only 群：激活、入站矩阵、点击校验审批、允许名单落地；群配置状态轴
+- [`scheduled-prompts.md`](./contracts/scheduled-prompts.zh-CN.md)（已准入，Phase 3)
+  - 定时 prompts:systemd --user 定时器经 `kitectl prompt send` 回到控制面;display 模式；终止策略
 
 ### Architecture
 
