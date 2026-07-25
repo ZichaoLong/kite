@@ -176,9 +176,9 @@ def build_outbound_runtime(
     def _render_group_history_text(
         msg_type: str, content_dict: dict, mentions: list
     ) -> str:
-        text = FeishuTransport._extract_text(msg_type, content_dict)
+        text = transport.extract_text(msg_type, content_dict)
         if text and mentions:
-            text = transport._normalize_mentions(text, list(mentions))
+            text = transport.normalize_mentions(text, list(mentions))
         return text
 
     group_history = GroupHistoryRecovery(

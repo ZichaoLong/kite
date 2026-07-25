@@ -193,13 +193,25 @@ def preview_service_stop(
     sessions: Optional[Sequence[SessionSummary]],
     *,
     kited_running: Optional[bool],
+    verified_pending: Optional[int] = None,
 ) -> ServiceStopPreview:
-    """Build the preview from a kap session list; ``None`` = unverifiable."""
+    """Build the preview from a kap session list; ``None`` = unverifiable.
+
+    ``verified_pending`` is the count from the real pending-approval/question
+    lists (upstream's `pending_interaction` session flag can be stale —
+    approvals expire server-side but the flag lingers); when omitted, the
+    flag count is used as the conservative fallback.
+    """
     if sessions is None:
         return ServiceStopPreview(verifiable=False, kited_running=kited_running)
+    pending = (
+        verified_pending
+        if verified_pending is not None
+        else sum(1 for session in sessions if session.pending_interaction)
+    )
     return ServiceStopPreview(
         verifiable=True,
         busy_sessions=sum(1 for session in sessions if session.busy),
-        pending_interactions=sum(1 for session in sessions if session.pending_interaction),
+        pending_interactions=pending,
         kited_running=kited_running,
     )

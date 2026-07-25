@@ -368,6 +368,7 @@ class ServicePreviewGateTests(KitectlTestCase):
         manager = self._fake_manager()
         session = self.state.create_session("s-pending", title="demo")
         session.pending_interaction = "approval"
+        self.state.add_pending_approval(session, "a-1")
 
         code, _, err = self._run_cli("service", "restart")
 
@@ -375,6 +376,19 @@ class ServicePreviewGateTests(KitectlTestCase):
         self.assertIn("0 session(s) busy, 1 pending interaction(s)", err)
         self.assertIn("restarting kills in-flight prompts", err)
         self.assertEqual(manager.calls, [])
+
+    def test_stale_pending_flag_proceeds_after_verification(self) -> None:
+        # The session-level pending_interaction flag can linger after the
+        # approval itself expired upstream; the gate verifies the real
+        # pending lists and must not false-positive on the flag alone.
+        manager = self._fake_manager()
+        session = self.state.create_session("s-stale", title="demo")
+        session.pending_interaction = "approval"
+
+        code, _, _ = self._run_cli("service", "restart")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(manager.calls, ["restart"])
 
     def test_restart_refused_when_live_state_unverifiable(self) -> None:
         manager = self._fake_manager()

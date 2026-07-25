@@ -574,6 +574,15 @@ class FeishuTransport:
             return set()
         return {self._configured_bot_open_id, *self._configured_trigger_open_ids}
 
+    @staticmethod
+    def extract_text(msg_type: str, content_dict: dict) -> str:
+        """Public alias of `_extract_text` (group-history backfill seam)."""
+        return FeishuTransport._extract_text(msg_type, content_dict)
+
+    def normalize_mentions(self, text: str, mentions: list) -> str:
+        """Public alias of `_normalize_mentions` (group-history backfill seam)."""
+        return self._normalize_mentions(text, list(mentions))
+
     def _normalize_mentions(self, text: str, mentions: list) -> str:
         """Strip trigger mentions from group text, keep other @members readable."""
         normalized = text

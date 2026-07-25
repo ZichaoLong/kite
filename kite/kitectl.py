@@ -332,15 +332,32 @@ def _service_in_flight_gate(args: argparse.Namespace, *, verb: str) -> None:
     runtime_admin discipline, docs/research/focus-assets-map.md §0 item 4).
     """
     sessions: list[kap_server.SessionSummary] | None = None
+    verified_pending: int | None = None
     try:
-        sessions = _connect().list_sessions()
+        client = _connect()
+        sessions = client.list_sessions()
+        # Stale-flag correction: the session-level pending_interaction flag
+        # can linger after the approval itself expired upstream. Verify
+        # flagged sessions against the real pending lists; a per-session
+        # fetch failure counts that session as pending (conservative).
+        flags = [s for s in sessions if s.pending_interaction]
+        if flags:
+            verified_pending = 0
+            for summary in flags:
+                try:
+                    approvals, questions = _pending_interactions(client, summary.session_id)
+                    verified_pending += len(approvals) + len(questions)
+                except (kap_server.KapError, kap_server.KapTransportError):
+                    verified_pending += 1
     except (CliError, kap_server.KapError, kap_server.KapTransportError):
         sessions = None
+        verified_pending = None
     status = read_runtime_status(default_data_root())
     kited_pid = status.get("kited_pid") if status else None
     preview = preflights.preview_service_stop(
         sessions,
         kited_running=isinstance(kited_pid, int) and process_exists(kited_pid),
+        verified_pending=verified_pending,
     )
     if not preview.force_only:
         return
