@@ -151,11 +151,9 @@ KAP_ERROR_PROMPT_NOT_PENDING = 40402
 # Card-action names owned by this module (the /sessions switch buttons).
 ACTION_SESSION_SWITCH = "session_switch"
 
-# E3 seam: card-action names owned by the outbound path. The approval names
-# are defined next to the approval card builders in kite/cards.py; the
-# question option-button name is defined here ahead of the rich question
-# card (the MVP question surface is text, kite-design.md §6).
-ACTION_QUESTION_ANSWER = "question_answer"
+# E3 seam: card-action names owned by the outbound path. The approval and
+# question names are defined next to their card builders in kite/cards.py.
+ACTION_QUESTION_ANSWER = cards.ACTION_QUESTION_ANSWER
 APPROVAL_CARD_ACTIONS = frozenset(
     {cards.ACTION_APPROVAL_RESOLVE, cards.ACTION_APPROVAL_REJECT_WITH_FEEDBACK}
 )

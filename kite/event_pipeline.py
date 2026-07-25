@@ -26,10 +26,14 @@ Implements the outbound half of the MVP contract
   call). An approval unanswered for ``approval_timeout_seconds`` is
   resolved to upstream as rejected and the initiator is notified — never
   auto-approved (§3).
-- question.requested is the MVP text pass-through: numbered options to the
-  owner chat; numbered replies are claimed via ``try_handle_interaction_reply``
-  (in groups, only from the initiator or an admin — the same actor rule) and
-  answered over REST; timeout auto-dismisses with a notice.
+- question.requested renders one option-button card per question item to the
+  owner chat (group-chat §3.9); the numbered-reply text pass-through stays as
+  the fallback surface (claimed via ``try_handle_interaction_reply`` — in
+  groups, only from the initiator or an admin, the same actor rule). Button
+  clicks are actor-gated identically to approvals (bystander → denial toast,
+  no state change, no upstream call), answer over REST, and freeze the
+  clicked card; question.answered/dismissed from ANY client freezes every
+  item card. Timeout auto-dismisses and patches the cards closed.
 - fail-close sweep: /new /switch unbinds sweep the old session's pending
   approvals/questions routed to that chat, and kited shutdown sweeps all of
   them — responded upstream (approval rejected, question dismissed) and the
@@ -319,7 +323,16 @@ class _PendingQuestion:
     prompt_id: str
     owner_chat_id: str
     items: tuple[QuestionItemView, ...]
+    # One option-button card per item ("" for an item whose card send
+    # failed); aligned with ``items``.
+    card_message_ids: tuple[str, ...]
     timer: Optional[TimerHandle]
+    # Set when a button click answered the question (the answered event that
+    # closes the entry may lag): repeated clicks get the "已回答" notice and
+    # the clicked item's card keeps its answer label when the event patches
+    # the rest closed.
+    resolved: bool = False
+    answered_item_index: Optional[int] = None
 
 
 @dataclass(slots=True)
@@ -1501,7 +1514,123 @@ class EventPipeline:
         self._cancel_timer(pending)
 
     # ------------------------------------------------------------------
-    # question.* -> MVP text pass-through with numbered replies
+    # Question card actions (AppHandler E3 seam)
+    # ------------------------------------------------------------------
+
+    def handle_question_action(
+        self,
+        action: CardAction,
+        *,
+        is_admin: Optional[Callable[[str], bool]] = None,
+    ) -> CardActionResponse:
+        """Question option buttons (AppHandler E3 seam; runs on the loop).
+
+        Actor rule identical to approvals (group-chat §3.3): only the prompt
+        initiator or an admin may answer; a bystander click is a denial toast
+        with no state change and no upstream call. A valid click answers over
+        REST (same answers payload shape as the numbered reply) and freezes
+        the clicked card with the chosen label; the matching
+        question.answered event then closes the entry and freezes the other
+        item cards. A click before that event lands gets the "已回答" notice
+        (the entry is kept, marked resolved, so the click never
+        double-submits); a click on a gone entry gets "已失效或已处理".
+        """
+        question_id = str(action.value.get("question_id") or "").strip()
+        pending = self._questions.get(question_id)
+        if not question_id or pending is None:
+            return CardActionResponse(toast=cards.QUESTION_STALE_NOTICE)
+        if pending.resolved:
+            return CardActionResponse(toast=cards.QUESTION_ALREADY_ANSWERED_NOTICE)
+        if pending.owner_chat_id != action.chat_id:
+            logger.warning(
+                "question action from foreign chat question=%s chat=%s",
+                question_id,
+                action.chat_id,
+            )
+            return CardActionResponse(toast="该问题只能由发起聊天回答。", toast_type="error")
+        if not self._is_interaction_actor(
+            pending.prompt_id, action.operator_open_id, is_admin
+        ):
+            logger.warning(
+                "question action by non-actor question=%s operator=%s",
+                question_id,
+                action.operator_open_id,
+            )
+            return CardActionResponse(
+                toast="只有该 prompt 的发起者或管理员可以回答此问题。", toast_type="error"
+            )
+        item_index = action.value.get("item_index")
+        label = str(action.value.get("label") or "").strip()
+        if (
+            not isinstance(item_index, int)
+            or isinstance(item_index, bool)
+            or not (0 <= item_index < len(pending.items))
+            or not label
+        ):
+            logger.warning("question action with malformed value: %r", action.value)
+            return CardActionResponse(toast="操作无效。", toast_type="error")
+        item = pending.items[item_index]
+        option = next(
+            (opt for opt in item.options if opt.label.strip() == label), None
+        )
+        if option is None:
+            logger.warning(
+                "question action with unknown label question=%s label=%r",
+                question_id,
+                label,
+            )
+            return CardActionResponse(toast="操作无效。", toast_type="error")
+        # Mark resolved BEFORE the REST call (click-guard discipline): a
+        # nested click while the answer is in flight is a "已回答" notice,
+        # never a double-submit. Transport/business failure rolls back so
+        # the click may be retried.
+        pending.resolved = True
+        pending.answered_item_index = item_index
+        try:
+            self._ops.answer_question(
+                pending.session_id,
+                question_id,
+                {item.item_id: {"kind": "single", "option_id": option.option_id}},
+            )
+        except KapError as exc:
+            if exc.code == KAP_ERROR_ALREADY_RESOLVED:
+                # Resolved elsewhere meanwhile: keep the resolved mark and
+                # freeze; the entry closes with the answered event.
+                return CardActionResponse(
+                    card=cards.build_question_dismissed_card(
+                        header=item.header,
+                        question=item.question,
+                        reason="已在其他客户端处理",
+                    ),
+                    toast=cards.QUESTION_ALREADY_ANSWERED_NOTICE,
+                )
+            pending.resolved = False
+            pending.answered_item_index = None
+            return CardActionResponse(toast=f"提交回答失败：{exc.msg}", toast_type="error")
+        except KapTransportError:
+            pending.resolved = False
+            pending.answered_item_index = None
+            return CardActionResponse(toast=_KAP_UNREACHABLE_TOAST, toast_type="error")
+        if pending.timer is not None:
+            pending.timer.cancel()
+        logger.info(
+            "question answered from card session_id=%s question_id=%s item=%s option=%s",
+            pending.session_id,
+            question_id,
+            item.item_id,
+            option.option_id,
+        )
+        return CardActionResponse(
+            card=cards.build_question_dismissed_card(
+                header=item.header,
+                question=item.question,
+                answer_label=option.label.strip(),
+            ),
+            toast="已回答。",
+        )
+
+    # ------------------------------------------------------------------
+    # question.* -> option-button cards, numbered-reply fallback, timeouts
     # ------------------------------------------------------------------
 
     def _question_requested(self, event: QuestionRequested) -> None:
@@ -1522,10 +1651,34 @@ class EventPipeline:
             self._send_question_expired(event.session_id, targets, prompt_id=prompt_id)
             return
         specs = tuple(_question_spec(item) for item in event.items)
-        self._send_text(
-            owner_chat,
-            cards.build_question_text(specs, timeout_seconds=self._question_timeout),
-        )
+        card_message_ids: list[str] = []
+        all_cards_sent = True
+        for index, spec in enumerate(specs):
+            card = cards.build_question_card(
+                question_id=event.question_id,
+                item_index=index,
+                item=spec,
+                item_count=len(specs),
+                timeout_seconds=self._question_timeout,
+            )
+            message_id = self._send_card(owner_chat, card)
+            if not message_id:
+                all_cards_sent = False
+                logger.error(
+                    "question card send failed chat=%s question=%s item=%d",
+                    owner_chat,
+                    event.question_id,
+                    index,
+                )
+            card_message_ids.append(message_id)
+        if not all_cards_sent:
+            # Fail-closed on the fallback surface (§3.9): a missing card
+            # would hide its options, so the numbered text goes out too —
+            # numbered replies land on the same pending entry.
+            self._send_text(
+                owner_chat,
+                cards.build_question_text(specs, timeout_seconds=self._question_timeout),
+            )
         timer = self._start_timer(
             self._question_timeout, self._question_timed_out, event.question_id
         )
@@ -1535,6 +1688,7 @@ class EventPipeline:
             prompt_id=prompt_id,
             owner_chat_id=owner_chat,
             items=event.items,
+            card_message_ids=tuple(card_message_ids),
             timer=timer,
         )
         logger.info(
@@ -1575,11 +1729,17 @@ class EventPipeline:
         )
 
     def _question_resolved(self, event: QuestionResolved) -> None:
+        """Freeze the item cards (resolution may come from any client, e.g.
+        the web UI or the local CLI — the resolved event is broadcast)."""
         pending = self._questions.pop(event.question_id, None)
         if pending is None:
             return
         if pending.timer is not None:
             pending.timer.cancel()
+        self._patch_question_cards_closed(
+            pending,
+            reason="已在其他客户端关闭" if event.dismissed else "已在其他客户端回答",
+        )
         logger.info(
             "question resolved session_id=%s question_id=%s dismissed=%s",
             event.session_id,
@@ -1587,15 +1747,39 @@ class EventPipeline:
             event.dismissed,
         )
 
+    def _patch_question_cards_closed(self, pending: _PendingQuestion, *, reason: str) -> None:
+        """Patch every item card to its frozen closed form.
+
+        The card already frozen by the answering click keeps its
+        "已回答：<label>" render (it carries the choice; the closed render
+        does not know it)."""
+        for index, message_id in enumerate(pending.card_message_ids):
+            if not message_id or index == pending.answered_item_index:
+                continue
+            header = question = ""
+            if index < len(pending.items):
+                header = pending.items[index].header
+                question = pending.items[index].question
+            self._patch_card(
+                message_id,
+                cards.build_question_dismissed_card(
+                    header=header, question=question, reason=reason
+                ),
+            )
+
     def _question_timed_out(self, question_id: str) -> None:
         pending = self._questions.pop(question_id, None)
-        if pending is None:
+        if pending is None or pending.resolved:
+            # resolved: the timer fire raced the answered event; the click
+            # path already froze the card.
             return
         try:
             self._ops.dismiss_question(pending.session_id, question_id)
         except KapError as exc:
             if exc.code in (KAP_ERROR_ALREADY_RESOLVED, KAP_ERROR_QUESTION_NOT_FOUND):
-                return  # handled upstream meanwhile
+                # Handled upstream meanwhile: freeze as closed elsewhere.
+                self._patch_question_cards_closed(pending, reason="已在其他客户端处理")
+                return
             logger.warning("question dismiss failed %s: %s", question_id, exc)
             return
         except KapTransportError as exc:
@@ -1604,6 +1788,7 @@ class EventPipeline:
             logger.warning("question dismiss unreachable %s: %s", question_id, exc)
             self._questions[question_id] = pending
             return
+        self._patch_question_cards_closed(pending, reason="超时未回复")
         self._send_text(
             pending.owner_chat_id,
             f"⏰ 问题 `{question_id}` 超过 {self._question_timeout // 60} 分钟未回复，已自动关闭。",
@@ -1695,8 +1880,9 @@ class EventPipeline:
                     logger.warning("sweep: question %s dismiss failed: %s", question_id, exc)
             except KapTransportError as exc:
                 logger.warning("sweep: question %s dismiss unreachable: %s", question_id, exc)
-            # The MVP question surface is text (no card to patch); the
-            # closing notice is its expired/closed equivalent.
+            # A swept card never stays clickable (fail-closed); the closing
+            # notice keeps the reason visible in the chat stream.
+            self._patch_question_cards_closed(pending, reason=reason)
             self._send_text(
                 pending.owner_chat_id,
                 f"问题 `{question_id}` 已关闭（{reason}）。",
@@ -1982,9 +2168,12 @@ class EventPipeline:
                 continue
             if question_id in upstream_pending:
                 continue
+            # Resolved elsewhere while disconnected -> freeze the cards
+            # (the chosen answer is unknown -> generic closed render).
             self._questions.pop(question_id, None)
             if pending.timer is not None:
                 pending.timer.cancel()
+            self._patch_question_cards_closed(pending, reason="已在其他客户端处理")
         for view in upstream_pending.values():
             if view.question_id in self._questions:
                 continue
@@ -2252,6 +2441,11 @@ class OutboundAppHandler(AppHandler):
         # Same split as approvals: the pipeline owns the abort, the handler
         # owns the admin set for the actor check.
         return self._event_pipeline.handle_abort_action(action, is_admin=self._is_admin)
+
+    def handle_question_action(self, action: CardAction) -> CardActionResponse:
+        # Same split as approvals: the pipeline owns the pending-question
+        # state, the handler owns the admin set for the actor check.
+        return self._event_pipeline.handle_question_action(action, is_admin=self._is_admin)
 
     def try_handle_interaction_reply(self, message: InboundMessage) -> bool:
         return self._event_pipeline.try_handle_interaction_reply(

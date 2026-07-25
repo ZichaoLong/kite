@@ -341,26 +341,32 @@ def approval_requested(
 
 
 def question_requested(
-    *, question_id: str = "q-1", turn_id: int = 1, session_id: str = SESSION_ID
+    *,
+    question_id: str = "q-1",
+    turn_id: int = 1,
+    session_id: str = SESSION_ID,
+    questions: list | None = None,
 ) -> KapEvent:
+    if questions is None:
+        questions = [
+            {
+                "id": "q_0",
+                "question": "部署到哪个环境？",
+                "header": "环境",
+                "options": [
+                    {"id": "opt_0_0", "label": "开发", "description": "dev"},
+                    {"id": "opt_0_1", "label": "生产"},
+                ],
+                "allow_other": True,
+            }
+        ]
     return kap_event(
         "event.question.requested",
         {
             "question_id": question_id,
             "session_id": session_id,
             "turn_id": turn_id,
-            "questions": [
-                {
-                    "id": "q_0",
-                    "question": "部署到哪个环境？",
-                    "header": "环境",
-                    "options": [
-                        {"id": "opt_0_0", "label": "开发", "description": "dev"},
-                        {"id": "opt_0_1", "label": "生产"},
-                    ],
-                    "allow_other": True,
-                }
-            ],
+            "questions": questions,
             "created_at": "2026-01-01T00:00:00Z",
         },
         session_id=session_id,
@@ -432,6 +438,22 @@ def make_card_action(
         message_id="om_card_action",
         value=value,
     )
+
+
+def _collect_buttons(node: object) -> list[dict]:
+    if isinstance(node, dict):
+        buttons: list[dict] = []
+        if node.get("tag") == "button":
+            buttons.append(node)
+        for value in node.values():
+            buttons.extend(_collect_buttons(value))
+        return buttons
+    if isinstance(node, list):
+        buttons = []
+        for item in node:
+            buttons.extend(_collect_buttons(item))
+        return buttons
+    return []
 
 
 class PipelineTestCase(unittest.TestCase):
@@ -955,7 +977,7 @@ class ApprovalTests(PipelineTestCase):
 
 
 # ---------------------------------------------------------------------------
-# question.* lifecycle (MVP text pass-through)
+# question.* lifecycle (option-button cards + numbered-reply fallback, §3.9)
 # ---------------------------------------------------------------------------
 
 
@@ -967,15 +989,26 @@ class QuestionTests(PipelineTestCase):
         self.ownership.record("p-1", CHAT_ID)
         self.feed(question_requested())
 
-    def test_question_text_goes_to_owner_only_others_get_notice(self) -> None:
+    def test_question_card_goes_to_owner_only_others_get_notice(self) -> None:
         self._start_and_request_question()
 
-        texts = self.transport.texts_to(CHAT_ID)
-        self.assertEqual(len(texts), 1)
-        self.assertIn("部署到哪个环境？", texts[0])
-        self.assertIn("1. 开发", texts[0])
-        self.assertIn("2. 生产", texts[0])
-        self.assertIn("回复选项编号", texts[0])
+        # The owner gets one option-button card per question item (§3.9),
+        # not the text pass-through.
+        owner_cards = self.transport.cards_to(CHAT_ID)
+        question_card = owner_cards[-1]["content"]
+        rendered = json.dumps(question_card, ensure_ascii=False)
+        self.assertIn("部署到哪个环境？", rendered)
+        self.assertIn("开发", rendered)
+        self.assertIn("生产", rendered)
+        self.assertEqual(self.transport.texts_to(CHAT_ID), [])
+        buttons = _collect_buttons(question_card)
+        self.assertEqual(
+            [button["value"] for button in buttons],
+            [
+                {"action": "question_answer", "question_id": "q-1", "item_index": 0, "label": "开发"},
+                {"action": "question_answer", "question_id": "q-1", "item_index": 0, "label": "生产"},
+            ],
+        )
         notices = self.transport.texts_to(CHAT_ID_2)
         self.assertEqual(len(notices), 1)
         self.assertIn("等待 `p-1` 号 prompt 的发起者处理", notices[0])
@@ -1038,6 +1071,228 @@ class QuestionTests(PipelineTestCase):
 
         self.assertEqual(self.rest.dismissals, [(SESSION_ID, "q-1")])
         self.assertIn("已自动关闭", self.transport.texts_to(CHAT_ID)[-1])
+
+    def _question_click(self, *, operator: str = ADMIN_OPEN_ID, chat_id: str = CHAT_ID, **value_overrides):
+        value = {
+            "action": cards.ACTION_QUESTION_ANSWER,
+            "question_id": "q-1",
+            "item_index": 0,
+            "label": "生产",
+        }
+        value.update(value_overrides)
+        return self.handler.on_card_action(make_card_action(value, operator=operator, chat_id=chat_id))
+
+    def test_button_click_answers_and_freezes_card(self) -> None:
+        self._start_and_request_question()
+        card_message_id = self.transport.cards_to(CHAT_ID)[-1]["message_id"]
+
+        response = self._question_click()
+
+        self.assertEqual(
+            self.rest.question_answers,
+            [
+                {
+                    "session_id": SESSION_ID,
+                    "question_id": "q-1",
+                    "body": {"answers": {"q_0": {"kind": "single", "option_id": "opt_0_1"}}},
+                }
+            ],
+        )
+        # The clicked card is frozen with the chosen label; the timer is gone.
+        self.assertIsNotNone(response.card)
+        frozen = json.dumps(response.card, ensure_ascii=False)
+        self.assertIn("已回答：生产", frozen)
+        self.assertNotIn("button", frozen)
+        self.assertIn("已回答", response.toast or "")
+        self.assertEqual(self.timers.live, [])
+        # The follow-up answered event closes the entry without re-patching
+        # the clicked card (it keeps the answer label).
+        self.feed(
+            kap_event("event.question.answered", {"question_id": "q-1", "answers": {}, "resolved_at": "2026-01-01T00:00:00Z"})
+        )
+        self.assertEqual(self.transport.patches_to(card_message_id), [])
+
+    def test_second_click_before_event_gets_already_answered_notice(self) -> None:
+        self._start_and_request_question()
+        self._question_click()
+
+        second = self._question_click()
+
+        self.assertEqual(second.toast, cards.QUESTION_ALREADY_ANSWERED_NOTICE)
+        self.assertNotEqual(second.toast_type, "error")
+        self.assertIsNone(second.card)
+        self.assertEqual(len(self.rest.question_answers), 1)
+
+    def test_click_after_event_gets_stale_notice(self) -> None:
+        self._start_and_request_question()
+        self._question_click()
+        self.feed(
+            kap_event("event.question.answered", {"question_id": "q-1", "answers": {}, "resolved_at": "2026-01-01T00:00:00Z"})
+        )
+
+        response = self._question_click()
+
+        self.assertEqual(response.toast, cards.QUESTION_STALE_NOTICE)
+        self.assertEqual(len(self.rest.question_answers), 1)
+
+    def test_click_on_unknown_question_gets_stale_notice(self) -> None:
+        self._start_and_request_question()
+
+        response = self._question_click(question_id="q-ghost")
+
+        self.assertEqual(response.toast, cards.QUESTION_STALE_NOTICE)
+        self.assertEqual(self.rest.question_answers, [])
+
+    def test_click_from_foreign_chat_is_denied(self) -> None:
+        self._start_and_request_question()
+
+        response = self._question_click(chat_id=CHAT_ID_2)
+
+        self.assertEqual(response.toast_type, "error")
+        self.assertIn("发起聊天", response.toast or "")
+        self.assertEqual(self.rest.question_answers, [])
+
+    def test_click_with_malformed_value_is_an_error_toast(self) -> None:
+        self._start_and_request_question()
+
+        for bad_value in (
+            {"item_index": 9, "label": "生产"},  # out of range
+            {"item_index": 0, "label": "不存在"},  # unknown label
+            {"item_index": "0", "label": "生产"},  # wrong type
+        ):
+            value = {"action": cards.ACTION_QUESTION_ANSWER, "question_id": "q-1"}
+            value.update(bad_value)
+            response = self.handler.on_card_action(make_card_action(value))
+            self.assertEqual(response.toast_type, "error")
+            self.assertIn("操作无效", response.toast or "")
+        self.assertEqual(self.rest.question_answers, [])
+
+    def test_answered_event_from_any_client_freezes_card_and_cancels_timer(self) -> None:
+        self._start_and_request_question()
+        card_message_id = self.transport.cards_to(CHAT_ID)[-1]["message_id"]
+
+        self.feed(
+            kap_event("event.question.answered", {"question_id": "q-1", "answers": {}, "resolved_at": "2026-01-01T00:00:00Z"})
+        )
+
+        patches = self.transport.patches_to(card_message_id)
+        self.assertEqual(len(patches), 1)
+        rendered = json.dumps(patches[0], ensure_ascii=False)
+        self.assertIn("已关闭", rendered)
+        self.assertIn("已在其他客户端回答", rendered)
+        self.assertNotIn("button", rendered)
+        self.assertEqual(self.timers.live, [])
+
+    def test_timeout_freezes_the_card(self) -> None:
+        self._start_and_request_question()
+        card_message_id = self.transport.cards_to(CHAT_ID)[-1]["message_id"]
+
+        self.timers.fire(0)
+        self.flush()
+
+        patch = json.dumps(self.transport.patches_to(card_message_id)[-1], ensure_ascii=False)
+        self.assertIn("已关闭", patch)
+        self.assertIn("超时未回复", patch)
+
+    def test_numbered_reply_still_answers_and_event_freezes_card(self) -> None:
+        # The numbered fallback and the buttons land on the same pending
+        # entry; the card freezes when the answered event lands.
+        self._start_and_request_question()
+        card_message_id = self.transport.cards_to(CHAT_ID)[-1]["message_id"]
+
+        self.handler.on_message(make_message("2"))
+
+        self.assertEqual(
+            self.rest.question_answers,
+            [
+                {
+                    "session_id": SESSION_ID,
+                    "question_id": "q-1",
+                    "body": {"answers": {"q_0": {"kind": "single", "option_id": "opt_0_1"}}},
+                }
+            ],
+        )
+        self.feed(
+            kap_event("event.question.answered", {"question_id": "q-1", "answers": {}, "resolved_at": "2026-01-01T00:00:00Z"})
+        )
+        patch = json.dumps(self.transport.patches_to(card_message_id)[-1], ensure_ascii=False)
+        self.assertIn("已关闭", patch)
+        self.assertEqual(self.timers.live, [])
+
+    def test_card_send_failure_falls_back_to_numbered_text(self) -> None:
+        self.bind(CHAT_ID)
+        self.bind(CHAT_ID_2)
+        self.start_prompt()
+        self.ownership.record("p-1", CHAT_ID)
+        self.transport.fail_sends = True
+        self.feed(question_requested())
+
+        texts = self.transport.texts_to(CHAT_ID)
+        self.assertEqual(len(texts), 1)
+        self.assertIn("回复选项编号", texts[0])
+        # The pending entry is still answerable via the numbered reply.
+        self.handler.on_message(make_message("1"))
+        self.assertEqual(len(self.rest.question_answers), 1)
+
+    def test_multi_item_question_renders_one_card_per_item(self) -> None:
+        self.bind(CHAT_ID)
+        self.start_prompt()
+        self.ownership.record("p-1", CHAT_ID)
+        self.feed(
+            question_requested(
+                questions=[
+                    {
+                        "id": "q_0",
+                        "question": "问题一？",
+                        "options": [
+                            {"id": "opt_0_0", "label": "甲"},
+                            {"id": "opt_0_1", "label": "乙"},
+                        ],
+                    },
+                    {
+                        "id": "q_1",
+                        "question": "问题二？",
+                        "options": [
+                            {"id": "opt_1_0", "label": "丙"},
+                            {"id": "opt_1_1", "label": "丁"},
+                        ],
+                    },
+                ]
+            )
+        )
+
+        question_cards = self.transport.cards_to(CHAT_ID)[-2:]
+        self.assertIn("问题一？", json.dumps(question_cards[0]["content"], ensure_ascii=False))
+        self.assertIn("问题二？", json.dumps(question_cards[1]["content"], ensure_ascii=False))
+        first_buttons = _collect_buttons(question_cards[0]["content"])
+        second_buttons = _collect_buttons(question_cards[1]["content"])
+        self.assertEqual(
+            [button["value"]["item_index"] for button in first_buttons], [0, 0]
+        )
+        self.assertEqual(
+            [button["value"]["item_index"] for button in second_buttons], [1, 1]
+        )
+        self.assertEqual(
+            [button["value"]["label"] for button in second_buttons], ["丙", "丁"]
+        )
+        # Only one timeout timer for the whole question.
+        self.assertEqual(len(self.timers.live), 1)
+
+        # Clicking item 2 answers that item over REST.
+        response = self._question_click(item_index=1, label="丁")
+        self.assertEqual(
+            self.rest.question_answers[-1]["body"],
+            {"answers": {"q_1": {"kind": "single", "option_id": "opt_1_1"}}},
+        )
+        self.assertIn("已回答：丁", json.dumps(response.card, ensure_ascii=False))
+        # The answered event freezes item 1's card; item 2's keeps its label.
+        self.feed(
+            kap_event("event.question.answered", {"question_id": "q-1", "answers": {}, "resolved_at": "2026-01-01T00:00:00Z"})
+        )
+        patches = self.transport.patches_to(question_cards[0]["message_id"])
+        self.assertEqual(len(patches), 1)
+        self.assertIn("已关闭", json.dumps(patches[0], ensure_ascii=False))
+        self.assertEqual(self.transport.patches_to(question_cards[1]["message_id"]), [])
 
     def test_unknown_ownership_gets_expired_notice(self) -> None:
         self.bind(CHAT_ID)
@@ -1526,13 +1781,15 @@ class SweepTests(PipelineTestCase):
     def _pending_approval_and_question(self) -> str:
         """A bound chat with one tracked pending approval + question.
 
-        Returns the approval card's message id."""
+        Returns the approval card's message id (the question's option-button
+        card is sent after it, so capture before feeding the question)."""
         self.bind(CHAT_ID)
         self.start_prompt()
         self.ownership.record("p-1", CHAT_ID)
         self.feed(approval_requested())
+        approval_card_id = self.transport.cards_to(CHAT_ID)[-1]["message_id"]
         self.feed(question_requested())
-        return self.transport.cards_to(CHAT_ID)[-1]["message_id"]
+        return approval_card_id
 
     def test_new_sweeps_old_session_pending_interactions(self) -> None:
         approval_card_id = self._pending_approval_and_question()
@@ -1824,6 +2081,55 @@ class GroupActorTests(PipelineTestCase):
         self.handler.on_message(make_group_message("1", sender=OTHER_OPEN_ID))
 
         self.assertEqual(len(self.rest.question_answers), 1)
+
+    def _group_question_click(self, operator: str):
+        return self.handler.on_card_action(
+            make_card_action(
+                {
+                    "action": cards.ACTION_QUESTION_ANSWER,
+                    "question_id": "q-1",
+                    "item_index": 0,
+                    "label": "生产",
+                },
+                operator=operator,
+                chat_id=GROUP_CHAT_ID,
+            )
+        )
+
+    def test_group_question_button_click_from_bystander_is_denied(self) -> None:
+        self._start_group_question()
+        card_message_id = self.transport.cards_to(GROUP_CHAT_ID)[-1]["message_id"]
+
+        response = self._group_question_click(BYSTANDER_OPEN_ID)
+
+        self.assertEqual(response.toast_type, "error")
+        self.assertIn("发起者或管理员", response.toast or "")
+        # No upstream call, no card patch, and the question is still live:
+        # the initiator can still answer it afterwards (§3.3).
+        self.assertEqual(self.rest.question_answers, [])
+        self.assertEqual(self.transport.patches_to(card_message_id), [])
+        followup = self._group_question_click(MEMBER_OPEN_ID)
+        self.assertIn("已回答", followup.toast or "")
+        self.assertEqual(len(self.rest.question_answers), 1)
+
+    def test_group_question_button_click_from_initiator_is_answered(self) -> None:
+        self._start_group_question()
+
+        response = self._group_question_click(MEMBER_OPEN_ID)
+
+        self.assertEqual(len(self.rest.question_answers), 1)
+        answer = self.rest.question_answers[0]
+        self.assertEqual(answer["session_id"], SESSION_ID)
+        self.assertEqual(answer["question_id"], "q-1")
+        self.assertIn("已回答", response.toast or "")
+
+    def test_group_question_button_click_from_admin_is_answered(self) -> None:
+        self._start_group_question()
+
+        response = self._group_question_click(OTHER_OPEN_ID)
+
+        self.assertEqual(len(self.rest.question_answers), 1)
+        self.assertIn("已回答", response.toast or "")
 
 
 # ---------------------------------------------------------------------------

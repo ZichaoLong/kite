@@ -6,6 +6,7 @@ from kite.cards import (
     ACTION_APPROVAL_REJECT_WITH_FEEDBACK,
     ACTION_APPROVAL_RESOLVE,
     ACTION_PROMPT_ABORT,
+    ACTION_QUESTION_ANSWER,
     APPROVAL_ALREADY_PROCESSED_NOTICE,
     EXECUTION_STATE_FROZEN_DONE,
     EXECUTION_STATE_FROZEN_UNKNOWN,
@@ -17,6 +18,8 @@ from kite.cards import (
     build_approval_expired_card,
     build_approval_resolved_card,
     build_execution_card,
+    build_question_card,
+    build_question_dismissed_card,
     build_question_text,
     build_terminal_card,
     terminal_result_checksum,
@@ -426,6 +429,114 @@ class QuestionTextTests(unittest.TestCase):
             ]
         )
         self.assertIn("1. 有效", text)
+
+
+class QuestionCardTests(unittest.TestCase):
+    def test_buttons_carry_question_id_item_index_and_label(self) -> None:
+        card = build_question_card(
+            question_id="q-1",
+            item_index=0,
+            item=QuestionItemSpec(
+                header="环境",
+                question="部署到哪个环境？",
+                options=(
+                    QuestionOptionSpec("开发", "本地开发环境"),
+                    QuestionOptionSpec("生产"),
+                ),
+            ),
+        )
+        buttons = _collect_buttons(card)
+        self.assertEqual(
+            [button["text"]["content"] for button in buttons], ["开发", "生产"]
+        )
+        self.assertEqual(
+            buttons[1]["value"],
+            {
+                "action": ACTION_QUESTION_ANSWER,
+                "question_id": "q-1",
+                "item_index": 0,
+                "label": "生产",
+            },
+        )
+        markdown = "\n".join(_collect_markdown(card))
+        self.assertIn("**环境**", markdown)
+        self.assertIn("部署到哪个环境？", markdown)
+        self.assertIn("1. 开发 — 本地开发环境", markdown)
+        self.assertIn("2. 生产", markdown)
+        self.assertIn("5 分钟内未回答将自动关闭", markdown)
+
+    def test_multi_item_header_defaults_to_numbered(self) -> None:
+        card = build_question_card(
+            question_id="q-1",
+            item_index=1,
+            item=QuestionItemSpec(
+                question="问题二？",
+                options=(QuestionOptionSpec("丙"), QuestionOptionSpec("丁")),
+            ),
+            item_count=2,
+        )
+        self.assertIn("**问题 2**", "\n".join(_collect_markdown(card)))
+        buttons = _collect_buttons(card)
+        self.assertEqual([button["value"]["item_index"] for button in buttons], [1, 1])
+
+    def test_multi_select_and_allow_other_notes(self) -> None:
+        card = build_question_card(
+            question_id="q-1",
+            item_index=0,
+            item=QuestionItemSpec(
+                question="选哪些？",
+                options=(QuestionOptionSpec("甲"), QuestionOptionSpec("乙")),
+                multi_select=True,
+                allow_other=True,
+            ),
+        )
+        markdown = "\n".join(_collect_markdown(card))
+        self.assertIn("可多选", markdown)
+        self.assertIn("按钮为单选", markdown)
+        self.assertIn("其他：你的内容", markdown)
+
+    def test_item_without_options_renders_text_only(self) -> None:
+        card = build_question_card(
+            question_id="q-1",
+            item_index=0,
+            item=QuestionItemSpec(question="说说你的想法？", options=()),
+        )
+        self.assertEqual(_collect_buttons(card), [])
+        self.assertIn("说说你的想法？", "\n".join(_collect_markdown(card)))
+
+    def test_zero_timeout_omits_timeout_note(self) -> None:
+        card = build_question_card(
+            question_id="q-1",
+            item_index=0,
+            item=QuestionItemSpec(
+                question="Q?", options=(QuestionOptionSpec("甲"), QuestionOptionSpec("乙"))
+            ),
+            timeout_seconds=0,
+        )
+        self.assertNotIn("dismiss", "\n".join(_collect_markdown(card)))
+
+
+class QuestionDismissedCardTests(unittest.TestCase):
+    def test_answered_card_shows_the_chosen_label(self) -> None:
+        card = build_question_dismissed_card(
+            header="环境", question="部署到哪个环境？", answer_label="生产"
+        )
+        markdown = "\n".join(_collect_markdown(card))
+        self.assertIn("部署到哪个环境？", markdown)
+        self.assertIn("已回答：生产", markdown)
+        self.assertIn("已回答", card["header"]["title"]["content"])
+        self.assertEqual(_collect_buttons(card), [])
+
+    def test_closed_card_shows_reason(self) -> None:
+        card = build_question_dismissed_card(question="Q?", reason="超时未回复")
+        markdown = "\n".join(_collect_markdown(card))
+        self.assertIn("已关闭（超时未回复）。", markdown)
+        self.assertIn("已关闭", card["header"]["title"]["content"])
+        self.assertEqual(_collect_buttons(card), [])
+
+    def test_closed_card_without_reason(self) -> None:
+        card = build_question_dismissed_card(question="Q?")
+        self.assertIn("已关闭。", "\n".join(_collect_markdown(card)))
 
 
 if __name__ == "__main__":

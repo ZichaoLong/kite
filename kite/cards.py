@@ -32,8 +32,13 @@ Ported from FOCUS ``bot/cards.py`` but rewritten to kap event semantics
   gets the ``APPROVAL_ALREADY_PROCESSED_NOTICE`` toast, not an error.
   Unrebuildable-after-restart / timed-out approvals are explicitly closed out
   with the expired card (fail-closed, mvp-scope §4.6).
-- Question (MVP): text pass-through listing numbered options; reply with the
-  option number; auto-dismiss on timeout. The rich form card is Phase 2.
+- Question (group-chat §3.9): question.requested renders one option-button
+  card per question item to the owner chat (button value carries
+  ``question_id`` + ``item_index`` + ``label``); a click answers over REST
+  and the card is patched to the frozen dismissed card, as are timeout and
+  resolution from any client. The numbered-reply text pass-through
+  (``build_question_text``) stays as the fallback surface (multi-select,
+  custom "其他：…" answers, and card-send failure).
 
 Deliberately not ported from FOCUS (see module test file for the locked
 surface): goal/plan/model/group/thread-list/settings cards, help navigation
@@ -93,6 +98,10 @@ ACTION_APPROVAL_RESOLVE = "approval_resolve"
 ACTION_APPROVAL_REJECT_WITH_FEEDBACK = "approval_reject_with_feedback"
 ACTION_PROMPT_ABORT = "prompt_abort"
 
+# Question option-button value contract (consumed by the application layer's
+# on_card_action): one click answers one question item with one option.
+ACTION_QUESTION_ANSWER = "question_answer"
+
 # kap approval decisions (packages/protocol/src/approval.ts).
 APPROVAL_DECISION_APPROVED = "approved"
 APPROVAL_DECISION_REJECTED = "rejected"
@@ -108,6 +117,12 @@ APPROVAL_ALREADY_PROCESSED_NOTICE = "该审批已处理，请勿重复操作。"
 # never a double-submit.
 APPROVAL_PROCESSING_NOTICE = "正在处理中，请稍候。"
 APPROVAL_STALE_NOTICE = "该审批已失效或已处理。"
+
+# Question click toasts: a second click on an already-answered question (the
+# answered event has not landed yet) and a click on an entry that is gone
+# (answered, dismissed, swept, or expired) — both notices, never errors.
+QUESTION_ALREADY_ANSWERED_NOTICE = "该问题已回答，请勿重复操作。"
+QUESTION_STALE_NOTICE = "该问题已失效或已处理。"
 
 # Default interaction timeouts (mvp-scope §3: approval timeout default 5
 # minutes, configurable; question auto-dismiss shares the MVP default).
@@ -125,6 +140,7 @@ _PROMPT_SNIPPET_MAX = 200
 _EXECUTION_CARD_TITLE = "Kimi 执行过程"
 _TERMINAL_CARD_TITLE = "Kimi 执行结果"
 _APPROVAL_CARD_TITLE = "Kimi 审批请求"
+_QUESTION_CARD_TITLE = "Kimi 提问"
 
 _APPROVAL_DECISION_LABELS = {
     APPROVAL_DECISION_APPROVED: "已批准",
@@ -531,7 +547,8 @@ def build_approval_expired_card(*, reason: str = "") -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Question (MVP: text pass-through; the rich form card is Phase 2)
+# Question (group-chat §3.9: option-button card per item, numbered reply as
+# the fallback surface)
 # ---------------------------------------------------------------------------
 
 
@@ -545,7 +562,7 @@ class QuestionOptionSpec:
 
 @dataclass(frozen=True, slots=True)
 class QuestionItemSpec:
-    """One question to render in the MVP text pass-through."""
+    """One question item to render (button card or text fallback)."""
 
     question: str
     header: str = ""
@@ -554,12 +571,123 @@ class QuestionItemSpec:
     allow_other: bool = False
 
 
+def build_question_card(
+    *,
+    question_id: str,
+    item_index: int,
+    item: QuestionItemSpec,
+    item_count: int = 1,
+    timeout_seconds: int = DEFAULT_QUESTION_TIMEOUT_SECONDS,
+) -> dict:
+    """Build the option-button card for ONE question item.
+
+    Every button carries ``question_id`` + ``item_index`` + the option label
+    in its value so the application layer can route the answer to the right
+    pending question and render the frozen card with the chosen label. The
+    options are also listed as numbered text (with descriptions) so the
+    numbered-reply fallback keeps working from the same surface; a click on a
+    multi-select item answers it single-select, so those items keep the
+    `1,3` reply hint, and ``allow_other`` items keep the custom-text hint.
+    """
+    question_id = str(question_id or "").strip()
+    item_index = int(item_index)
+
+    header = str(item.header or "").strip()
+    if not header and item_count > 1:
+        header = f"问题 {item_index + 1}"
+    lines: list[str] = []
+    if header:
+        lines.append(f"**{header}**")
+    lines.append(str(item.question or "").strip() or "（空问题）")
+    rendered_options = [
+        option for option in item.options if str(option.label or "").strip()
+    ]
+    for option_index, option in enumerate(rendered_options, start=1):
+        line = f"{option_index}. {option.label.strip()}"
+        if str(option.description or "").strip():
+            line += f" — {option.description.strip()}"
+        lines.append(line)
+    if item.multi_select and rendered_options:
+        lines.append("（可多选，回复如 `1,3`；按钮为单选）")
+    if item.allow_other:
+        lines.append("（回复「其他：你的内容」可自定义回答）")
+    timeout_seconds = max(int(timeout_seconds), 0)
+    if timeout_seconds > 0:
+        lines.append(f"{timeout_seconds // 60} 分钟内未回答将自动关闭（dismiss）。")
+
+    elements: list[dict] = [
+        _markdown(sanitize_runtime_markdown_for_feishu_card("\n".join(lines)))
+    ]
+    if rendered_options:
+        buttons = [
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": option.label.strip()},
+                "type": "default",
+                "value": {
+                    "action": ACTION_QUESTION_ANSWER,
+                    "question_id": question_id,
+                    "item_index": item_index,
+                    "label": option.label.strip(),
+                },
+            }
+            for option in rendered_options
+        ]
+        elements.append({"tag": "hr"})
+        elements.append({"tag": "action", "actions": buttons})
+
+    return {
+        "config": _card_config(),
+        "header": _header(_QUESTION_CARD_TITLE, "blue"),
+        "elements": elements,
+    }
+
+
+def build_question_dismissed_card(
+    *,
+    header: str = "",
+    question: str = "",
+    answer_label: str = "",
+    reason: str = "",
+) -> dict:
+    """Build the frozen question card (patched in place after an answer, a
+    dismiss, or a timeout; buttons are gone, so no further clicks can race
+    the closing event).
+
+    ``answer_label`` is the click path's chosen option ("已回答：<label>").
+    Otherwise the card reads "已关闭（<reason>）。" — reason is a short
+    fragment like 超时未回复 / 已在其他客户端处理 / the sweep reason."""
+    lines: list[str] = []
+    header = str(header or "").strip()
+    if header:
+        lines.append(f"**{header}**")
+    question = str(question or "").strip()
+    if question:
+        lines.append(question)
+    answer_label = str(answer_label or "").strip()
+    if answer_label:
+        title = f"{_QUESTION_CARD_TITLE}（已回答）"
+        lines.append(f"已回答：{answer_label}")
+    else:
+        title = f"{_QUESTION_CARD_TITLE}（已关闭）"
+        status = "已关闭"
+        reason = str(reason or "").strip()
+        if reason:
+            status += f"（{reason}）"
+        lines.append(status + "。")
+    return {
+        "config": _card_config(),
+        "header": _header(title, "grey"),
+        "elements": [_markdown("\n".join(lines))],
+    }
+
+
 def build_question_text(
     items: Sequence[QuestionItemSpec],
     *,
     timeout_seconds: int = DEFAULT_QUESTION_TIMEOUT_SECONDS,
 ) -> str:
-    """Build the MVP question pass-through text.
+    """Build the numbered question text (the fallback surface of §3.9).
 
     Lists each question with numbered options and the reply convention; the
     application layer maps the user's numbered reply to the kap answers
