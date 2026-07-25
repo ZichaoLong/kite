@@ -57,6 +57,8 @@ class AppendDeltaTests(unittest.TestCase):
         transcript.rebuild_from_snapshot("xy")
         self.assertFalse(transcript.gapped)
         self.assertEqual(transcript.expected_offset, 2)
+        self.assertFalse(transcript.append_delta(2, "z"))
+        self.assertEqual(transcript.full_text(), "xyz")
 
     def test_non_bmp_characters_do_not_false_gap(self) -> None:
         # Upstream offsets are JS String.length (UTF-16 code units): one
@@ -72,8 +74,6 @@ class AppendDeltaTests(unittest.TestCase):
         self.assertEqual(transcript.expected_offset, 4)
         self.assertFalse(transcript.append_delta(4, "c"))
         self.assertEqual(transcript.full_text(), "a😀bc")
-        self.assertFalse(transcript.append_delta(2, "z"))
-        self.assertEqual(transcript.full_text(), "xyz")
 
     def test_overflow_latches_the_gap(self) -> None:
         transcript = StreamingTranscript()
