@@ -141,6 +141,7 @@ class FakeKapRestClient:
         busy: bool = False,
         pending_interaction: str | None = None,
         archived: bool = False,
+        updated_at: str = "",
     ) -> dict:
         session = {
             "id": session_id,
@@ -148,6 +149,7 @@ class FakeKapRestClient:
             "busy": busy,
             "pending_interaction": pending_interaction,
             "archived": archived,
+            "updated_at": updated_at,
             "metadata": {"cwd": cwd} if cwd else {},
         }
         self.sessions[session_id] = session
@@ -231,6 +233,7 @@ class FakeKapRestClient:
                 busy=session["busy"],
                 pending_interaction=session["pending_interaction"],
                 archived=session["archived"],
+                updated_at=session.get("updated_at", ""),
             )
             for session in self.sessions.values()
         ]
@@ -1072,6 +1075,17 @@ class SessionsTests(AppHandlerTestCase):
         self.send("/sessions")
         self.assertIn("没有可用会话", self.transport.last_text())
         self.assertEqual(self.transport.cards, [])
+
+    def test_sessions_sorted_by_recent_activity(self) -> None:
+        self.rest.add_session("s-old", title="Old", updated_at="2026-07-01T00:00:00Z")
+        self.rest.add_session("s-new", title="New", updated_at="2026-07-25T00:00:00Z")
+        self.rest.add_session("s-mid", title="Mid", updated_at="2026-07-10T00:00:00Z")
+
+        self.send("/sessions")
+
+        markdown = _card_elements(self.transport.cards[0]["card"])[0]["content"]
+        self.assertLess(markdown.index("New"), markdown.index("Mid"))
+        self.assertLess(markdown.index("Mid"), markdown.index("Old"))
 
     def test_sessions_when_kap_down(self) -> None:
         self.rest.list_error = KapTransportError("down")

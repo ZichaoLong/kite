@@ -1265,7 +1265,13 @@ class AppHandler(TransportHandler):
             self._reply_to(message, build_usage_text("/sessions"))
             return
         try:
-            sessions = [s for s in self._ops.list_sessions() if not s.archived]
+            # Most recent activity first (mvp-scope aligned item 3), by the
+            # upstream updated_at the adapter now normalizes.
+            sessions = sorted(
+                (s for s in self._ops.list_sessions() if not s.archived),
+                key=lambda s: s.updated_at,
+                reverse=True,
+            )
         except KapTransportError:
             self._reply_to(message, _KAP_UNREACHABLE_TEXT)
             return

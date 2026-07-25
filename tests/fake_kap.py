@@ -41,6 +41,7 @@ class FakeSession:
         self.busy = False
         self.pending_interaction: str | None = None
         self.archived = False
+        self.updated_at = "2026-01-01T00:00:00Z"
         self.epoch = f"epoch-{uuid.uuid4().hex[:6]}"
         self.seq = 0
         self.journal: list[dict[str, Any]] = []
@@ -208,7 +209,7 @@ def _session_wire(session: FakeSession) -> dict[str, Any]:
         "workspace_id": "ws-1",
         "title": session.title,
         "created_at": "2026-01-01T00:00:00Z",
-        "updated_at": "2026-01-01T00:00:00Z",
+        "updated_at": session.updated_at,
         "busy": session.busy,
         "pending_interaction": session.pending_interaction,
         "archived": session.archived,

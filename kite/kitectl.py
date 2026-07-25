@@ -135,7 +135,9 @@ def _print_lines(lines: list[str]) -> None:
 
 def _cmd_session_list(_args: argparse.Namespace) -> int:
     client = _connect()
-    sessions = _checked(client.list_sessions)
+    sessions = sorted(
+        _checked(client.list_sessions), key=lambda s: s.updated_at, reverse=True
+    )
     rows = [
         [
             session.session_id,

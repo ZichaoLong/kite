@@ -148,6 +148,9 @@ class SessionSummary:
     busy: bool
     pending_interaction: str | None
     archived: bool
+    # ISO-8601 upstream activity timestamp; "" when the server omits it.
+    # Lexicographic compare works for the server's uniform format.
+    updated_at: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1677,6 +1680,7 @@ def _parse_session_summary(raw: dict[str, Any]) -> SessionSummary:
         busy=bool(raw.get("busy")),
         pending_interaction=_optional_str(raw.get("pending_interaction")),
         archived=bool(raw.get("archived")),
+        updated_at=str(raw.get("updated_at") or ""),
     )
 
 

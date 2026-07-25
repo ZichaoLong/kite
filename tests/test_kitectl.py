@@ -65,6 +65,17 @@ class SessionListTests(KitectlTestCase):
 
         self.assertEqual(code, 0)
         self.assertIn("SESSION_ID", out)
+
+    def test_lists_sessions_sorted_by_recent_activity(self) -> None:
+        old = self.state.create_session("s-old", title="old")
+        old.updated_at = "2026-07-01T00:00:00Z"
+        new = self.state.create_session("s-new", title="new")
+        new.updated_at = "2026-07-25T00:00:00Z"
+
+        code, out, _ = self._run_cli("session", "list")
+
+        self.assertEqual(code, 0)
+        self.assertLess(out.index("s-new"), out.index("s-old"))
         self.assertIn("s-abc", out)
         self.assertIn("demo", out)
         self.assertIn("/work/demo", out)
