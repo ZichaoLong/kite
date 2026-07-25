@@ -45,6 +45,7 @@ from test_app_handler import (
     ADMIN_OPEN_ID,
     CHAT_ID,
     DEFAULT_CWD,
+    INIT_TOKEN,
     AppHandlerTestCase,
     make_card_action,
     make_forward_item,
@@ -290,6 +291,13 @@ class ActivatedGroupIngressTests(GroupChatTestCase):
         self.assertIn("仅管理员", self.transport.last_text())
         self.assertEqual(self.rest.calls, [])
 
+    def test_app_sender_mention_is_silently_ignored(self) -> None:
+        # Another bot must not drive prompts through an @mention (audit M11).
+        self.bind_group("s-1")
+        self.rest.add_session("s-1")
+        self.send_group("做点事", sender="ou_other_bot", mentioned=True, sender_type="app")
+        self.assert_no_reaction()
+
     def test_member_mentioned_text_submits_prompt_and_first_use_binds(self) -> None:
         self.send_group("帮我看看这段代码", sender=MEMBER_OPEN_ID, mentioned=True)
         methods = [(method, path) for method, path, _ in self.rest.calls]
@@ -376,6 +384,12 @@ class ActivatedGroupIngressTests(GroupChatTestCase):
 
 
 class GroupActivationTests(GroupChatTestCase):
+    def test_init_is_refused_in_groups(self) -> None:
+        # /init typed in a group would leak the standing token to every
+        # member (audit M8): refuse with a p2p hint, never register.
+        self.send_group(f"/init {INIT_TOKEN}", sender=ADMIN_OPEN_ID, mentioned=False)
+        self.assertIn("私聊", self.transport.last_text())
+        self.assertEqual(self.persisted_admins, [])
     def test_activate_writes_config_and_persists_across_restart(self) -> None:
         self.bind_group("s-1")
         self.rest.add_session("s-1")

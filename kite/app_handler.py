@@ -582,6 +582,13 @@ class AppHandler(TransportHandler):
             # Non-@ group chatter is ignored entirely: no prompt, no
             # interaction claim, no context (§3.2).
             return
+        if message.sender_type == "app" or (
+            message.sender_open_id.strip()
+            and message.sender_open_id == self._bot_open_id()
+        ):
+            # Another bot must not drive prompts through an @mention
+            # (audit M11; same guard as the assistant/all branches).
+            return
         if not text:
             self._reply_to(message, _GROUP_PROMPT_HINT_TEXT)
             return
@@ -1428,6 +1435,12 @@ class AppHandler(TransportHandler):
 
     def _cmd_init(self, message: InboundMessage, arg: str) -> None:
         sender = message.sender_open_id.strip()
+        if message.chat_type != "p2p":
+            # The init token is a standing secret; typing it in a group leaks
+            # it to every member (audit M8). FOCUS scopes /init to p2p; so
+            # does KITE.
+            self._reply_to(message, "请私聊机器人执行 /init，管理员 token 不能在群内出示。")
+            return
         if not arg.strip():
             self._reply_to(message, build_usage_text("/init"))
             return
