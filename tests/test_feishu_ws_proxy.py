@@ -49,6 +49,8 @@ class ConfigureFeishuWsProxyTests(unittest.TestCase):
         self.assertEqual(configure_feishu_ws_proxy("env"), "env")
 
     def test_disabled_mode_installs_scoped_shim(self) -> None:
+        if self._had_hook:
+            self.skipTest("installed lark-oapi uses the legacy connect-kwargs hook shape")
         self.assertEqual(configure_feishu_ws_proxy("disabled"), "disabled")
         shim = lark_ws_client.websockets
         self.assertIsInstance(shim, _DisabledProxyWebsocketsShim)
@@ -67,6 +69,8 @@ class ConfigureFeishuWsProxyTests(unittest.TestCase):
         self.assertIsNone(captured["proxy"])
 
     def test_disabled_mode_shim_is_idempotent(self) -> None:
+        if self._had_hook:
+            self.skipTest("installed lark-oapi uses the legacy connect-kwargs hook shape")
         configure_feishu_ws_proxy("disabled")
         first = lark_ws_client.websockets
         configure_feishu_ws_proxy("disabled")

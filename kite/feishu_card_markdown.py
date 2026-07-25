@@ -16,6 +16,15 @@ _MARKDOWN_LINK_RE = re.compile(r"(?<!!)\[([^\]\n]*)\]\(([^)\n]+)\)")
 _MARKDOWN_HEADING_RE = re.compile(r"^(#{1,6})[ \t]+(.+?)[ \t]*$", re.MULTILINE)
 _FENCED_CODE_OPEN_RE = re.compile(r"^([ \t]*)(`{3,}|~{3,})([^\n]*)$")
 _LIST_ITEM_RE = re.compile(r"^([ \t]*)(?:[-+*]|\d{1,9}[.)])([ \t]+)")
+_FEISHU_HARD_BREAK_TAG_RE = re.compile(r"<br[ \t]*/?>", re.IGNORECASE)
+_URI_AUTOLINK_RE = re.compile(
+    r"<([A-Za-z][A-Za-z0-9+.-]{1,31}:[^\x00-\x20\x7f<>\s]*)>"
+)
+_EMAIL_AUTOLINK_RE = re.compile(
+    r"<([A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@"
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*)>"
+)
 
 
 @dataclass(slots=True)
@@ -89,6 +98,7 @@ def sanitize_runtime_markdown_for_feishu_card(text: str) -> str:
     sanitized = _MARKDOWN_HEADING_RE.sub(_replace_heading, normalized)
     sanitized = _MARKDOWN_IMAGE_RE.sub(_replace_image, sanitized)
     sanitized = _MARKDOWN_LINK_RE.sub(_replace_link, sanitized)
+    sanitized = _neutralize_raw_html_xml_openers_outside_fenced_code(sanitized)
     return _harden_list_continuation_soft_breaks_for_feishu(sanitized)
 
 
@@ -106,7 +116,117 @@ def sanitize_terminal_result_markdown_for_feishu_json2(text: str) -> str:
 
     sanitized = _MARKDOWN_IMAGE_RE.sub(_replace_image, normalized)
     sanitized = _normalize_fenced_code_blocks_for_feishu(sanitized)
+    sanitized = _neutralize_raw_html_xml_openers_outside_fenced_code(sanitized)
     return _harden_list_continuation_soft_breaks_for_feishu(sanitized)
+
+
+def _neutralize_raw_html_xml_openers_outside_fenced_code(text: str) -> str:
+    normalized = str(text or "")
+    if not normalized:
+        return ""
+
+    lines = normalized.splitlines(keepends=True)
+    output: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        body = line.rstrip("\r\n")
+        fence_match = _FENCED_CODE_OPEN_RE.match(body)
+        if fence_match is not None:
+            closing_index = _find_fence_closing_index(
+                lines,
+                index + 1,
+                fence_match.group(2)[0],
+                len(fence_match.group(2)),
+            )
+            end_index = len(lines) if closing_index is None else closing_index + 1
+            output.extend(lines[index:end_index])
+            index = end_index
+            continue
+        output.append(_neutralize_raw_html_xml_openers_outside_inline_code(line))
+        index += 1
+    return "".join(output)
+
+
+def _neutralize_raw_html_xml_openers_outside_inline_code(text: str) -> str:
+    output: list[str] = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == "`" and not _is_backslash_escaped(text, index):
+            delimiter_length = _backtick_run_length(text, index)
+            closing_index = _find_inline_code_closing_index(
+                text,
+                index + delimiter_length,
+                delimiter_length,
+            )
+            if closing_index is not None:
+                end_index = closing_index + delimiter_length
+                output.append(text[index:end_index])
+                index = end_index
+                continue
+            output.append(text[index:index + delimiter_length])
+            index += delimiter_length
+            continue
+        if char != "<":
+            output.append(char)
+            index += 1
+            continue
+
+        hard_break_match = _FEISHU_HARD_BREAK_TAG_RE.match(text, index)
+        if hard_break_match is not None:
+            output.append(hard_break_match.group(0))
+            index = hard_break_match.end()
+            continue
+        autolink_match = _URI_AUTOLINK_RE.match(text, index)
+        if autolink_match is None:
+            autolink_match = _EMAIL_AUTOLINK_RE.match(text, index)
+        if autolink_match is not None:
+            output.append(autolink_match.group(1))
+            index = autolink_match.end()
+            continue
+        if (
+            index + 1 < len(text)
+            and text[index + 1] in "!?/ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+        ):
+            output.append("＜")
+        else:
+            output.append("<")
+        index += 1
+    return "".join(output)
+
+
+def _backtick_run_length(text: str, start_index: int) -> int:
+    end_index = start_index
+    while end_index < len(text) and text[end_index] == "`":
+        end_index += 1
+    return end_index - start_index
+
+
+def _find_inline_code_closing_index(
+    text: str,
+    start_index: int,
+    delimiter_length: int,
+) -> int | None:
+    index = start_index
+    while index < len(text):
+        index = text.find("`", index)
+        if index < 0:
+            return None
+        run_length = _backtick_run_length(text, index)
+        if run_length == delimiter_length:
+            return index
+        index += run_length
+    return None
+
+
+def _is_backslash_escaped(text: str, index: int) -> bool:
+    backslash_count = 0
+    index -= 1
+    while index >= 0 and text[index] == "\\":
+        backslash_count += 1
+        index -= 1
+    return backslash_count % 2 == 1
 
 
 def _harden_list_continuation_soft_breaks_for_feishu(text: str) -> str:

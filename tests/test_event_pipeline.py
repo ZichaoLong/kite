@@ -17,6 +17,7 @@ import tempfile
 import unittest
 
 from kite import cards
+from kite.message_patch_result import MessagePatchResult
 from kite.adapters.kap_server import (
     ApprovalRequestView,
     KapError,
@@ -68,6 +69,11 @@ class FakeTransport:
         self.replies: list[dict] = []
         self.fail_sends = False
         self._counter = 0
+        # Every patch attempt (applied or rejected), for retry accounting.
+        self.patch_attempts: list[str] = []
+        # When set, patch contents containing this marker are rejected with
+        # MessagePatchResult.invalid_content() (Feishu 230099 stand-in).
+        self.reject_patch_containing: str | None = None
 
     def send_message_get_id(self, chat_id: str, msg_type: str, content: str):
         if self.fail_sends:
@@ -84,9 +90,21 @@ class FakeTransport:
         )
         return message_id
 
-    def patch_message(self, message_id: str, content: str) -> bool:
+    def patch_message_result(self, message_id: str, content: str) -> MessagePatchResult:
+        self.patch_attempts.append(content)
+        # Content arrives json.dumps-escaped; match markers against the
+        # unescaped rendering too so CJK markers work.
+        rendered = json.dumps(json.loads(content), ensure_ascii=False)
+        if self.reject_patch_containing and (
+            self.reject_patch_containing in content
+            or self.reject_patch_containing in rendered
+        ):
+            return MessagePatchResult.invalid_content()
         self.patches.append({"message_id": message_id, "content": json.loads(content)})
-        return True
+        return MessagePatchResult.success()
+
+    def patch_message(self, message_id: str, content: str) -> bool:
+        return self.patch_message_result(message_id, content).ok
 
     def reply(self, chat_id: str, text: str, *, parent_message_id: str = "", reply_in_thread: bool = False) -> bool:
         self.replies.append({"chat_id": chat_id, "text": text})
@@ -656,6 +674,94 @@ class ExecutionCardTests(PipelineTestCase):
             )
         )
         self.assertEqual(len(self.transport.patches_to(message_id)), 1)
+
+    def test_frozen_card_content_rejected_retries_minimal_once(self) -> None:
+        # FOCUS 5787d4c port: a non-running execution card whose full frozen
+        # content is rejected by Feishu (230099) gets ONE minimal-terminal
+        # retry (no tool lines, no reply projection) instead of staying
+        # "执行中" forever with a live cancel button.
+        self.bind(CHAT_ID)
+        message_id = self.start_prompt()
+        self.feed(
+            kap_event(
+                "tool.call.started",
+                {
+                    "turnId": 1,
+                    "toolCallId": "tc-1",
+                    "name": "Bash",
+                    "display": {"kind": "command", "command": "ls -la"},
+                },
+            )
+        )
+        attempts_before = len(self.transport.patch_attempts)
+        self.transport.reject_patch_containing = "ls -la"
+
+        self.feed(kap_event("turn.ended", {"turnId": 1, "reason": "completed"}))
+
+        # Full freeze rejected + exactly one minimal retry (no third attempt).
+        freeze_attempts = self.transport.patch_attempts[attempts_before:]
+        self.assertEqual(len(freeze_attempts), 2)
+        self.assertIn("ls -la", freeze_attempts[0])
+        self.assertNotIn("ls -la", freeze_attempts[1])
+        # The minimal frozen card still renders the terminal state and no
+        # longer offers the cancel button.
+        minimal = json.dumps(self.transport.patches_to(message_id)[-1], ensure_ascii=False)
+        self.assertIn("已结束", minimal)
+        self.assertNotIn("取消", minimal)
+        # The terminal card still went out with the full reply text.
+        terminal = self.transport.cards_to(CHAT_ID)[-1]["content"]
+        self.assertIn("最终答复文本", json.dumps(terminal, ensure_ascii=False))
+
+    def test_frozen_card_minimal_retry_is_one_shot(self) -> None:
+        # Even when the minimal retry is also rejected, there is no third
+        # attempt (one-shot, never a retry loop); the result still reached
+        # the user via the terminal card.
+        self.bind(CHAT_ID)
+        message_id = self.start_prompt()
+        self.feed(
+            kap_event(
+                "tool.call.started",
+                {
+                    "turnId": 1,
+                    "toolCallId": "tc-1",
+                    "name": "Bash",
+                    "display": {"kind": "command", "command": "ls -la"},
+                },
+            )
+        )
+        attempts_before = len(self.transport.patch_attempts)
+        patches_before = len(self.transport.patches)
+        self.transport.reject_patch_containing = "已结束"
+
+        self.feed(kap_event("turn.ended", {"turnId": 1, "reason": "completed"}))
+
+        freeze_attempts = self.transport.patch_attempts[attempts_before:]
+        self.assertEqual(len(freeze_attempts), 2)
+        # Both the full and the minimal freeze were rejected: nothing applied.
+        self.assertEqual(len(self.transport.patches), patches_before)
+        self.assertIn(
+            "最终答复文本",
+            json.dumps(self.transport.cards_to(CHAT_ID)[-1]["content"], ensure_ascii=False),
+        )
+
+    def test_frozen_card_content_rejected_without_strippable_content_does_not_retry(self) -> None:
+        # No tool lines and no reply projection: the minimal card would be
+        # identical, so a rejection must not trigger a retry (FOCUS guards
+        # on `log_text or reply_segments`).
+        self.bind(CHAT_ID)
+        message_id = self.start_prompt()
+        self.rest.snapshots[SESSION_ID] = KapTransportError("connection refused")
+        attempts_before = len(self.transport.patch_attempts)
+        self.transport.reject_patch_containing = "状态未知"
+
+        self.pipeline.handle_resync_required(
+            ResyncRequest(session_id=SESSION_ID, reason=None, current_seq=None, epoch=None)
+        )
+        self.flush()
+
+        freeze_attempts = self.transport.patch_attempts[attempts_before:]
+        self.assertEqual(len(freeze_attempts), 1)
+        self.assertEqual(self.transport.patches_to(message_id), [])
 
     def test_turn_ended_failed_uses_upstream_error_text(self) -> None:
         self.bind(CHAT_ID)

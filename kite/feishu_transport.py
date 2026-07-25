@@ -964,6 +964,7 @@ class FeishuTransport:
         if not response.success():
             code = str(getattr(response, "code", "") or "").strip()
             ext = self._patch_error_ext(response)
+            error_text = f"{getattr(response, 'msg', '')} {ext}".lower()
             if code == "230020":
                 logger.warning(
                     "message patch rate-limited, retry later: message_id=%s code=%s msg=%s ext=%s",
@@ -973,6 +974,18 @@ class FeishuTransport:
                     ext,
                 )
                 return MessagePatchResult.retry_later(_PATCH_MESSAGE_RETRY_SECONDS)
+            if code == "230099" and (
+                "failed to create card content" in error_text
+                or "markdown content parse error" in error_text
+            ):
+                logger.error(
+                    "message patch content rejected by Feishu: message_id=%s code=%s msg=%s ext=%s",
+                    message_id,
+                    code,
+                    response.msg,
+                    ext,
+                )
+                return MessagePatchResult.invalid_content()
             logger.error(
                 "message patch failed: message_id=%s code=%s msg=%s ext=%s",
                 message_id,

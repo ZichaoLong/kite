@@ -44,6 +44,90 @@ class FeishuCardMarkdownTests(unittest.TestCase):
             "1. 外层<br>\n    - 内层\n2. 另一项",
         )
 
+    def test_runtime_card_neutralizes_raw_rss_xml_outside_fenced_code(self) -> None:
+        text = (
+            '<?xml version="1.0"?><rss><channel><item><title>示例</title></item>'
+            "<br></channel></rss>"
+        )
+
+        self.assertEqual(
+            sanitize_runtime_markdown_for_feishu_card(text),
+            (
+                '＜?xml version="1.0"?>＜rss>＜channel>＜item>＜title>示例'
+                "＜/title>＜/item><br>＜/channel>＜/rss>"
+            ),
+        )
+
+    def test_runtime_card_preserves_xml_inside_fenced_code(self) -> None:
+        text = "```xml\n<rss><item>示例</item></rss>\n```"
+
+        self.assertEqual(sanitize_runtime_markdown_for_feishu_card(text), text)
+
+    def test_runtime_card_preserves_markup_inside_closed_inline_code(self) -> None:
+        text = "使用 `<section>`，以及 ``<tag attr=`value`>``。"
+
+        self.assertEqual(sanitize_runtime_markdown_for_feishu_card(text), text)
+
+    def test_terminal_result_normalizes_uri_and_email_autolinks_to_plain_targets(self) -> None:
+        text = "文档：<https://open.feishu.cn/path?q=1> 邮箱：<user@example.com>"
+
+        self.assertEqual(
+            sanitize_terminal_result_markdown_for_feishu_json2(text),
+            "文档：https://open.feishu.cn/path?q=1 邮箱：user@example.com",
+        )
+
+    def test_runtime_card_does_not_protect_unclosed_inline_code_or_autolink(self) -> None:
+        text = (
+            "未闭合代码：`<section>\n"
+            "未闭合链接：<https://example.com\n"
+            "非法链接：<https://example.com path>"
+        )
+
+        self.assertEqual(
+            sanitize_runtime_markdown_for_feishu_card(text),
+            (
+                "未闭合代码：`＜section>\n"
+                "未闭合链接：＜https://example.com\n"
+                "非法链接：＜https://example.com path>"
+            ),
+        )
+
+    def test_runtime_card_keeps_code_context_separate_from_raw_markup(self) -> None:
+        text = "代码：`<section>`；原文：<section>正文</section>"
+
+        self.assertEqual(
+            sanitize_runtime_markdown_for_feishu_card(text),
+            "代码：`<section>`；原文：＜section>正文＜/section>",
+        )
+
+    def test_terminal_result_neutralizes_raw_html_outside_fenced_code(self) -> None:
+        text = "结果：<section data-kind=\"summary\">完成</section>"
+
+        self.assertEqual(
+            sanitize_terminal_result_markdown_for_feishu_json2(text),
+            "结果：＜section data-kind=\"summary\">完成＜/section>",
+        )
+
+    def test_runtime_card_neutralizes_complex_markup_openers_without_parsing_declarations(self) -> None:
+        text = (
+            "<![CDATA[<p>hello</p>]]>\n"
+            "<!-- <tag>comment</tag> -->\n"
+            "<!DOCTYPE root [<!ELEMENT root (#PCDATA)>]>\n"
+            "1 < 2\n"
+            "<br><BR/><br />"
+        )
+
+        self.assertEqual(
+            sanitize_runtime_markdown_for_feishu_card(text),
+            (
+                "＜![CDATA[＜p>hello＜/p>]]>\n"
+                "＜!-- ＜tag>comment＜/tag> -->\n"
+                "＜!DOCTYPE root [＜!ELEMENT root (#PCDATA)>]>\n"
+                "1 < 2\n"
+                "<br><BR/><br />"
+            ),
+        )
+
     def test_nested_list_item_continuation_keeps_child_order_for_feishu(self) -> None:
         text = "2. xxxx：\n  - yyyy\n     zzzz"
 

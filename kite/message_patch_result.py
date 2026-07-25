@@ -8,6 +8,7 @@ class MessagePatchResult:
     ok: bool
     retryable: bool = False
     retry_after_seconds: float = 0.0
+    content_rejected: bool = False
 
     @classmethod
     def success(cls) -> MessagePatchResult:
@@ -16,6 +17,10 @@ class MessagePatchResult:
     @classmethod
     def failure(cls) -> MessagePatchResult:
         return cls(ok=False)
+
+    @classmethod
+    def invalid_content(cls) -> MessagePatchResult:
+        return cls(ok=False, content_rejected=True)
 
     @classmethod
     def retry_later(cls, retry_after_seconds: float) -> MessagePatchResult:

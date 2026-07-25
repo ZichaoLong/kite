@@ -600,6 +600,41 @@ class PatchMessageTests(unittest.TestCase):
         self.assertFalse(result.retryable)
         self.assertFalse(transport.patch_message("om-1", "{}"))
 
+    def test_patch_230099_card_content_rejected(self) -> None:
+        transport, client = self._transport_with_mock_client()
+        client.im.v1.message.patch.return_value = _fail_response(
+            code="230099",
+            msg="failed to create card content",
+            raw={"ext": "markdown content parse error"},
+        )
+
+        result = transport.patch_message_result("om-1", "{}")
+
+        self.assertFalse(result.ok)
+        self.assertFalse(result.retryable)
+        self.assertTrue(result.content_rejected)
+
+    def test_patch_230099_parse_error_in_msg(self) -> None:
+        transport, client = self._transport_with_mock_client()
+        client.im.v1.message.patch.return_value = _fail_response(
+            code="230099", msg="markdown content parse error"
+        )
+
+        result = transport.patch_message_result("om-1", "{}")
+
+        self.assertFalse(result.ok)
+        self.assertTrue(result.content_rejected)
+
+    def test_patch_230099_without_content_signature_is_generic_failure(self) -> None:
+        transport, client = self._transport_with_mock_client()
+        client.im.v1.message.patch.return_value = _fail_response(code="230099", msg="rate limited")
+
+        result = transport.patch_message_result("om-1", "{}")
+
+        self.assertFalse(result.ok)
+        self.assertFalse(result.retryable)
+        self.assertFalse(result.content_rejected)
+
 
 class AttachmentDownloadTests(unittest.TestCase):
     def _transport_with_mock_client(self) -> tuple[FeishuTransport, Mock]:

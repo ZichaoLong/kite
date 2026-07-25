@@ -949,17 +949,51 @@ class EventPipeline:
             return ""
 
     def _freeze_card_done(self, state: _ExecutionCardState) -> None:
+        self._patch_frozen_execution_card(state, cards.EXECUTION_STATE_FROZEN_DONE)
+
+    def _patch_frozen_execution_card(self, state: _ExecutionCardState, execution_state: str) -> None:
+        """Freeze a non-running execution card, with a one-shot minimal retry.
+
+        Ported from FOCUS 5787d4c (``runtime_card_publisher.py``): when
+        Feishu rejects the full frozen card content (230099 →
+        ``content_rejected``), retry once with a minimal frozen card (no
+        tool lines, no reply projection) so the card never stays "执行中"
+        with a live cancel button. The retry is one-shot: a rejected
+        minimal card is dropped (the terminal card still carries the
+        result).
+        """
+        message_id = state.anchor.card_message_id
         card = cards.build_execution_card(
             session_title=state.session_title,
             session_id=state.anchor.session_id,
             prompt_text=state.prompt_text,
-            state=cards.EXECUTION_STATE_FROZEN_DONE,
+            state=execution_state,
             elapsed_seconds=self._elapsed(state),
             queue_length=0,
             tool_lines=state.tool_lines,
             reply_text=self._stream_projection(state),
         )
-        self._patch_card(state.anchor.card_message_id, card)
+        result = self._patch_card_result(message_id, card)
+        if not result.content_rejected:
+            return
+        if not state.tool_lines and not self._stream_projection(state):
+            # Nothing strippable: the minimal card would be identical.
+            return
+        logger.warning(
+            "frozen execution card content rejected by Feishu, retrying minimal: message_id=%s",
+            message_id,
+        )
+        minimal_card = cards.build_execution_card(
+            session_title=state.session_title,
+            session_id=state.anchor.session_id,
+            prompt_text=state.prompt_text,
+            state=execution_state,
+            elapsed_seconds=self._elapsed(state),
+            queue_length=0,
+            tool_lines=[],
+            reply_text="",
+        )
+        self._patch_card(message_id, minimal_card)
 
     def _fetch_terminal_text(self, session_id: str) -> str:
         try:
@@ -2318,17 +2352,7 @@ class EventPipeline:
             if state.anchor.session_id != session_id:
                 continue
             self._cancel_stream_state(state)
-            card = cards.build_execution_card(
-                session_title=state.session_title,
-                session_id=session_id,
-                prompt_text=state.prompt_text,
-                state=cards.EXECUTION_STATE_FROZEN_UNKNOWN,
-                elapsed_seconds=self._elapsed(state),
-                queue_length=0,
-                tool_lines=state.tool_lines,
-                reply_text=self._stream_projection(state),
-            )
-            self._patch_card(state.anchor.card_message_id, card)
+            self._patch_frozen_execution_card(state, cards.EXECUTION_STATE_FROZEN_UNKNOWN)
             del self._cards[chat_id]
 
     # ------------------------------------------------------------------
@@ -2391,13 +2415,12 @@ class EventPipeline:
             return ""
 
     def _patch_card(self, message_id: str, card: dict) -> bool:
+        return self._patch_card_result(message_id, card).ok
+
+    def _patch_card_result(self, message_id: str, card: dict) -> MessagePatchResult:
         if not message_id:
-            return False
-        try:
-            return bool(self._transport.patch_message(message_id, json.dumps(card)))
-        except Exception:
-            logger.exception("card patch failed message=%s", message_id)
-            return False
+            return MessagePatchResult.failure()
+        return self._patch_message_result(message_id, json.dumps(card))
 
     def _send_text(self, chat_id: str, text: str) -> None:
         try:
