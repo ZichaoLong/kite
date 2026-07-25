@@ -584,6 +584,28 @@ class PromptSendTests(KitectlTestCase):
         self.assertIn("status: queued", out)
         self.assertIn("owner_recorded: no", out)
 
+    def test_send_with_display_silent_passes_the_param(self) -> None:
+        code, _, _ = self._run_cli(
+            "prompt", "send", "--chat", "chat-1", "--text", "hi", "--display", "silent"
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            self.received,
+            [("prompt/submit", {"text": "hi", "chat_id": "chat-1", "display": "silent"})],
+        )
+
+    def test_send_with_display_announce_passes_the_param(self) -> None:
+        code, _, _ = self._run_cli(
+            "prompt", "send", "--chat", "chat-1", "--text", "hi", "--display", "announce"
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            self.received,
+            [("prompt/submit", {"text": "hi", "chat_id": "chat-1", "display": "announce"})],
+        )
+
     def test_send_requires_a_target(self) -> None:
         with self.assertRaises(SystemExit) as ctx:
             self._run_cli("prompt", "send", "--text", "hi")

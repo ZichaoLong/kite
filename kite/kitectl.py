@@ -29,6 +29,13 @@ Implemented slice (docs/contracts/mvp-scope.md §2 kitectl row, §6):
                                 (docs/contracts/images.md §3). Same exit-code
                                 taxonomy; a partial fan-out failure exits 1
                                 with the per-chat report.
+  - `kitectl schedule create|list|show|remove|run-now`
+                              — scheduled prompts (docs/contracts/scheduled-prompts.md):
+                                Linux systemd --user timers that fire
+                                `kitectl prompt send` back into the daemon.
+                                Validation is fail-closed before anything is
+                                written (past --at, unparseable --cron,
+                                unknown chat); remove requires --yes.
 
 Read-only commands talk to kap-server REST directly: the `kap:` section of
 system.yaml provides address/home, the instance registry is the source of
@@ -53,6 +60,7 @@ import yaml
 
 from kite import config as kite_config
 from kite import preflights
+from kite import schedule_units
 from kite import service_manager
 from kite.adapters import kap_server
 from kite.adapters.kap_server import KapRestClient
@@ -64,7 +72,7 @@ from kite.control_plane import (
     ControlRefusedError,
     discover_live_control_metadata,
 )
-from kite.platform_paths import default_data_root
+from kite.platform_paths import default_data_root, is_linux
 from kite.process_utils import process_exists
 from kite.runtime_status import read_runtime_status
 from kite.stores.binding_store import BindingStore
@@ -480,6 +488,8 @@ def _cmd_prompt_send(args: argparse.Namespace) -> int:
         params["chat_id"] = args.chat
     else:
         params["session_id"] = args.session
+    if getattr(args, "display", None) is not None:
+        params["display"] = args.display
     client = _control_client()
     try:
         data = client.request("prompt/submit", params)
@@ -563,6 +573,122 @@ def _cmd_image_send(args: argparse.Namespace) -> int:
     # Per-chat failures are data in the report (contract §3.1); a partial
     # delivery still exits non-zero so scripts notice.
     return 1 if failed else 0
+
+
+# ---------------------------------------------------------------------------
+# schedule — Linux systemd --user timers (docs/contracts/scheduled-prompts.md)
+# ---------------------------------------------------------------------------
+
+
+def _require_schedule_platform() -> None:
+    if not is_linux():
+        _die("kitectl schedule is Linux-only (systemd --user timers)")
+
+
+def _schedule_error(exc: Exception) -> NoReturn:
+    if isinstance(exc, schedule_units.ScheduleSystemctlError):
+        _die(str(exc), exit_code=1)
+    _die(str(exc))
+
+
+def _cmd_schedule_create(args: argparse.Namespace) -> int:
+    _require_schedule_platform()
+    text = str(args.text or "").strip()
+    if not text:
+        _die("prompt text must not be empty")
+    chat_id = str(args.chat or "").strip()
+    # Contract §3/§4.3: the target chat must already be bound — reject before
+    # writing anything (at fire time the control plane's no_binding error is
+    # the fail-closed outcome; creating anyway would build a dead timer).
+    if BindingStore(default_data_root()).load(chat_id) is None:
+        _die(f"no binding for chat {chat_id}; bind the chat from Feishu first")
+    try:
+        if args.at is not None:
+            on_calendar = schedule_units.parse_at_on_calendar(args.at)
+            recurring = False
+        else:
+            on_calendar = schedule_units.parse_cron_on_calendar(args.cron)
+            recurring = True
+        ctl_path = schedule_units.resolve_ctl_path(args.ctl_path)
+        spec = schedule_units.create_schedule(
+            chat_id=chat_id,
+            text=text,
+            on_calendar=on_calendar,
+            recurring=recurring,
+            display=args.display,
+            ctl_path=ctl_path,
+        )
+    except (schedule_units.ScheduleError, schedule_units.ScheduleSystemctlError) as exc:
+        _schedule_error(exc)
+    print(f"name: {spec.name}")
+    print(f"chat_id: {spec.chat_id}")
+    print(f"on_calendar: {spec.on_calendar}")
+    print(f"display: {spec.display}")
+    print(f"ctl_path: {spec.ctl_path}")
+    print(f"timer_unit: {schedule_units.timer_unit_path(spec.name)}")
+    print(f"service_unit: {schedule_units.service_unit_path(spec.name)}")
+    if recurring:
+        # Contract §4.4: a recurring timer has no natural end and kitectl
+        # cannot tell whether the prompt carries a termination strategy, so
+        # every --cron create warns.
+        print(
+            "warning: recurring schedule without a verified termination strategy; "
+            "systemd keeps firing until the timer is removed — give the prompt a "
+            f"self-removal condition (`kitectl schedule remove {spec.name} --yes`) "
+            "or a one-shot cleanup prompt (docs/contracts/scheduled-prompts.md §4.4)",
+            file=sys.stderr,
+        )
+    return 0
+
+
+def _cmd_schedule_list(_args: argparse.Namespace) -> int:
+    _require_schedule_platform()
+    entries = schedule_units.list_schedules()
+    if not entries:
+        print("(no schedules)")
+        return 0
+    rows = [[entry.name, entry.on_calendar, entry.next_elapse] for entry in entries]
+    _print_lines(render_table(["NAME", "ON_CALENDAR", "NEXT"], rows))
+    return 0
+
+
+def _cmd_schedule_show(args: argparse.Namespace) -> int:
+    _require_schedule_platform()
+    try:
+        shown = schedule_units.show_schedule(args.name)
+    except schedule_units.ScheduleError as exc:
+        _schedule_error(exc)
+    print(f"# {shown.timer_path}")
+    print(shown.timer_text, end="")
+    print(f"# {shown.service_path}")
+    print(shown.service_text, end="")
+    return 0
+
+
+def _cmd_schedule_remove(args: argparse.Namespace) -> int:
+    _require_schedule_platform()
+    try:
+        base, _, _ = schedule_units.schedule_unit_paths(args.name)
+    except schedule_units.ScheduleError as exc:
+        _schedule_error(exc)
+    if not args.yes:
+        _die(f"re-run with --yes to disable and delete schedule '{base}'")
+    try:
+        schedule_units.remove_schedule(base)
+    except (schedule_units.ScheduleError, schedule_units.ScheduleSystemctlError) as exc:
+        _schedule_error(exc)
+    print(f"schedule '{base}' removed")
+    return 0
+
+
+def _cmd_schedule_run_now(args: argparse.Namespace) -> int:
+    _require_schedule_platform()
+    try:
+        base = schedule_units.run_schedule_now(args.name)
+    except (schedule_units.ScheduleError, schedule_units.ScheduleSystemctlError) as exc:
+        _schedule_error(exc)
+    print(f"schedule '{base}' started")
+    return 0
 
 
 def _quote_path(value: str) -> str:
@@ -753,6 +879,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="target session directly (permission_mode=auto, plan_mode=off)",
     )
     send_parser.add_argument("--text", required=True, help="prompt text")
+    send_parser.add_argument(
+        "--display",
+        choices=schedule_units.DISPLAY_MODES,
+        default=None,
+        help="announce makes the daemon send a scheduled-trigger notice to the "
+        "chat before submitting (default: silent)",
+    )
     send_parser.set_defaults(func=_cmd_prompt_send)
 
     image_parser = subparsers.add_parser("image", help="image delivery (control plane)")
@@ -797,6 +930,73 @@ def _build_parser() -> argparse.ArgumentParser:
         help="actually reject/dismiss; without it only the plan is printed",
     )
     sweep_parser.set_defaults(func=_cmd_interaction_sweep)
+
+    schedule_parser = subparsers.add_parser(
+        "schedule",
+        help="scheduled prompts via systemd --user timers (Linux only)",
+    )
+    schedule_sub = schedule_parser.add_subparsers(dest="schedule_command", required=True)
+    create_parser = schedule_sub.add_parser(
+        "create", help="create a scheduled prompt (writes + enables the timer)"
+    )
+    create_parser.add_argument(
+        "--chat",
+        required=True,
+        metavar="CHAT_ID",
+        help="bound chat the prompt fires into (must have a binding)",
+    )
+    create_parser.add_argument(
+        "--text", required=True, help="prompt text (single line)"
+    )
+    create_when = create_parser.add_mutually_exclusive_group(required=True)
+    create_when.add_argument(
+        "--at",
+        metavar="ISO_TIMESTAMP",
+        help="one-shot fire time (local wall time unless an offset is given)",
+    )
+    create_when.add_argument(
+        "--cron",
+        metavar="EXPR",
+        help="recurring: a systemd OnCalendar shorthand (daily, hourly, ...) "
+        "or a standard 5-field cron expression",
+    )
+    create_parser.add_argument(
+        "--display",
+        choices=schedule_units.DISPLAY_MODES,
+        default="silent",
+        help="announce sends a trigger notice to the chat before submitting "
+        "(default: silent)",
+    )
+    create_parser.add_argument(
+        "--ctl-path",
+        default="",
+        help="explicit kitectl path stored in the service unit "
+        "(default: KITE_BIN_DIR or ~/.local/bin, then the managed venv)",
+    )
+    create_parser.set_defaults(func=_cmd_schedule_create)
+    schedule_sub.add_parser(
+        "list", help="list scheduled prompts with their next elapse"
+    ).set_defaults(func=_cmd_schedule_list)
+    show_parser = schedule_sub.add_parser(
+        "show", help="print the timer + service definitions of one schedule"
+    )
+    show_parser.add_argument("name", help="schedule name (kite-schedule-<hash> or the hash)")
+    show_parser.set_defaults(func=_cmd_schedule_show)
+    remove_parser = schedule_sub.add_parser(
+        "remove", help="disable + delete a schedule's unit pair"
+    )
+    remove_parser.add_argument("name", help="schedule name (kite-schedule-<hash> or the hash)")
+    remove_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="actually disable and delete; without it the command refuses",
+    )
+    remove_parser.set_defaults(func=_cmd_schedule_remove)
+    run_now_parser = schedule_sub.add_parser(
+        "run-now", help="fire a schedule's service unit once immediately"
+    )
+    run_now_parser.add_argument("name", help="schedule name (kite-schedule-<hash> or the hash)")
+    run_now_parser.set_defaults(func=_cmd_schedule_run_now)
     return parser
 
 

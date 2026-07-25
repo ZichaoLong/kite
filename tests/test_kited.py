@@ -488,6 +488,79 @@ class ControlPlaneSubmitTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "submit_blocked")
         self.assertEqual(len(self.ownership), 0)
 
+    def test_announce_sends_a_trigger_notice_before_submitting(self) -> None:
+        """Scheduled-prompts contract §4.2: display=announce sends one short
+        Chinese trigger notice to the target chat BEFORE the prompt submit."""
+        self.rest.add_session("s-1")
+        self._bind("chat-1", "s-1")
+        events: list[str] = []
+        original_reply = self.transport.reply
+
+        def reply_spy(chat_id, text, **kwargs):
+            events.append("notice")
+            return original_reply(chat_id, text, **kwargs)
+
+        original_call = self.rest.call
+
+        def call_spy(method, path, body=None):
+            if str(path).endswith("/prompts"):
+                events.append("submit")
+            return original_call(method, path, body)
+
+        self.transport.reply = reply_spy
+        self.rest.call = call_spy
+
+        result = self._submit({"chat_id": "chat-1", "text": "hello kite", "display": "announce"})
+
+        self.assertEqual(events, ["notice", "submit"])
+        self.assertEqual(result["owner_recorded"], True)
+        self.assertEqual(len(self.transport.replies), 1)
+        notice = self.transport.replies[0]
+        self.assertEqual(notice["chat_id"], "chat-1")
+        self.assertIn("⏰ 定时任务触发", notice["text"])
+        self.assertIn("hello kite", notice["text"])
+
+    def test_announce_notice_collapses_and_truncates_the_snippet(self) -> None:
+        self.rest.add_session("s-1")
+        self._bind("chat-1", "s-1")
+        text = "  multi\n\n spaced   " + "x" * 80
+
+        self._submit({"chat_id": "chat-1", "text": text, "display": "announce"})
+
+        notice = self.transport.replies[0]["text"]
+        self.assertTrue(notice.startswith("⏰ 定时任务触发：multi spaced "))
+        self.assertTrue(notice.endswith("…"))
+        self.assertLessEqual(len(notice), len("⏰ 定时任务触发：") + 50)
+
+    def test_silent_display_sends_no_notice(self) -> None:
+        self.rest.add_session("s-1")
+        self._bind("chat-1", "s-1")
+
+        self._submit({"chat_id": "chat-1", "text": "hi", "display": "silent"})
+
+        self.assertEqual(self.transport.replies, [])
+        self.assertEqual(len(self.rest.submissions), 1)
+
+    def test_announce_requires_a_chat_target(self) -> None:
+        self.rest.add_session("s-1")
+
+        with self.assertRaises(ControlError) as ctx:
+            self._submit({"session_id": "s-1", "text": "hi", "display": "announce"})
+        self.assertEqual(ctx.exception.code, "invalid_params")
+        self.assertEqual(self.rest.submissions, [])
+        self.assertEqual(self.transport.replies, [])
+
+    def test_display_validation_rejects_garbage(self) -> None:
+        self.rest.add_session("s-1")
+        self._bind("chat-1", "s-1")
+        for display in ("loud", True, 1):
+            with self.subTest(display=display):
+                with self.assertRaises(ControlError) as ctx:
+                    self._submit({"chat_id": "chat-1", "text": "hi", "display": display})
+                self.assertEqual(ctx.exception.code, "invalid_params")
+        self.assertEqual(self.rest.submissions, [])
+        self.assertEqual(self.transport.replies, [])
+
     def test_unknown_method_is_a_structured_error(self) -> None:
         with self.assertRaises(ControlError) as ctx:
             self.dispatch("bogus/method", {})

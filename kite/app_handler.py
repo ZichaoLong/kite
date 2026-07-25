@@ -1025,7 +1025,10 @@ class AppHandler(TransportHandler):
         """The _handle_prompt submit discipline minus the Feishu surface:
         same pre-flight, same explicit modes + model, same certain ownership
         record — but no text ack (the response travels back over the control
-        channel; the execution card still arrives event-driven).
+        channel; the execution card still arrives event-driven). The optional
+        ``display`` param (scheduled-prompts contract §4.2): ``announce``
+        sends one short trigger notice to the target chat before submitting;
+        ``silent`` (default) keeps the no-extra-message behavior.
         """
         text = str(params.get("text") or "").strip()
         chat_id = str(params.get("chat_id") or "").strip()
@@ -1048,6 +1051,15 @@ class AppHandler(TransportHandler):
         plan_mode = params.get("plan_mode")
         if plan_mode is not None and not isinstance(plan_mode, bool):
             raise ControlError("plan_mode must be a boolean", code="invalid_params")
+        display = params.get("display")
+        if display is not None and display not in ("silent", "announce"):
+            raise ControlError(
+                "display must be one of ['announce', 'silent']", code="invalid_params"
+            )
+        if display == "announce" and not chat_id:
+            # The trigger notice needs a target chat; a bare session has none
+            # (scheduled-prompts contract §4.2).
+            raise ControlError("display=announce requires chat_id", code="invalid_params")
 
         owner_chat_id = ""
         if chat_id:
@@ -1093,6 +1105,11 @@ class AppHandler(TransportHandler):
                 f"session {session_id} is archived; switch sessions from Feishu first",
                 code="session_archived",
             )
+        if display == "announce":
+            # Scheduled-prompts contract §4.2: one short trigger notice to
+            # the target chat before submitting. Best-effort: a Feishu
+            # hiccup must not block the scheduled prompt itself.
+            self._safe_reply(owner_chat_id, _scheduled_trigger_notice(text))
         try:
             result = self._ops.submit_prompt(
                 session_id,
@@ -1990,6 +2007,18 @@ def _session_title_from_text(text: str) -> str:
     if len(first_line) > _SESSION_TITLE_MAX:
         return first_line[: _SESSION_TITLE_MAX - 1] + "…"
     return first_line
+
+
+_SCHEDULED_TRIGGER_SNIPPET_MAX = 50
+
+
+def _scheduled_trigger_notice(text: str) -> str:
+    """The announce-mode trigger notice (scheduled-prompts contract §4.2):
+    one short line with a whitespace-collapsed snippet of the fired prompt."""
+    snippet = " ".join(str(text).split())
+    if len(snippet) > _SCHEDULED_TRIGGER_SNIPPET_MAX:
+        snippet = snippet[: _SCHEDULED_TRIGGER_SNIPPET_MAX - 1] + "…"
+    return f"⏰ 定时任务触发：{snippet}"
 
 
 def _build_sessions_card(sessions: list[SessionSummary], *, bound_id: str) -> dict:
