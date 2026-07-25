@@ -165,8 +165,9 @@ Carry over FOCUS experience, rewritten to kap event semantics:
   (approve/reject/feedback); patched and frozen after the REST response;
   repeated clicks within the 60s idempotency window get an "already processed"
   notice, not an error.
-- question form card: in the MVP, passed through as text (list the options,
-  reply with a number to choose); a rich form comes in Phase 2.
+- question form card: `question.requested` renders an option-button card per
+  question item (numbered reply as fallback); auto-dismiss on timeout
+  (admitted 2026-07-25, fulfilling the original mvp-scope question row).
 
 ## 7. Persistence
 

@@ -34,8 +34,10 @@ through the normal prompt path.
   the binding).
 - Conflicts ride kap's server-side FIFO (a busy session queues; no local
   in-memory FIFO exists or is needed).
-- Platform boundary: **Linux `systemd --user` only** today; macOS/Windows
-  have no managed timer helper yet (adding one changes this document first).
+- Platform boundary: the managed timer helper dispatches like
+  `service_manager` — Linux `systemd --user` timers, macOS `launchd`
+  (`StartCalendarInterval`), Windows Task Scheduler calendar triggers
+  (admitted 2026-07-25).
 
 ## 3. `kitectl schedule` Surface
 

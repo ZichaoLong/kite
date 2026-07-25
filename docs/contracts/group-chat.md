@@ -131,10 +131,32 @@ beyond the actor rule, group creation/admin via kitectl.
 
 ## 6. Deferred With Pointers
 
-- Merge-forward in groups: the aggregator is p2p-only today (forwards never
-  carry @mention, so mention_only groups drop them); admitting them in
-  groups needs its own trigger-semantics decision.
-- Rich question form in groups: same actor rule, no new contract needed.
+- Nothing currently deferred. Earlier deferrals are now admitted:
+  merge-forward in groups (§3.7), the all-mode reverse exclusivity (§3.8),
+  and the rich question form (§3.9).
+
+## 7. Later Admissions (2026-07-25)
+
+### 3.7 Merge-forward in groups
+
+Trigger semantics per mode (FOCUS parity): `mention_only` → dropped
+silently (forwards never carry @mention); `assistant` → appended to the
+group log as context material, never a trigger; `all` → aggregated and
+processed like a member text message. The 2s aggregation window and the
+recursive expansion are shared with the p2p path.
+
+### 3.8 All-mode reverse exclusivity
+
+The exclusivity rule applies in both directions: any other chat
+(p2p or group) rebinding (`/switch`, first-bind) into a session an
+all-mode group already occupies is denied with the same remediation text.
+
+### 3.9 Rich question form
+
+`question.requested` renders an option-button card per question item
+(numbered reply as fallback, actor rule identical to approvals); answering
+or timeout dismisses (patches) the card. Fulfills the original mvp-scope
+question row.
 
 ## Aligned Additions (2026-07-24)
 

@@ -36,6 +36,7 @@
 | `/last` | 重发当前会话最近一次终态答复文本（本地终态 store，超过 15000 字符截断） |
 | `/abort` | 中断 active prompt；仅该 prompt 发起者与管理员可用；对已完成 prompt 再 abort 得上游 40402(not pending)→ 提示"已结束"，执行卡不转失败（spike S2) |
 | `/help` | 命令导航 |
+| `/whoami` | 展示发送者身份（open_id、显示名、是否管理员）与 chat/绑定状态；非管理员可用 |
 | `kitectl` | config / service（启停、status、log)/ binding(list)/ session(list、status)/ prompt send |
 
 ### 不包含（Non-goals,MVP 期内明确拒绝）
@@ -83,7 +84,7 @@
 - 首个管理员通过在飞书内发送 `/init <token>` 登记（init token 安装时
   生成，流程仿 FOCUS)；管理员集合存实例配置。
 - MVP 只有两级：**管理员**（全部命令 + `kitectl`）与**非管理员**（不可
-  使用，`/help` 除外）。允许名单（多用户）是 Phase 2 候选。
+  使用，`/help` 与 `/whoami` 除外）。允许名单（多用户）是 Phase 2 候选。
 - binding 级 permission mode 默认 `auto`;`yolo` 需要管理员显式设置，
   且每次设置都在会话内明示"本会话已开启自动批准"。
 

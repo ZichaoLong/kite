@@ -41,6 +41,7 @@ If it cannot answer, cut the requirement. No exceptions.
 | `/last` | reply with the bound session's most recent terminal result text from the local store (truncated past 15000 chars) |
 | `/abort` | abort the active prompt; only available to that prompt's initiator and admins; aborting an already-finished prompt gets upstream 40402 (not pending) → show "already finished", do not transition the card to failed (spike S2) |
 | `/help` | command navigation |
+| `/whoami` | show the sender's identity (open_id, display name, admin status), chat/binding state; available to non-admins |
 | `kitectl` | config / service (start/stop, status, log) / binding (list) / session (list, status) / prompt send |
 
 ### Not included (Non-goals, explicitly rejected during the MVP)
@@ -103,8 +104,8 @@ explicitly; "best-effort" silent degradation is forbidden:
   token is generated at install time, flow modeled on FOCUS); the admin set is
   stored in the instance config.
 - The MVP has only two levels: **admin** (all commands + `kitectl`) and
-  **non-admin** (cannot use, except `/help`). An allowlist (multi-user) is a
-  Phase 2 candidate.
+  **non-admin** (cannot use, except `/help` and `/whoami`). An allowlist
+  (multi-user) is a Phase 2 candidate.
 - The binding-level permission mode defaults to `auto`; `yolo` requires an
   explicit admin setting, and every setting announces in the chat
   "auto-approval is now enabled for this chat".

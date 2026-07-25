@@ -28,8 +28,9 @@ KITE 实例经普通 prompt 路径执行。
   面 → daemon 提交（归属记到该 chat，模式随绑定）。
 - 冲突交给 kap 服务端 FIFO(session 忙则排队；不需要也不存在本地内存
   队列）。
-- 平台边界：今天仅 **Linux `systemd --user`**;macOS/Windows 暂无对应
-  受管定时助手（要加须先改本文档）。
+- 平台边界：受管定时助手与 `service_manager` 同构分派——Linux
+  `systemd --user` 定时器、macOS `launchd`(`StartCalendarInterval`)、
+  Windows Task Scheduler 日历触发（2026-07-25 准入）。
 
 ## 3. `kitectl schedule` 命令面
 

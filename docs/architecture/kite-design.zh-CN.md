@@ -136,8 +136,9 @@ gate。登记在 `docs/decisions/concurrency-model.md`，等产品证明需要�
   定格；终态文本落本地 store 供 `/last` 类命令读取。
 - **审批卡**:approval.requested → 三键卡（批准/拒绝/反馈）,REST 响应后
   patch 定格；60s 幂等窗口内重复点击按"已处理"提示，不报错。
-- question 表单卡：MVP 透传文本化（列出选项，回复编号选择）;Phase 2 再做
-  富表单。
+- question 表单卡：`question.requested` 按 question 项渲染选项按钮卡
+  （编号回复兜底）；超时自动 dismiss(2026-07-25 准入，落实 mvp-scope
+  的 question 原始行）。
 
 ## 7. 持久化
 
