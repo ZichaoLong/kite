@@ -111,6 +111,11 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
         "/help",
         "显示本命令导航。",
     ),
+    CommandSpec(
+        "/whoami",
+        "/whoami",
+        "查看你的身份与当前 chat/绑定状态（非管理员也可用）。",
+    ),
 )
 
 _SPECS_BY_NAME = {spec.name: spec for spec in COMMAND_SPECS}

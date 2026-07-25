@@ -525,6 +525,33 @@ class IdentityTests(AppHandlerTestCase):
 # ---------------------------------------------------------------------------
 
 
+class WhoamiTests(AppHandlerTestCase):
+    def test_whoami_admin_p2p_shows_identity_and_binding(self) -> None:
+        self.bind("s-1")
+
+        self.send("/whoami")
+
+        text = self.transport.last_text()
+        self.assertIn(ADMIN_OPEN_ID, text)
+        self.assertIn("管理员", text)
+        self.assertIn("s-1", text)
+        self.assertIn("单聊", text)
+
+    def test_whoami_non_admin_allowed(self) -> None:
+        self.handler = self._make_handler(admins=set())
+
+        self.send("/whoami", sender="ou_stranger")
+
+        text = self.transport.last_text()
+        self.assertIn("ou_stranger", text)
+        self.assertIn("非管理员", text)
+
+    def test_whoami_unbound_shows_no_binding(self) -> None:
+        self.send("/whoami")
+
+        self.assertIn("绑定会话：无", self.transport.last_text())
+
+
 class LastCommandTests(AppHandlerTestCase):
     def _seed_terminal(self, text: str = "最终答复文本", session_id: str = "s-1") -> TerminalResultStore:
         store = TerminalResultStore(self.data_dir)

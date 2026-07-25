@@ -427,6 +427,7 @@ class AppHandler(TransportHandler):
             "/abort": self._cmd_abort,
             "/help": self._cmd_help,
             "/init": self._cmd_init,
+            "/whoami": self._cmd_whoami,
         }
 
     @property
@@ -507,11 +508,14 @@ class AppHandler(TransportHandler):
             self._on_group_message_impl(message, text, command)
             return
         if not self._is_admin(message.sender_open_id):
-            # Identity gate (mvp-scope §5): non-admins get /help and /init only.
+            # Identity gate (mvp-scope §5): non-admins get /help, /init and
+            # /whoami only.
             if command is not None and command.name == "/help":
                 self._reply_to(message, build_help_text())
             elif command is not None and command.name == "/init":
                 self._cmd_init(message, command.arg)
+            elif command is not None and command.name == "/whoami":
+                self._cmd_whoami(message, command.arg)
             else:
                 self._reply_to(message, _NON_ADMIN_TEXT)
             return
@@ -1393,6 +1397,34 @@ class AppHandler(TransportHandler):
 
     def _cmd_help(self, message: InboundMessage, arg: str) -> None:
         self._reply_to(message, build_help_text())
+
+    def _cmd_whoami(self, message: InboundMessage, arg: str) -> None:
+        """/whoami: sender identity + chat/binding state (non-admin allowed)."""
+        sender = message.sender_open_id.strip()
+        name = self._names.name_of(sender) if sender else "unknown"
+        lines = [
+            f"open_id：`{sender or '-'}`",
+            f"显示名：{name}",
+            f"身份：{'管理员' if self._is_admin(sender) else '非管理员'}",
+            f"chat：`{message.chat_id}`（{'群聊' if message.chat_type == 'group' else '单聊'}）",
+        ]
+        binding = self._binding_store.load(message.chat_id)
+        if binding is not None:
+            lines.append(f"绑定会话：`{binding['session_id']}`")
+            lines.append(
+                f"推送：{'开启' if binding['attached'] else '暂停'}；"
+                f"权限模式：{binding['permission_mode']}；"
+                f"plan 模式：{'开' if binding['plan_mode'] else '关'}"
+            )
+        else:
+            lines.append("绑定会话：无")
+        if message.chat_type == "group":
+            config = self._group_config_store.load(message.chat_id)
+            if config is not None and config.get("activated"):
+                lines.append(f"群聊状态：已激活（{config['mode']}）")
+            else:
+                lines.append("群聊状态：未激活")
+        self._reply_to(message, "\n".join(lines))
 
     def _cmd_init(self, message: InboundMessage, arg: str) -> None:
         sender = message.sender_open_id.strip()

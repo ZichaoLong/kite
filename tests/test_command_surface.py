@@ -79,6 +79,7 @@ class CommandSpecTests(unittest.TestCase):
                 "/abort",
                 "/init",
                 "/help",
+                "/whoami",
             ],
         )
 

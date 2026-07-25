@@ -1382,5 +1382,31 @@ class AllModeReverseExclusivityTests(GroupChatTestCase):
         self.assertEqual(binding["session_id"], "s-3")
 
 
+class GroupWhoamiTests(GroupChatTestCase):
+    def test_whoami_in_activated_group_shows_mode(self) -> None:
+        self.bind_group()
+        self.activate_group(mode=GROUP_MODE_ASSISTANT)
+
+        self.send_group("/whoami", sender=ADMIN_OPEN_ID)
+
+        text = self.transport.last_text()
+        self.assertIn(ADMIN_OPEN_ID, text)
+        self.assertIn("群聊", text)
+        self.assertIn("已激活（assistant）", text)
+
+    def test_whoami_group_member_is_admin_only(self) -> None:
+        self.bind_group()
+        self.activate_group()
+
+        self.send_group("/whoami", sender=MEMBER_OPEN_ID)
+
+        self.assertIn("仅管理员可用", self.transport.last_text())
+
+    def test_whoami_in_non_activated_group_shows_inactive(self) -> None:
+        self.send_group("/whoami", sender=ADMIN_OPEN_ID)
+
+        self.assertIn("未激活", self.transport.last_text())
+
+
 if __name__ == "__main__":
     unittest.main()
