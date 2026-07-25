@@ -66,6 +66,7 @@ Scope boundaries (what this module deliberately does NOT do):
 from __future__ import annotations
 
 import hmac
+import json
 import logging
 import pathlib
 import urllib.parse
@@ -82,6 +83,10 @@ from kite.adapters.kap_server import (
     SessionSummary,
 )
 from kite.attachment_domain import AttachmentDomain, AttachmentPorts
+from kite.card_text_projection import (
+    project_interactive_card_text,
+    verify_terminal_result_checksum,
+)
 from kite.command_surface import (
     SlashCommand,
     build_help_text,
@@ -171,6 +176,10 @@ _GROUP_NOT_ACTIVATED_ADMIN_TEXT = "本群尚未激活，@我 发送的消息不�
 _GROUP_COMMAND_ADMIN_ONLY_TEXT = "群聊中命令仅管理员可用。"
 _ABORT_DENIED_TEXT = "只有该 prompt 的发起者或管理员可以中止它。"
 _LAST_TEXT_CAP = 15000
+# /last history fallback: how many of the newest chat messages are scanned
+# for a verifiable terminal card when the local store has no record.
+_LAST_HISTORY_SCAN_LIMIT = 20
+_LAST_HISTORY_FETCH_FAILED_TEXT = "读取聊天记录失败，请稍后重试。"
 _GROUP_PROMPT_HINT_TEXT = "群聊中请 @我 并发送文字来提交 prompt。"
 # Fail-closed §4.5: never answer without the context, say so explicitly.
 _GROUP_HISTORY_FETCH_FAILED_TEXT = (
@@ -1529,8 +1538,13 @@ class AppHandler(TransportHandler):
     def _cmd_last(self, message: InboundMessage, arg: str) -> None:
         """/last: reply with the bound session's latest terminal result text.
 
-        Reads the local terminal result store (design §6: terminal text is
-        persisted for /last-style reads); no upstream call, no state axis.
+        Primary source is the local terminal result store (design §6:
+        terminal text is persisted for /last-style reads); no upstream call,
+        no state axis. When the store has no record for the session (store
+        lost/wiped), the fallback re-reads the newest verifiable terminal
+        card from the Feishu chat history and projects its text back
+        (kite/card_text_projection.py marker contract); kap REST is not
+        involved in the fallback.
         """
         if arg.strip():
             self._reply_to(message, build_usage_text("/last"))
@@ -1543,11 +1557,71 @@ class AppHandler(TransportHandler):
             return
         text = self._terminal_store.latest_for_session(binding["session_id"])
         if not text:
+            text = self._last_text_from_history(message.chat_id)
+            if text is None:
+                self._reply_to(message, _LAST_HISTORY_FETCH_FAILED_TEXT)
+                return
+        if not text:
             self._reply_to(message, "该会话暂无终态答复记录。")
             return
         if len(text) > _LAST_TEXT_CAP:
             text = text[:_LAST_TEXT_CAP] + "\n\n（内容过长，已截断）"
         self._reply_to(message, text)
+
+    def _last_text_from_history(self, chat_id: str) -> str | None:
+        """Project the newest checksum-verified terminal card from chat history.
+
+        Returns the projected terminal text, "" when no verifiable terminal
+        card is found in the scanned window, or None when the history fetch
+        itself failed (the caller then answers with an explicit error notice
+        instead of the no-record one). Only checksum-verified projections
+        are exported (fail-closed): marker-only legacy cards and cards whose
+        text no longer matches the stamped element id are skipped, so a
+        forged marker can never poison /last.
+        """
+        list_messages = getattr(self._transport, "list_messages", None)
+        if not callable(list_messages):
+            return ""
+        try:
+            page = list_messages(
+                chat_id,
+                sort_type="ByCreateTimeDesc",
+                page_size=_LAST_HISTORY_SCAN_LIMIT,
+            )
+        except Exception:
+            logger.warning(
+                "/last history fallback fetch failed chat=%s", chat_id, exc_info=True
+            )
+            return None
+        app_id = str(getattr(self._transport, "app_id", "") or "").strip()
+        for item in list(getattr(page, "items", None) or []):
+            if str(getattr(item, "msg_type", "") or "").strip() != "interactive":
+                continue
+            if app_id:
+                sender = getattr(item, "sender", None)
+                sender_type = str(getattr(sender, "sender_type", "") or "").strip()
+                sender_id = str(getattr(sender, "id", "") or "").strip()
+                # Only this bot's own cards are candidates (other apps'
+                # cards are not KITE terminal cards).
+                if sender_type != "app" or sender_id != app_id:
+                    continue
+            body = getattr(item, "body", None)
+            raw_content = str(getattr(body, "content", "") or "").strip()
+            if not raw_content:
+                continue
+            try:
+                content_dict = json.loads(raw_content)
+            except Exception:
+                continue
+            if not isinstance(content_dict, dict):
+                continue
+            projection = project_interactive_card_text(content_dict)
+            if not projection.final_reply_text:
+                continue
+            if not verify_terminal_result_checksum(projection):
+                continue
+            return projection.final_reply_text
+        return ""
 
     def _cmd_abort(self, message: InboundMessage, arg: str) -> None:
         if arg.strip():

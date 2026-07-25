@@ -18,9 +18,13 @@ Ported from FOCUS ``bot/cards.py`` but rewritten to kap event semantics
 - Terminal result card: when a prompt finishes (completed/aborted/failed — the
   MVP observes completion via turn.ended / prompt.aborted; prompt.completed
   has no producer upstream) a separate terminal card is sent and the execution
-  card is frozen. ``terminal_result_checksum`` / ``terminal_result_element_id``
-  produce the id/checksum pair ``terminal_result_store`` persists for
-  ``/last``-style reads.
+  card is frozen. The card carries the projection contract of
+  ``kite/card_text_projection.py``: an invisible terminal marker appended to
+  the final text plus a ``kite_tr_<id>_<checksum16>`` element id binding the
+  visible card text, so ``/last`` can recover the terminal text from Feishu
+  history when the local terminal result store is lost. Guarded texts
+  (marker injection / embedded image / over budget) render without the
+  marker and id.
 - Approval card: approval.requested → three buttons (approve / reject /
   reject-with-feedback) carrying ``approval_id`` + ``prompt_id`` in the button
   value; after the REST response the card is patched to a frozen resolved
@@ -32,24 +36,34 @@ Ported from FOCUS ``bot/cards.py`` but rewritten to kap event semantics
   option number; auto-dismiss on timeout. The rich form card is Phase 2.
 
 Deliberately not ported from FOCUS (see module test file for the locked
-surface): the card-history text projection (KITE's transport extracts no
-text from interactive messages; terminal text lives in the local store),
-goal/plan/model/group/thread-list/settings cards, help navigation
+surface): goal/plan/model/group/thread-list/settings cards, help navigation
 decoration, and the execution card's cancel button (MVP abort is the
 permission-gated ``/abort`` command).
 """
 
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass
 from typing import Literal, Sequence
 
 from kite.card_limits import MAX_CARD_TABLES, count_card_tables, limit_card_tables
+from kite.card_text_projection import (
+    TERMINAL_RESULT_CARD_MARKER,
+    TERMINAL_RESULT_ELEMENT_ID_PREFIX,
+    can_render_terminal_result_card,
+    render_terminal_result_text_block,
+    terminal_result_checksum,
+    terminal_result_element_id,
+)
 from kite.feishu_card_markdown import (
     sanitize_runtime_markdown_for_feishu_card,
     sanitize_terminal_result_markdown_for_feishu_json2,
 )
+
+# NB: terminal_result_checksum / terminal_result_element_id /
+# TERMINAL_RESULT_ELEMENT_ID_PREFIX / TERMINAL_RESULT_CARD_MARKER live in
+# kite.card_text_projection (the marker/projection contract owner) and are
+# re-exported here so existing callers (event_pipeline, tests) keep working.
 
 # ---------------------------------------------------------------------------
 # Card model constants
@@ -100,9 +114,11 @@ APPROVAL_STALE_NOTICE = "该审批已失效或已处理。"
 DEFAULT_APPROVAL_TIMEOUT_SECONDS = 300
 DEFAULT_QUESTION_TIMEOUT_SECONDS = 300
 
-# element_id prefix stamped on terminal cards; pairs with the
-# terminal_result_id/checksum persisted by terminal_result_store.
-TERMINAL_RESULT_ELEMENT_ID_PREFIX = "kite_tr_"
+# Char budget for the terminal card's marker-stamped render (the projector
+# contract in kite/card_text_projection.py): over-budget terminal text is
+# rendered without the marker/element id (event_pipeline additionally
+# enforces a serialized utf-8 byte budget with a plain-text fallback).
+TERMINAL_RESULT_CARD_CHAR_LIMIT = 15000
 
 _PROMPT_SNIPPET_MAX = 200
 
@@ -183,22 +199,6 @@ def _session_line(session_title: str, session_id: str) -> str:
     if session_id:
         return f"会话：{title}（`{_shorten(session_id, 12)}`）"
     return f"会话：{title}"
-
-
-def terminal_result_checksum(final_reply_text: str) -> str:
-    """sha256 of the terminal text; stored beside the record for /last reads."""
-    raw_text = str(final_reply_text or "")
-    if not raw_text:
-        return ""
-    return hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
-
-
-def terminal_result_element_id(terminal_result_id: str, checksum: str) -> str:
-    normalized_id = str(terminal_result_id or "").strip().lower()
-    normalized_checksum = str(checksum or "").strip().lower()
-    if not normalized_id or not normalized_checksum:
-        return ""
-    return f"{TERMINAL_RESULT_ELEMENT_ID_PREFIX}{normalized_id}_{normalized_checksum[:16]}"
 
 
 # ---------------------------------------------------------------------------
@@ -359,10 +359,21 @@ def build_terminal_card(
 
     ``text`` is the terminal text (final reply for completed, the abort note
     for aborted, the upstream error msg for failed); it is what
-    terminal_result_store persists for `/last`-style reads. When
-    ``terminal_result_id`` is given, the text element is stamped with an
-    element_id derived from it + the checksum, so card and store record stay
-    cross-referable.
+    terminal_result_store persists for `/last`-style reads.
+
+    Marker/projection contract (kite/card_text_projection.py): when the text
+    passes ``can_render_terminal_result_card`` (non-empty, no marker
+    injection, no embedded image markdown, within the char budget), the
+    rendered content ends with the invisible terminal marker and the text
+    element is stamped with ``kite_tr_<terminal_result_id>_<checksum16>``
+    where the checksum is derived from the exact visible (marker-free) card
+    text — so the /last history fallback can verify a projected text without
+    the local store. When the guards fail, the card falls back to a safe
+    rendering: plain sanitized text, no marker, no element id, so a forged
+    marker can never poison later projection. The ``checksum`` parameter is
+    accepted for call compatibility with the pipeline (which hashes the raw
+    text for the store record); the stamped checksum is always derived from
+    the rendered card text.
     """
     raw_text = str(text or "")
     if outcome == TERMINAL_ABORTED:
@@ -378,13 +389,19 @@ def build_terminal_card(
         title = _TERMINAL_CARD_TITLE
         fallback = "*无最终输出。*"
 
-    content = sanitize_terminal_result_markdown_for_feishu_json2(raw_text) or fallback
-    element: dict[str, str] = {"tag": "markdown", "content": content}
-    element_id = terminal_result_element_id(
-        terminal_result_id, checksum or terminal_result_checksum(raw_text)
-    )
-    if element_id:
-        element["element_id"] = element_id
+    safe_content = sanitize_terminal_result_markdown_for_feishu_json2(raw_text) or fallback
+    element: dict[str, str] = {"tag": "markdown"}
+    if can_render_terminal_result_card(raw_text, char_limit=TERMINAL_RESULT_CARD_CHAR_LIMIT):
+        element["content"] = render_terminal_result_text_block(safe_content)
+        # The checksum binds the exact text the projector will extract
+        # (marker-stripped, stripped), not the raw pre-sanitize text.
+        element_id = terminal_result_element_id(
+            terminal_result_id, terminal_result_checksum(safe_content.strip())
+        )
+        if element_id:
+            element["element_id"] = element_id
+    else:
+        element["content"] = safe_content
 
     return {
         "schema": "2.0",

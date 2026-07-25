@@ -26,6 +26,8 @@ from kite.app_handler import (
     ACTION_SESSION_SWITCH,
     AppHandler,
 )
+from kite.card_text_projection import TERMINAL_RESULT_CARD_MARKER
+from kite.cards import build_terminal_card
 from kite.feishu_transport import (
     CardAction,
     DownloadedMessageResource,
@@ -71,6 +73,10 @@ class FakeTransport:
         self.merge_forward_items: list = []
         self.merge_forward_error: Exception | None = None
         self.merge_forward_fetches: list[str] = []
+        # /last history fallback scripting (Feishu message history page).
+        self.history_items: list = []
+        self.history_error: Exception | None = None
+        self.list_messages_calls: list[dict] = []
 
     def reply(self, chat_id: str, text: str, *, parent_message_id: str = "", reply_in_thread: bool = False) -> bool:
         self.replies.append(
@@ -82,6 +88,30 @@ class FakeTransport:
         self.cards.append(
             {"chat_id": chat_id, "card": card, "parent_message_id": parent_message_id}
         )
+
+    def list_messages(
+        self,
+        chat_id: str,
+        *,
+        start_time: str | None = None,
+        end_time: str | None = None,
+        sort_type: str = "ByCreateTimeAsc",
+        page_size: int = 50,
+        page_token: str = "",
+    ):
+        self.list_messages_calls.append(
+            {
+                "chat_id": chat_id,
+                "start_time": start_time,
+                "end_time": end_time,
+                "sort_type": sort_type,
+                "page_size": page_size,
+                "page_token": page_token,
+            }
+        )
+        if self.history_error is not None:
+            raise self.history_error
+        return SimpleNamespace(items=list(self.history_items), has_more=False, page_token="")
 
     def download_message_resource(
         self, message_id: str, file_key: str, *, resource_type: str
@@ -536,6 +566,142 @@ class LastCommandTests(AppHandlerTestCase):
 
         self.assertIn("已截断", self.transport.last_text())
         self.assertLess(len(self.transport.last_text()), 16000)
+
+
+class LastHistoryFallbackTests(AppHandlerTestCase):
+    """Store miss -> project the newest verifiable terminal card from history."""
+
+    def _empty_store(self) -> TerminalResultStore:
+        return TerminalResultStore(self.data_dir)
+
+    def _history_card(self, card: dict, *, message_id: str = "om_t1"):
+        return SimpleNamespace(
+            message_id=message_id,
+            msg_type="interactive",
+            sender=SimpleNamespace(sender_type="app", id="cli_kite"),
+            body=SimpleNamespace(content=json.dumps(card, ensure_ascii=False)),
+        )
+
+    def test_last_store_miss_projects_terminal_card_from_history(self) -> None:
+        self.handler = self._make_handler(terminal_store=self._empty_store())
+        self.bind("s-1")
+        self.transport.history_items = [
+            self._history_card(
+                build_terminal_card(
+                    outcome="completed", text="历史终态", terminal_result_id="p-1"
+                )
+            )
+        ]
+
+        self.send("/last")
+
+        self.assertEqual(self.transport.last_text(), "历史终态")
+        self.assertEqual(len(self.transport.list_messages_calls), 1)
+        call = self.transport.list_messages_calls[0]
+        self.assertEqual(call["chat_id"], CHAT_ID)
+        self.assertEqual(call["sort_type"], "ByCreateTimeDesc")
+
+    def test_last_store_hit_wins_over_history(self) -> None:
+        store = TerminalResultStore(self.data_dir)
+        store.upsert(
+            TerminalResultRecord(
+                message_id="om_t0",
+                execution_message_id="",
+                final_reply_text="本地终态",
+                recorded_at=1.0,
+                terminal_result_id="p-0",
+                session_id="s-1",
+            )
+        )
+        self.handler = self._make_handler(terminal_store=store)
+        self.bind("s-1")
+        self.transport.history_items = [
+            self._history_card(
+                build_terminal_card(
+                    outcome="completed", text="历史终态", terminal_result_id="p-1"
+                )
+            )
+        ]
+
+        self.send("/last")
+
+        self.assertEqual(self.transport.last_text(), "本地终态")
+        # The store hit never touches the Feishu history API.
+        self.assertEqual(self.transport.list_messages_calls, [])
+
+    def test_last_history_tampered_card_is_skipped_for_older_verifiable(self) -> None:
+        self.handler = self._make_handler(terminal_store=self._empty_store())
+        self.bind("s-1")
+        tampered = build_terminal_card(
+            outcome="completed", text="权威原文", terminal_result_id="p-2"
+        )
+        # Text changed after the element id was stamped: checksum mismatch.
+        tampered["body"]["elements"][0]["content"] = (
+            f"被篡改的文本{TERMINAL_RESULT_CARD_MARKER}"
+        )
+        older = build_terminal_card(
+            outcome="completed", text="较早终态", terminal_result_id="p-1"
+        )
+        self.transport.history_items = [
+            self._history_card(tampered, message_id="om_new"),
+            self._history_card(older, message_id="om_old"),
+        ]
+
+        self.send("/last")
+
+        self.assertEqual(self.transport.last_text(), "较早终态")
+
+    def test_last_history_marker_only_card_is_not_exported(self) -> None:
+        self.handler = self._make_handler(terminal_store=self._empty_store())
+        self.bind("s-1")
+        # Feishu history re-rendered shape: marker survives but the element
+        # id is gone, so the projection is unverifiable (fail-closed).
+        history_rendered = {
+            "title": "Kimi 执行结果",
+            "elements": [
+                [
+                    {"tag": "text", "text": "## 结论"},
+                    {"tag": "text", "text": f"第一条{TERMINAL_RESULT_CARD_MARKER}"},
+                ]
+            ],
+        }
+        self.transport.history_items = [
+            SimpleNamespace(
+                message_id="om_legacy",
+                msg_type="interactive",
+                sender=SimpleNamespace(sender_type="app", id="cli_kite"),
+                body=SimpleNamespace(content=json.dumps(history_rendered, ensure_ascii=False)),
+            )
+        ]
+
+        self.send("/last")
+
+        self.assertIn("暂无终态答复记录", self.transport.last_text())
+
+    def test_last_history_without_terminal_card_gives_notice(self) -> None:
+        self.handler = self._make_handler(terminal_store=self._empty_store())
+        self.bind("s-1")
+        self.transport.history_items = [
+            SimpleNamespace(
+                message_id="om_m1",
+                msg_type="text",
+                sender=SimpleNamespace(sender_type="user", id="ou_user"),
+                body=SimpleNamespace(content=json.dumps({"text": "普通消息"})),
+            )
+        ]
+
+        self.send("/last")
+
+        self.assertIn("暂无终态答复记录", self.transport.last_text())
+
+    def test_last_history_fetch_failure_gives_error_notice(self) -> None:
+        self.handler = self._make_handler(terminal_store=self._empty_store())
+        self.bind("s-1")
+        self.transport.history_error = RuntimeError("code=500, msg=boom")
+
+        self.send("/last")
+
+        self.assertIn("读取聊天记录失败", self.transport.last_text())
 
 
 class PromptSubmissionTests(AppHandlerTestCase):

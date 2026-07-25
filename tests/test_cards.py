@@ -1,6 +1,7 @@
 import json
 import unittest
 
+from kite.card_text_projection import TERMINAL_RESULT_CARD_MARKER
 from kite.cards import (
     ACTION_APPROVAL_REJECT_WITH_FEEDBACK,
     ACTION_APPROVAL_RESOLVE,
@@ -198,7 +199,9 @@ class TerminalCardTests(unittest.TestCase):
         self.assertEqual(card["schema"], "2.0")
         self.assertEqual(card["header"]["template"], "green")
         self.assertEqual(card["header"]["title"]["content"], "Kimi 执行结果")
-        self.assertEqual(_collect_markdown(card), ["全部完成。"])
+        # The final text carries the invisible terminal marker (projection
+        # contract, kite/card_text_projection.py).
+        self.assertEqual(_collect_markdown(card), [f"全部完成。{TERMINAL_RESULT_CARD_MARKER}"])
 
     def test_aborted_card(self) -> None:
         card = build_terminal_card(outcome="aborted", text="已生成一半。")
