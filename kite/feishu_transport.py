@@ -1150,6 +1150,7 @@ class FeishuTransport:
         sort_type: str = "ByCreateTimeAsc",
         page_size: int = 50,
         page_token: str = "",
+        card_msg_content_type: str = "",
     ) -> ListedMessagesPage:
         """Fetch one page of a chat's message history.
 
@@ -1157,7 +1158,10 @@ class FeishuTransport:
         (FOCUS ``_list_history_messages_page``, same contract): start/end are
         second-precision unix timestamps as strings; raises RuntimeError on
         failure so the assistant-mode history fetch can fail closed
-        (group-chat contract §4.5).
+        (group-chat contract §4.5). ``card_msg_content_type`` (e.g.
+        ``user_card_content``) makes Feishu return the as-sent card JSON
+        (with element ids) instead of the flattened re-render — without it
+        interactive history is unprojectable (audit H1).
         """
         builder = (
             ListMessageRequest.builder()
@@ -1173,6 +1177,9 @@ class FeishuTransport:
         if page_token:
             builder = builder.page_token(page_token)
         request = builder.build()
+        normalized_card_content_type = str(card_msg_content_type or "").strip()
+        if normalized_card_content_type:
+            request.queries.append(("card_msg_content_type", normalized_card_content_type))
         try:
             response = self.client.im.v1.message.list(request)
         except Exception as e:

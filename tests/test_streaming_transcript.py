@@ -57,6 +57,21 @@ class AppendDeltaTests(unittest.TestCase):
         transcript.rebuild_from_snapshot("xy")
         self.assertFalse(transcript.gapped)
         self.assertEqual(transcript.expected_offset, 2)
+
+    def test_non_bmp_characters_do_not_false_gap(self) -> None:
+        # Upstream offsets are JS String.length (UTF-16 code units): one
+        # emoji counts 2. A Python-len tracker would false-gap on every
+        # delta after the first emoji (audit H2).
+        transcript = StreamingTranscript()
+        self.assertFalse(transcript.append_delta(0, "a"))
+        self.assertEqual(transcript.expected_offset, 1)
+        self.assertFalse(transcript.append_delta(1, "😀"))  # 2 UTF-16 units
+        self.assertEqual(transcript.expected_offset, 3)
+        self.assertFalse(transcript.append_delta(3, "b"))
+        self.assertFalse(transcript.gapped)
+        self.assertEqual(transcript.expected_offset, 4)
+        self.assertFalse(transcript.append_delta(4, "c"))
+        self.assertEqual(transcript.full_text(), "a😀bc")
         self.assertFalse(transcript.append_delta(2, "z"))
         self.assertEqual(transcript.full_text(), "xyz")
 

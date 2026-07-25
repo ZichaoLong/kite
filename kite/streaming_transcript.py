@@ -37,12 +37,22 @@ class StreamingTranscript:
     the banked earlier steps, and a gapped latch. While gapped, appends
     report the gap without mutating, so the caller rebuilds exactly once;
     ``rebuild_from_snapshot`` clears the latch and re-baselines the stream.
+
+    Offsets are tracked in **UTF-16 code units** — upstream stamps them with
+    JS ``String.length`` (`inFlightTurnTracker.ts`), so a non-BMP character
+    (emoji) counts 2, and a Python ``len`` comparison would false-gap on
+    every subsequent delta (audit H2).
     """
 
     _step_text: str = ""
     _segments: list[str] = field(default_factory=list)
     _banked_chars: int = 0
     _gapped: bool = False
+
+    @staticmethod
+    def _offset_len(text: str) -> int:
+        """Length in UTF-16 code units (upstream's offset unit)."""
+        return len(text.encode("utf-16-le")) // 2
 
     @property
     def gapped(self) -> bool:
@@ -51,7 +61,7 @@ class StreamingTranscript:
     @property
     def expected_offset(self) -> int:
         """The pre-append offset the next delta of the current step must carry."""
-        return len(self._step_text)
+        return self._offset_len(self._step_text)
 
     def append_delta(self, offset: int, text_delta: str) -> bool:
         """Append one delta; returns True on an offset gap (caller rebuilds).
@@ -67,7 +77,7 @@ class StreamingTranscript:
         if self._gapped:
             return True
         offset = max(int(offset), 0)
-        expected = len(self._step_text)
+        expected = self._offset_len(self._step_text)
         if offset != expected:
             if offset > expected or offset != 0:
                 self._gapped = True

@@ -1870,6 +1870,7 @@ class AppHandler(TransportHandler):
                 chat_id,
                 sort_type="ByCreateTimeDesc",
                 page_size=_LAST_HISTORY_SCAN_LIMIT,
+                card_msg_content_type="user_card_content",
             )
         except Exception:
             logger.warning(

@@ -98,6 +98,7 @@ class FakeTransport:
         sort_type: str = "ByCreateTimeAsc",
         page_size: int = 50,
         page_token: str = "",
+        card_msg_content_type: str = "",
     ):
         self.list_messages_calls.append(
             {
@@ -107,6 +108,7 @@ class FakeTransport:
                 "sort_type": sort_type,
                 "page_size": page_size,
                 "page_token": page_token,
+                "card_msg_content_type": card_msg_content_type,
             }
         )
         if self.history_error is not None:
@@ -627,6 +629,9 @@ class LastHistoryFallbackTests(AppHandlerTestCase):
         call = self.transport.list_messages_calls[0]
         self.assertEqual(call["chat_id"], CHAT_ID)
         self.assertEqual(call["sort_type"], "ByCreateTimeDesc")
+        # Without this, Feishu returns flattened re-renders (no element ids)
+        # and every projection is unverifiable (audit H1).
+        self.assertEqual(call["card_msg_content_type"], "user_card_content")
 
     def test_last_store_hit_wins_over_history(self) -> None:
         store = TerminalResultStore(self.data_dir)
