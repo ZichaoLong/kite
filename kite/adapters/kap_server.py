@@ -1159,11 +1159,20 @@ class KapWsClient:
     - frames arriving while an ack is awaited (replayed events, the standalone
       ``resync_required`` frame) are dispatched in strict wire order — never
       dropped, never reordered;
-    - ack ``payload.cursors`` are adopted as the cursor source of truth;
-    - durable event frames advance the stored per-session cursor;
+    - ack ``payload.cursors`` are adopted as a cursor source of truth,
+      monotonically (audit M4: same epoch keeps the higher seq, a new epoch
+      is always adopted) — the ack wait races the recv loop's own cursor
+      advances and must never rewind them;
+    - durable event frames advance the stored per-session cursor, including
+      durable ``error`` frames (audit M6: advancing BEFORE the error
+      callback fires, so a reconnect never replays them);
     - ``resync_required`` (standalone frame or ack-listed) is surfaced via the
       on_resync_required callback; the receiver rebuilds from a REST snapshot
-      and stores ``snapshot.cursor``;
+      and stores ``snapshot.cursor``. An ack-listed resync WITHOUT a cursor
+      means no server-side subscription was established (cold/deleted
+      session), so a successful rebuild must be answered with
+      ``resubscribe_after_rebuild`` — one guarded attempt per connection per
+      session until a clean ack lands (audit M7);
     - with no server heartbeat, no frame of any kind for ``stale_seconds``
       triggers a reconnect.
     """
@@ -1212,6 +1221,13 @@ class KapWsClient:
         self._pending_acks: dict[str, dict[str, Any]] = {}
         self._memory_cursors: dict[str, EventCursor] = {}
         self._connected_at: float | None = None
+        # M7 anti-tight-loop state (per connection): sessions an ack flagged
+        # for resync WITHOUT a cursor (no server-side subscription was
+        # established) and sessions that already used their one post-rebuild
+        # re-subscribe attempt. Both clear on disconnect and when a clean
+        # ack lands for the session.
+        self._ack_resync_sessions: set[str] = set()
+        self._resubscribe_attempted: set[str] = set()
         self.server_hello: dict[str, Any] | None = None
 
     # -- public API ----------------------------------------------------------
@@ -1279,6 +1295,36 @@ class KapWsClient:
 
     def cursor_for(self, session_id: str) -> EventCursor | None:
         return self._cursor_get(session_id)
+
+    def resubscribe_after_rebuild(self, session_id: str, *, timeout: float | None = None) -> bool:
+        """Re-subscribe once after a successful snapshot rebuild (audit M7).
+
+        An ack-listed resync that carried no cursor means no server-side
+        subscription was established (cold/deleted session): the snapshot
+        rebuild adopts the cursor, but without a fresh subscribe the session
+        stays silent until the next reconnect. Guarded against tight loops:
+        at most one attempt per connection per session until a clean ack
+        lands (the session stops appearing in resync_required); a
+        persistently cold session therefore cannot cycle rebuild ->
+        subscribe -> resync. Returns True when an attempt was made.
+        """
+        session_id = str(session_id or "").strip()
+        with self._state_lock:
+            if (
+                not session_id
+                or session_id not in self._wanted_sessions
+                or session_id not in self._ack_resync_sessions
+                or session_id in self._resubscribe_attempted
+            ):
+                return False
+            self._resubscribe_attempted.add(session_id)
+        try:
+            self.subscribe(session_id, timeout=timeout)
+        except Exception as exc:  # noqa: BLE001 - the reconnect path covers it
+            logger.warning(
+                "post-rebuild re-subscribe failed session=%s: %s", session_id, exc
+            )
+        return True
 
     # -- connection lifecycle (background thread) ----------------------------
 
@@ -1407,6 +1453,14 @@ class KapWsClient:
                 agent_id=_optional_str(payload.get("agentId")),
                 retryable=bool(payload.get("retryable")),
             )
+            # Upstream errors are ordinary durable events (seq/epoch/
+            # session_id on the frame, verified live against 0.29.1, audit
+            # M6): advance the cursor through the normal path BEFORE firing
+            # the callback, or a reconnect replays the frame and a healthy
+            # prompt can be misjudged failed.
+            event = _parse_event_frame(frame)
+            if event is not None and event.seq is not None and not event.volatile and event.session_id:
+                self._advance_cursor(event)
             logger.error("WS error frame: %s", payload)
             if self._on_error_frame is not None:
                 try:
@@ -1481,27 +1535,60 @@ class KapWsClient:
         raise KapWsError(f"no ack for {frame_type} within {timeout}s")
 
     def _handle_ack_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Adopt ack cursors (the cursor source of truth) and surface resyncs."""
+        """Adopt ack cursors (a cursor source of truth) and surface resyncs."""
         cursors = payload.get("cursors") if isinstance(payload.get("cursors"), dict) else {}
+        raw_resync = payload.get("resync_required")
+        resync_ids = (
+            sorted({raw for raw in raw_resync if isinstance(raw, str) and raw})
+            if isinstance(raw_resync, list)
+            else []
+        )
+        with self._state_lock:
+            for session_id in resync_ids:
+                if _parse_wire_cursor(cursors.get(session_id)) is None:
+                    # Resync listed WITHOUT a cursor: no server-side
+                    # subscription was established (cold/deleted session) —
+                    # the post-rebuild re-subscribe (M7) applies. A resync
+                    # carrying a cursor (buffer_overflow/epoch_changed)
+                    # keeps its server-side subscription.
+                    self._ack_resync_sessions.add(session_id)
+            for session_id in cursors:
+                if str(session_id) not in resync_ids:
+                    # A clean ack for the session: its server-side
+                    # subscription is live, so a later subscription-less
+                    # resync earns one fresh re-subscribe attempt.
+                    self._ack_resync_sessions.discard(str(session_id))
+                    self._resubscribe_attempted.discard(str(session_id))
         for session_id, raw_cursor in cursors.items():
             cursor = _parse_wire_cursor(raw_cursor)
             if cursor is not None:
-                self._cursor_set(str(session_id), cursor)
-        resync_ids = payload.get("resync_required")
-        if isinstance(resync_ids, list):
-            for raw_id in resync_ids:
-                if not isinstance(raw_id, str) or not raw_id:
-                    continue
-                server_cursor = _parse_wire_cursor(cursors.get(raw_id))
-                self._fire_resync(
-                    ResyncRequest(
-                        session_id=raw_id,
-                        reason=None,
-                        current_seq=server_cursor.seq if server_cursor else None,
-                        epoch=server_cursor.epoch if server_cursor else None,
-                    )
+                self._adopt_ack_cursor(str(session_id), cursor)
+        for session_id in resync_ids:
+            server_cursor = _parse_wire_cursor(cursors.get(session_id))
+            self._fire_resync(
+                ResyncRequest(
+                    session_id=session_id,
+                    reason=None,
+                    current_seq=server_cursor.seq if server_cursor else None,
+                    epoch=server_cursor.epoch if server_cursor else None,
                 )
+            )
         return payload
+
+    def _adopt_ack_cursor(self, session_id: str, cursor: EventCursor) -> None:
+        """Monotonic ack-cursor adoption (audit M4): subscribe waits for its
+        ack on the caller thread while the recv loop keeps advancing the
+        cursor with replayed/live events, so an older ack seq must never
+        rewind the stored cursor (same guard as the pipeline's
+        snapshot-adopt path); a new epoch is always adopted."""
+        current = self._cursor_get(session_id)
+        if (
+            current is not None
+            and current.epoch == cursor.epoch
+            and current.seq >= cursor.seq
+        ):
+            return
+        self._cursor_set(session_id, cursor)
 
     # -- helpers ----------------------------------------------------------------
 
@@ -1571,6 +1658,11 @@ class KapWsClient:
     def _mark_disconnected(self) -> None:
         was_connected = self._connected_at is not None
         self._connected_at = None
+        with self._state_lock:
+            # Per-connection M7 state: the next connection gets one fresh
+            # re-subscribe attempt per subscription-less session.
+            self._ack_resync_sessions.clear()
+            self._resubscribe_attempted.clear()
         self._close_ws()
         if was_connected:
             self._notify_connection_change(False)

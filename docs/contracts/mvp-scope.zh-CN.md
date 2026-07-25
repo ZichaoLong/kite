@@ -120,3 +120,6 @@
 10. `kitectl interaction sweep [--session <id>] [--yes]` 对上游陈旧的待处理
    审批/question 做拒绝/dismiss 收口（不带 `--yes` 时仅预览）；这些是上游
    kap 资源，故直连 kap REST(2026-07-24)。
+11. `/switch`（含 `/sessions` 卡片按钮）在有 active prompt 时拒绝（与
+   `/new`（对齐项 7）同理由：在途执行卡、终态结果与审批路由会失去可见
+   性）(2026-07-25)。

@@ -570,14 +570,16 @@ def launchd_start_calendar_interval(plan: SchedulePlan) -> dict[str, Any]:
     of ints per key and ANDs the keys, so every form the cron parser accepts
     maps faithfully (the dom+dow OR ambiguity is already rejected upstream)."""
     if plan.one_shot_at is not None:
-        at = plan.one_shot_at
-        return {
-            "Year": at.year,
-            "Month": at.month,
-            "Day": at.day,
-            "Hour": at.hour,
-            "Minute": at.minute,
-        }
+        # launchd.plist(5) StartCalendarInterval defines only
+        # Minute/Hour/Day/Weekday/Month — there is no Year key, so a one-shot
+        # --at cannot be expressed faithfully (an illegal Year key is
+        # ignored and the job silently degrades to a yearly repeat, audit
+        # M13). Fail closed instead of rendering a lie.
+        raise ScheduleError(
+            "launchd (macOS) cannot express one-shot --at schedules; "
+            "use a cron expression, or create the schedule on Linux (systemd) "
+            "or Windows (Task Scheduler)"
+        )
     if plan.shorthand is not None:
         return dict(_LAUNCHD_SHORTHAND_INTERVALS[plan.shorthand])
     cron = plan.cron

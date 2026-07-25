@@ -1052,6 +1052,59 @@ class AllModeExclusivityTests(GroupChatTestCase):
         assert config is not None
         self.assertEqual(config["mode"], GROUP_MODE_ALL)
 
+    def test_activate_all_mode_denied_when_session_shared(self) -> None:
+        # Audit M10 path B: the group was all-mode, deactivated; another
+        # chat bound the session meanwhile. Re-activation preserves the
+        # stored mode, so the exclusivity probes run BEFORE the flip.
+        self.bind("s-1")  # the p2p chat attached to the session
+        self.bind_group("s-1")
+        self.activate_all_mode()
+        self.group_config_store.deactivate(GROUP_CHAT_ID)
+
+        self.send_group("/group activate", sender=ADMIN_OPEN_ID, mentioned=False)
+
+        text = self.transport.last_text()
+        self.assertIn("all 模式", text)
+        self.assertIn("被拒绝", text)
+        config = self.group_config_store.load(GROUP_CHAT_ID)
+        assert config is not None
+        self.assertFalse(config["activated"])
+
+    def test_activate_all_mode_denied_when_session_occupied(self) -> None:
+        # Reverse direction (§3.8): another all-mode group occupies the
+        # session, so this group's re-activation is denied too.
+        self.bind("s-1", chat_id="oc_other_group")
+        self.group_config_store.activate("oc_other_group", activated_by=ADMIN_OPEN_ID)
+        self.group_config_store.set_mode("oc_other_group", GROUP_MODE_ALL)
+        self.bind_group("s-1")
+        self.activate_all_mode()
+        self.group_config_store.deactivate(GROUP_CHAT_ID)
+
+        self.send_group("/group activate", sender=ADMIN_OPEN_ID, mentioned=False)
+
+        text = self.transport.last_text()
+        self.assertIn("独占", text)
+        self.assertIn("被拒绝", text)
+        config = self.group_config_store.load(GROUP_CHAT_ID)
+        assert config is not None
+        self.assertFalse(config["activated"])
+
+    def test_activate_all_mode_allowed_when_session_exclusive(self) -> None:
+        self.bind_group("s-1")
+        self.activate_all_mode()
+        self.group_config_store.deactivate(GROUP_CHAT_ID)
+
+        self.send_group("/group activate", sender=ADMIN_OPEN_ID, mentioned=False)
+
+        text = self.transport.last_text()
+        self.assertIn("已激活", text)
+        # The reply is mode-aware (audit M10): all mode needs no @mention.
+        self.assertIn("无需 @我", text)
+        self.assertNotIn("@我 并发送文字即可提交", text)
+        config = self.group_config_store.load(GROUP_CHAT_ID)
+        assert config is not None
+        self.assertTrue(config["activated"])
+
     def test_switch_into_shared_session_denied_in_all_mode(self) -> None:
         self.bind_group("s-1")
         self.rest.add_session("s-1")
@@ -1267,6 +1320,34 @@ class GroupMergeForwardTests(GroupChatTestCase):
 
         self.assertEqual(self.rest.submissions, [])
         self.assertEqual(self.transport.replies, [])
+
+    def test_all_mode_next_text_claims_stash_into_one_prompt(self) -> None:
+        # §3.7 + audit M12: in all mode the member's next text claims the
+        # stashed transcript — ONE merged prompt, transcript first.
+        self.bind_group("s-1")
+        self.rest.add_session("s-1")
+        self.activate_group(mode=GROUP_MODE_ALL)
+        self.transport.merge_forward_items = [
+            make_forward_item("om_c1", text="转发的内容", sender_id="ou_alice")
+        ]
+        self._forward(sender=MEMBER_OPEN_ID, message_id="om_fwd1")
+        self.assertEqual(len(self.forward_timers), 1)
+
+        self.send_group("帮我看看这个", sender=MEMBER_OPEN_ID, mentioned=False)
+
+        self.assertEqual(len(self.rest.submissions), 1)
+        submission = self.rest.submissions[0]
+        text = submission["body"]["content"][0]["text"]
+        self.assertIn("<forwarded_messages>", text)
+        self.assertLess(text.index("转发的内容"), text.index("帮我看看这个"))
+        # Claimed: no second transcript-only prompt from the window timer.
+        self.assertTrue(self.forward_timers[-1].cancelled)
+        self.forward_timers[-1].fire()
+        self.assertEqual(len(self.rest.submissions), 1)
+        # Ownership records the member (forwarder == comment sender).
+        entry = self.handler.prompt_ownership.entry_of(submission["prompt_id"])
+        assert entry is not None
+        self.assertEqual(entry.sender_open_id, MEMBER_OPEN_ID)
 
 
 # ---------------------------------------------------------------------------

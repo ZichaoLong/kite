@@ -154,10 +154,12 @@ class KapWsClientTests(unittest.TestCase):
         self.assertTrue(wait_until(lambda: self.state.hello_count >= 2, timeout=5.0))
 
     def test_error_frame_fires_callback(self) -> None:
+        session = self.state.create_session("s-1")
         errors = []
-        self._start_client(on_error_frame=errors.append)
-        self.assertTrue(wait_until(lambda: self.state.hello_count >= 1))
-        self.state.send_error_frame("s-1", "model.not_configured", "Model not set")
+        client = self._start_client(on_error_frame=errors.append)
+        client.subscribe("s-1")
+        self.assertTrue(wait_until(lambda: client.connected))
+        self.state.send_error_frame(session, "model.not_configured", "Model not set")
         self.assertTrue(wait_until(lambda: len(errors) >= 1))
         error = errors[0]
         self.assertEqual(error.code, "model.not_configured")
@@ -165,6 +167,111 @@ class KapWsClientTests(unittest.TestCase):
         self.assertEqual(error.session_id, "s-1")
         self.assertEqual(error.agent_id, "main")
         self.assertFalse(error.retryable)
+
+    def test_error_frame_advances_cursor_and_never_replays(self) -> None:
+        # Audit M6: the error frame is a durable event; the cursor must
+        # advance past it or a reconnect replays it and a healthy prompt
+        # could be misjudged failed.
+        session = self.state.create_session("s-1")
+        errors = []
+        client = self._start_client(on_error_frame=errors.append)
+        client.subscribe("s-1")
+        self.assertTrue(wait_until(lambda: client.connected))
+
+        self.state.send_error_frame(session, "provider.auth_error", "token expired")
+
+        self.assertTrue(wait_until(lambda: len(errors) == 1))
+        # The cursor moved past the durable error frame (seq 1).
+        self.assertTrue(
+            wait_until(lambda: self.cursors.get("s-1") == EventCursor(1, session.epoch))
+        )
+
+        # Reconnect: the journal still holds the error frame, but the
+        # resumed cursor is already past it — it must not fire again.
+        first_port = self.ws_server.port
+        self.ws_server.close()
+        self.ws_server = fake_kap.make_ws_server(self.state, port=first_port)
+        self.assertTrue(wait_until(lambda: self.state.hello_count >= 2, timeout=5.0))
+        self.assertTrue(
+            wait_until(lambda: self.cursors.get("s-1") == EventCursor(1, session.epoch))
+        )
+        time.sleep(0.3)
+        self.assertEqual(len(errors), 1)
+
+    def test_ack_cursor_never_rewinds_stored_cursor(self) -> None:
+        # Audit M4: the ack path gets the same monotonic guard as the
+        # snapshot-adopt path — same epoch keeps the higher seq, a new
+        # epoch is adopted.
+        client = KapWsClient(
+            host="127.0.0.1",
+            port=1,
+            token="t",
+            rest_client=self.rest,
+            cursor_store=self.cursors,
+        )
+        self.cursors.set("s-1", EventCursor(seq=111, epoch="e1"))
+
+        # A stale ack cursor (same epoch, lower seq) must not rewind.
+        client._handle_ack_payload({"cursors": {"s-1": {"seq": 110, "epoch": "e1"}}})
+        self.assertEqual(self.cursors.get("s-1"), EventCursor(seq=111, epoch="e1"))
+
+        # A newer ack cursor (same epoch, higher seq) is adopted.
+        client._handle_ack_payload({"cursors": {"s-1": {"seq": 120, "epoch": "e1"}}})
+        self.assertEqual(self.cursors.get("s-1"), EventCursor(seq=120, epoch="e1"))
+
+        # A cross-epoch ack cursor is adopted even at a lower seq.
+        client._handle_ack_payload({"cursors": {"s-1": {"seq": 3, "epoch": "e2"}}})
+        self.assertEqual(self.cursors.get("s-1"), EventCursor(seq=3, epoch="e2"))
+
+    def test_cold_session_resubscribe_guard_blocks_tight_loop(self) -> None:
+        # Audit M7: the ack-listed resync for a cold session carries no
+        # cursor (no server-side subscription); the post-rebuild re-subscribe
+        # fires at most once per connection per session.
+        session = self.state.create_session("s-1")
+        session.warmable = False  # the warmup race is always lost
+        self.state.append_event(session, "session.meta.updated", {})
+        self.cursors.set("s-1", EventCursor(seq=0, epoch=session.epoch))
+
+        client = self._start_client()
+        client.subscribe("s-1")
+
+        self.assertTrue(wait_until(lambda: len(self.resyncs) >= 1))
+        subscribes = list(self.state.log).count("ws:subscribe")
+
+        # The rebuild's re-subscribe attempt fires exactly once...
+        self.assertTrue(client.resubscribe_after_rebuild("s-1"))
+        self.assertTrue(wait_until(lambda: list(self.state.log).count("ws:subscribe") == subscribes + 1))
+        # ...and the guard blocks the loop even though the session stayed
+        # cold (its ack listed resync again).
+        self.assertTrue(wait_until(lambda: len(self.resyncs) >= 2))
+        self.assertFalse(client.resubscribe_after_rebuild("s-1"))
+        time.sleep(0.2)
+        self.assertEqual(list(self.state.log).count("ws:subscribe"), subscribes + 1)
+
+    def test_resubscribe_after_rebuild_lands_subscription(self) -> None:
+        # Audit M7 happy path: the rebuild warmed the session, so the
+        # re-subscribe lands and live events flow without a reconnect.
+        session = self.state.create_session("s-1")
+        session.warmable = False
+        self.cursors.set("s-1", EventCursor(seq=0, epoch=session.epoch))
+
+        client = self._start_client()
+        client.subscribe("s-1")
+
+        self.assertTrue(wait_until(lambda: len(self.resyncs) >= 1))
+        self.state.append_event(session, "turn.started", {"turnId": 1})
+        time.sleep(0.2)
+        self.assertEqual(self.events, [])  # no server-side subscription yet
+
+        # The snapshot rebuild's REST touch activates the session...
+        session.warmable = True
+        self.assertTrue(client.resubscribe_after_rebuild("s-1"))
+
+        # ...and the live stream now flows on the same connection.
+        self.state.append_event(session, "turn.started", {"turnId": 2})
+        self.assertTrue(wait_until(lambda: any(e.type == "turn.started" for e in self.events)))
+        # The subscription landed: no further re-subscribe attempt fires.
+        self.assertFalse(client.resubscribe_after_rebuild("s-1"))
 
     def test_server_restart_resubscribes_with_cursor_and_replays(self) -> None:
         session = self.state.create_session("s-1")

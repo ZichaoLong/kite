@@ -38,13 +38,16 @@ Implements the MVP inbound contract (docs/contracts/mvp-scope.md):
   all-mode group already occupies is denied the same way. Group
   activation config lives in the GroupConfigStore (state axis 5);
 - merge_forward bundles: each merge_forward message's children are fetched
-  and buffered per (sender, chat) by the ForwardAggregator; a short window
-  later the expanded `<forwarded_messages>` transcript enters the normal
-  prompt path (admin-gated like any p2p text). Group forwards dispatch per
+  and buffered per (sender, chat) by the ForwardAggregator; the stashed
+  transcript waits out a short window for the sender's next plain text,
+  which claims it so transcript + comment merge into ONE prompt (FOCUS
+  stash-claim semantics, audit M12); an unclaimed window flushes the
+  expanded `<forwarded_messages>` transcript into the normal prompt path on
+  its own (admin-gated like any p2p text). Group forwards dispatch per
   mode at ingress (group-chat §3.7): mention_only drops them silently (a
   forward never carries an @mention), assistant appends the flattened
   transcript to the group log as context material (never a trigger), and
-  all aggregates them through the same window into a plain prompt;
+  all buffers them through the same stash-claim window into a plain prompt;
 - the MVP slash commands (/new /sessions /switch /detach /attach /mode
   /plan /group /group-mode /status /abort /help /init); in-flight-work-sensitive commands run
   the reason-coded preflights in kite/preflights.py (/new denies with an
@@ -135,6 +138,7 @@ from kite.stores.binding_store import (
     StoredBinding,
 )
 from kite.stores.group_config_store import (
+    DEFAULT_GROUP_MODE,
     GROUP_MODE_ALL,
     GROUP_MODE_ASSISTANT,
     GROUP_MODE_MENTION_ONLY,
@@ -195,6 +199,27 @@ _GROUP_HISTORY_FETCH_FAILED_TEXT = (
     "请稍后重试；若持续失败请联系管理员排查。"
 )
 _GROUP_ASSISTANT_NOT_WIRED_TEXT = "群聊 assistant 模式未正确配置，消息未提交。请联系管理员排查。"
+
+
+def _group_activation_reply(mode: str) -> str:
+    """The /group activate confirmation, worded per effective mode (audit
+    M10): `all` mode does not require an @mention, so the mention_only
+    wording would lie."""
+    if mode == GROUP_MODE_ALL:
+        return (
+            "已激活当前群聊（模式：all）。群成员直接发送文字即可提交 prompt（无需 @我）；"
+            "审批与问题仅发起者或管理员可处理。发送 /group deactivate 停用。"
+        )
+    if mode == GROUP_MODE_ASSISTANT:
+        return (
+            "已激活当前群聊（模式：assistant）。群成员的文字消息会记录到群聊日志，"
+            "@我 并发送文字时会携带群聊上下文提交 prompt；"
+            "审批与问题仅发起者或管理员可处理。发送 /group deactivate 停用。"
+        )
+    return (
+        f"已激活当前群聊（模式：{mode}）。群成员 @我 并发送文字即可提交 prompt；"
+        "审批与问题仅发起者或管理员可处理。发送 /group deactivate 停用。"
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1003,9 +1028,27 @@ class AppHandler(TransportHandler):
         comes from the raw message). Returns the SubmitPromptResult on a
         successful submit, None on every failure path — the assistant-mode
         trigger uses this to advance the boundary only after a real submit.
+
+        FOCUS stash-claim (audit M12): when the sender has a buffered
+        merge_forward transcript in this chat, the next plain text claims it
+        and the two merge into ONE prompt (``<forwarded_messages>`` +
+        comment) — the instruction never runs ahead of the content it refers
+        to. The claim is keyed on (sender, chat), so it never leaks across
+        users or chats, and it never fires for the aggregator's own flush
+        message or for submit_text overrides.
         """
         chat_id = message.chat_id
         text = message.text.strip()
+        if submit_text is None and message.msg_type != "merge_forward":
+            stashed = self._forward_aggregator.claim(message.sender_open_id, chat_id)
+            if stashed is not None:
+                text = f"{stashed.text}\n\n{text}" if text else stashed.text
+                logger.info(
+                    "forward stash claimed by next text: chat=%s sender=%s forward_msg=%s",
+                    chat_id,
+                    message.sender_open_id,
+                    stashed.message_id,
+                )
         prompt_text = (
             submit_text.strip() if submit_text is not None else text
         )
@@ -1614,6 +1657,36 @@ class AppHandler(TransportHandler):
         if binding["attached"]:
             self._reply_to(message, "当前会话已在接收推送。")
             return
+        # All-mode exclusivity (group-chat §2/§3.8, fail-closed §4.6):
+        # re-attaching must not silently recreate a shared session — a
+        # detached chat does not count as sharing, so /detach + another
+        # chat's /switch could have made this session shared or occupied
+        # while this chat was away (audit M10).
+        exclusive = preflights.all_mode_session_exclusive(
+            message.chat_id, self._binding_store, self._group_config_store
+        )
+        if not exclusive.allowed:
+            logger.info(
+                "/attach denied chat_id=%s reason_code=%s",
+                message.chat_id,
+                exclusive.reason_code,
+            )
+            self._reply_to(message, exclusive.reason_text)
+            return
+        occupied = preflights.all_mode_session_occupied(
+            message.chat_id,
+            self._binding_store,
+            self._group_config_store,
+            session_id=binding["session_id"],
+        )
+        if not occupied.allowed:
+            logger.info(
+                "/attach denied chat_id=%s reason_code=%s",
+                message.chat_id,
+                occupied.reason_code,
+            )
+            self._reply_to(message, occupied.reason_text)
+            return
         binding["attached"] = True
         self._binding_store.save(message.chat_id, binding)
         self._reply_to(message, "已恢复当前会话的飞书推送。")
@@ -1692,6 +1765,45 @@ class AppHandler(TransportHandler):
             if self._binding_store.load(message.chat_id) is None:
                 if self._create_and_bind(message.chat_id, "群聊会话") is None:
                     return
+            # All-mode exclusivity (fail-closed §4.6, audit M10): a
+            # re-activate keeps the stored mode, so when the effective mode
+            # is `all` the session must pass the same probes as
+            # /group-mode all BEFORE the activation flips — another chat may
+            # have bound the session while this group was deactivated.
+            existing = self._group_config_store.load(message.chat_id)
+            effective_mode = (
+                existing["mode"] if existing is not None else DEFAULT_GROUP_MODE
+            )
+            if effective_mode == GROUP_MODE_ALL:
+                exclusive = preflights.all_mode_session_exclusive(
+                    message.chat_id,
+                    self._binding_store,
+                    self._group_config_store,
+                    current_chat_mode=GROUP_MODE_ALL,
+                )
+                if not exclusive.allowed:
+                    logger.info(
+                        "/group activate denied chat_id=%s reason_code=%s",
+                        message.chat_id,
+                        exclusive.reason_code,
+                    )
+                    self._reply_to(message, exclusive.reason_text)
+                    return
+                binding = self._binding_store.load(message.chat_id)
+                occupied = preflights.all_mode_session_occupied(
+                    message.chat_id,
+                    self._binding_store,
+                    self._group_config_store,
+                    session_id=binding["session_id"] if binding else "",
+                )
+                if not occupied.allowed:
+                    logger.info(
+                        "/group activate denied chat_id=%s reason_code=%s",
+                        message.chat_id,
+                        occupied.reason_code,
+                    )
+                    self._reply_to(message, occupied.reason_text)
+                    return
             config = self._group_config_store.activate(
                 message.chat_id, activated_by=message.sender_open_id
             )
@@ -1701,11 +1813,7 @@ class AppHandler(TransportHandler):
                 config["activated_by"],
                 config["mode"],
             )
-            self._reply_to(
-                message,
-                f"已激活当前群聊（模式：{config['mode']}）。群成员 @我 并发送文字即可提交 prompt；"
-                "审批与问题仅发起者或管理员可处理。发送 /group deactivate 停用。",
-            )
+            self._reply_to(message, _group_activation_reply(config["mode"]))
             return
         if subcommand == "deactivate":
             self._group_config_store.deactivate(message.chat_id)
@@ -1993,6 +2101,25 @@ class AppHandler(TransportHandler):
             self._binding_store.save(chat_id, current)
             return True, "当前已绑定该会话，推送已恢复。"
         old_session_id = current["session_id"] if current else ""
+        if current is not None:
+            # Preflight (fail-closed, mvp-scope aligned item 11): same
+            # denial as /new — while the bound session has an active prompt,
+            # rebinding would strand its execution card, terminal result and
+            # approval routing. Unverifiable queue state also refuses.
+            try:
+                queue = self._ops.get_prompts(current["session_id"])
+            except KapTransportError:
+                return False, _KAP_UNREACHABLE_TEXT
+            except KapError as exc:
+                return False, f"查询会话状态失败：{exc.msg}"
+            check = preflights.check_new(queue)
+            if not check.allowed:
+                logger.info(
+                    "session switch denied chat_id=%s reason_code=%s",
+                    chat_id,
+                    check.reason_code,
+                )
+                return False, check.reason_text
         try:
             info = self._ops.get_session(session_id)
         except KapTransportError:

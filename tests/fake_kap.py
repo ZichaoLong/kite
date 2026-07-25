@@ -56,6 +56,11 @@ class FakeSession:
         # Cold-session nuance: subscribe with a cursor before any resume-backed
         # REST touch yields an unexplained resync_required.
         self.warm = False
+        # When False, the resume-backed REST touch cannot warm the session
+        # (models the upstream warmup race / deleted-session window, audit
+        # M7): subscribe keeps answering resync_required without a cursor
+        # and establishes no server-side subscription.
+        self.warmable = True
 
 
 class FakeKapState:
@@ -179,26 +184,21 @@ class FakeKapState:
                 "created_at": "2026-01-01T00:00:00Z",
             })
 
-    def send_error_frame(self, session_id: str, code: str, message: str) -> None:
-        """Broadcast a WS ``error`` frame (not a durable event; no seq)."""
-        frame = {
-            "type": "error",
-            "timestamp": "2026-01-01T00:00:00Z",
-            "payload": {
+    def send_error_frame(self, session: FakeSession, code: str, message: str) -> None:
+        """Broadcast a WS ``error`` frame in its real durable shape (audit
+        T3): journaled with seq/epoch/session_id like any durable event and
+        fanned out to the session's subscribers."""
+        self.append_event(
+            session,
+            "error",
+            {
                 "code": code,
                 "message": message,
                 "retryable": False,
                 "agentId": "main",
-                "sessionId": session_id,
+                "sessionId": session.id,
             },
-        }
-        with self.lock:
-            subscribers = list(self._subscribers.values())
-        for connection, _session_ids in subscribers:
-            try:
-                connection.send(json.dumps(frame))
-            except Exception:  # noqa: BLE001 - dead subscribers drop lazily
-                pass
+        )
 
 
 def _session_wire(session: FakeSession) -> dict[str, Any]:
@@ -301,7 +301,7 @@ class FakeKapRestHandler(BaseHTTPRequestHandler):
             if session is None:
                 self._send(_envelope(40401, None, "session not found"))
                 return
-            session.warm = True  # resume-backed route: activates cold sessions
+            session.warm = session.warmable  # resume-backed route: activates cold sessions
             self._send(_envelope(0, {
                 "active": _prompt_wire(session.active_prompt, "running")
                 if session.active_prompt else None,
@@ -453,15 +453,18 @@ def _handle_subscribe(
         if session is None:
             (resync_required if hello else not_found).append(sid)
             continue
-        accepted.append(sid)
         cursor = cursors.get(sid) if isinstance(cursors, dict) else None
         if cursor is None:
+            accepted.append(sid)
             ack_cursors[sid] = {"seq": session.seq, "epoch": session.epoch}
             continue
         if not session.warm:
-            # Cold-session nuance: unexplained resync, no reason frame, no cursor.
+            # Cold-session nuance: unexplained resync, no reason frame, no
+            # cursor — and NO server-side subscription is established
+            # (mirrors upstream wsConnectionV1; audit M7).
             resync_required.append(sid)
             continue
+        accepted.append(sid)
         seq = cursor.get("seq")
         epoch = cursor.get("epoch")
         reason = None

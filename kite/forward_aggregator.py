@@ -9,10 +9,15 @@ trigger), and all-mode groups buffer here exactly like p2p. The shared core:
 - Feishu delivers one forwarded bundle as N separate merge_forward messages;
   ``buffer()`` keeps them per (sender, chat) and (re)arms a short aggregation
   window, so the whole bundle dispatches as one callback;
-- on flush the buffered merge_forward trees are expanded recursively (item
-  and depth caps, per-item error isolation so one bad child never kills the
-  batch) into a single ``<forwarded_messages>`` transcript with resolved
-  sender display names and timestamps;
+- FOCUS's stash-claim semantics (feishu_bot.py:1930-1943, restored after
+  audit M12): the buffered transcript waits out the window for the sender's
+  next plain text, which claims it via ``claim()`` so transcript + comment
+  merge into ONE prompt; only an unclaimed window flushes (``_flush``) and
+  submits the transcript alone;
+- on flush/claim the buffered merge_forward trees are expanded recursively
+  (item and depth caps, per-item error isolation so one bad child never
+  kills the batch) into a single ``<forwarded_messages>`` transcript with
+  resolved sender display names and timestamps;
 - timer discipline: re-buffering cancels the pending timer, and ``close()``
   (kited shutdown) cancels everything and fails closed.
 
@@ -176,6 +181,28 @@ class ForwardAggregator:
         )
 
     # ------------------------------------------------------------------
+    # Claim (RuntimeLoop thread): the next plain text takes the stash
+    # ------------------------------------------------------------------
+
+    def claim(self, sender_open_id: str, chat_id: str) -> Optional[MergedForwardBatch]:
+        """Pop the pending window for (sender, chat) and render it as a batch.
+
+        FOCUS's stash-claim semantics (feishu_bot.py:1930-1943): a buffered
+        transcript waits ~2s for the sender's next plain text, which claims
+        it so the two merge into ONE prompt (``<forwarded_messages>`` +
+        comment) — the instruction never runs ahead of the content it refers
+        to. Returns None when nothing is buffered (or nothing renderable).
+        """
+        key = (sender_open_id, chat_id)
+        with self._lock:
+            pending = self._pending.pop(key, None)
+        if pending is None:
+            return None
+        if pending.timer is not None:
+            pending.timer.cancel()
+        return self._render_batch(sender_open_id, chat_id, pending)
+
+    # ------------------------------------------------------------------
     # Flush (timer thread)
     # ------------------------------------------------------------------
 
@@ -186,36 +213,9 @@ class ForwardAggregator:
                 pending = self._pending.pop(key, None)
             if pending is None:
                 return
-            parts: list[str] = []
-            for bundle in pending.bundles:
-                try:
-                    rendered = self._render_bundle(bundle.message_id, bundle.items)
-                except Exception:  # noqa: BLE001 - per-bundle isolation
-                    logger.warning(
-                        "merge_forward bundle expansion failed: message_id=%s",
-                        bundle.message_id,
-                        exc_info=True,
-                    )
-                    continue
-                if rendered:
-                    parts.append(rendered)
-            if not parts:
-                logger.info(
-                    "merge_forward expansion produced no renderable content: sender=%s chat=%s",
-                    sender_open_id,
-                    chat_id,
-                )
-                return
-            text = f"{_FORWARDED_OPEN}\n" + "\n".join(parts) + f"\n{_FORWARDED_CLOSE}"
-            self._on_batch(
-                MergedForwardBatch(
-                    chat_id=chat_id,
-                    sender_open_id=sender_open_id,
-                    message_id=pending.bundles[-1].message_id,
-                    text=text,
-                    chat_type=pending.chat_type,
-                )
-            )
+            batch = self._render_batch(sender_open_id, chat_id, pending)
+            if batch is not None:
+                self._on_batch(batch)
         except Exception:  # noqa: BLE001 - a timer thread must never die noisy
             logger.error(
                 "merge_forward flush failed: sender=%s chat=%s",
@@ -223,6 +223,41 @@ class ForwardAggregator:
                 chat_id,
                 exc_info=True,
             )
+
+    def _render_batch(
+        self, sender_open_id: str, chat_id: str, pending: _PendingForward
+    ) -> Optional[MergedForwardBatch]:
+        """Render the buffered bundles into one transcript batch; None when
+        nothing is renderable (the content is dropped with a log line, same
+        fail-closed discipline as before)."""
+        parts: list[str] = []
+        for bundle in pending.bundles:
+            try:
+                rendered = self._render_bundle(bundle.message_id, bundle.items)
+            except Exception:  # noqa: BLE001 - per-bundle isolation
+                logger.warning(
+                    "merge_forward bundle expansion failed: message_id=%s",
+                    bundle.message_id,
+                    exc_info=True,
+                )
+                continue
+            if rendered:
+                parts.append(rendered)
+        if not parts:
+            logger.info(
+                "merge_forward expansion produced no renderable content: sender=%s chat=%s",
+                sender_open_id,
+                chat_id,
+            )
+            return None
+        text = f"{_FORWARDED_OPEN}\n" + "\n".join(parts) + f"\n{_FORWARDED_CLOSE}"
+        return MergedForwardBatch(
+            chat_id=chat_id,
+            sender_open_id=sender_open_id,
+            message_id=pending.bundles[-1].message_id,
+            text=text,
+            chat_type=pending.chat_type,
+        )
 
     # ------------------------------------------------------------------
     # Shutdown

@@ -168,6 +168,55 @@ class AggregationWindowTests(AggregatorTestCase):
         self.assertEqual(self.batches, [])
 
 
+class ClaimTests(AggregatorTestCase):
+    """FOCUS stash-claim semantics (audit M12): the next plain text from the
+    same (sender, chat) claims the buffered transcript within the window."""
+
+    def test_claim_renders_stash_and_cancels_timer(self) -> None:
+        self.buffer("om-1", [make_item("om-c1", text="转发的内容", sender_id="ou_alice")])
+
+        batch = self.aggregator.claim("ou_admin", "oc_chat")
+
+        self.assertIsNotNone(batch)
+        assert batch is not None
+        self.assertIn("<forwarded_messages>", batch.text)
+        self.assertIn("Alice:", batch.text)
+        self.assertIn("转发的内容", batch.text)
+        self.assertEqual(batch.message_id, "om-1")
+        self.assertTrue(self.timers[-1].cancelled)
+        # The stash is gone: a second claim and the (cancelled) timer's late
+        # fire both find nothing.
+        self.assertIsNone(self.aggregator.claim("ou_admin", "oc_chat"))
+        self.timers[-1].fire()
+        self.assertEqual(self.batches, [])
+
+    def test_claim_merges_every_buffered_bundle(self) -> None:
+        self.buffer("om-1", [make_item("om-c1", text="第一段")])
+        self.buffer("om-2", [make_item("om-c2", text="第二段")])
+
+        batch = self.aggregator.claim("ou_admin", "oc_chat")
+
+        self.assertIsNotNone(batch)
+        assert batch is not None
+        self.assertLess(batch.text.index("第一段"), batch.text.index("第二段"))
+        self.assertEqual(batch.message_id, "om-2")
+
+    def test_claim_is_keyed_per_sender_and_chat(self) -> None:
+        self.buffer("om-1", sender="ou_a", chat_id="oc_1")
+
+        self.assertIsNone(self.aggregator.claim("ou_b", "oc_1"))
+        self.assertIsNone(self.aggregator.claim("ou_a", "oc_2"))
+        # The stash survives a foreign claim and still flushes on the timer.
+        self.timers[-1].fire()
+        self.assertEqual(len(self.batches), 1)
+
+    def test_claim_without_renderable_content_returns_none(self) -> None:
+        self.buffer("om-1", [make_item("om-1")])
+
+        self.assertIsNone(self.aggregator.claim("ou_admin", "oc_chat"))
+        self.assertTrue(self.timers[-1].cancelled)
+
+
 class ExpansionTests(AggregatorTestCase):
     def test_transcript_renders_senders_timestamps_and_text(self) -> None:
         items = [

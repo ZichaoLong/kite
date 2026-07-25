@@ -151,3 +151,7 @@ explicitly; "best-effort" silent degradation is forbidden:
     stale pending approvals/questions upstream (dry-run without `--yes`);
     these are upstream kap resources, so it talks to kap REST directly
     (2026-07-24).
+11. `/switch` (including the `/sessions` card button) is denied while the
+    currently bound session has an active prompt — same reasoning as `/new`
+    (aligned item 7): the in-flight execution card, terminal result and
+    approval routing would lose visibility (2026-07-25).

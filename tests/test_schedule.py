@@ -659,13 +659,14 @@ class LaunchdPlistRenderingTests(unittest.TestCase):
         ):
             return plistlib.loads(schedule_units.render_launchd_plist(spec))
 
-    def test_one_shot_renders_full_date(self) -> None:
-        payload = self._render(_planned_spec(_at_plan()))
-        self.assertEqual(
-            payload["StartCalendarInterval"],
-            {"Year": 2026, "Month": 8, "Day": 1, "Hour": 10, "Minute": 30},
-        )
-        self.assertIs(payload["RunAtLoad"], False)
+    def test_one_shot_at_is_rejected_fail_closed(self) -> None:
+        # Audit M13: launchd StartCalendarInterval has no Year key — a
+        # one-shot --at cannot be expressed faithfully (it silently degraded
+        # to a yearly repeat), so the backend refuses it (fail-closed).
+        with self.assertRaisesRegex(ScheduleError, "one-shot"):
+            self._render(_planned_spec(_at_plan()))
+        with self.assertRaisesRegex(ScheduleError, "one-shot"):
+            schedule_units.launchd_start_calendar_interval(_at_plan())
 
     def test_recurring_cron_field_mapping(self) -> None:
         cases = {
@@ -706,7 +707,11 @@ class LaunchdPlistRenderingTests(unittest.TestCase):
                 )
 
     def test_program_arguments_carry_verbatim_text(self) -> None:
-        spec = _planned_spec(_at_plan(), text='say "hi" there', display="announce")
+        spec = _planned_spec(
+            schedule_units.parse_cron_schedule("30 8 * * *"),
+            text='say "hi" there',
+            display="announce",
+        )
         payload = self._render(spec)
         # A plist array needs no shell quoting layer; the text rides verbatim.
         self.assertEqual(

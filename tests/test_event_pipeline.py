@@ -288,10 +288,15 @@ class ManualTimerFactory:
 class FakeWsClient:
     def __init__(self) -> None:
         self.subscriptions: list[str] = []
+        self.rebuild_resubscribes: list[str] = []
 
     def subscribe(self, session_id: str):
         self.subscriptions.append(session_id)
         return {}
+
+    def resubscribe_after_rebuild(self, session_id: str) -> bool:
+        self.rebuild_resubscribes.append(session_id)
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -826,6 +831,11 @@ class ApprovalTests(PipelineTestCase):
         self.assertIn("已过期", rendered)
         self.assertNotIn("批准", rendered)
         self.assertEqual(self.timers.live, [])
+        # Fail-closed to the end (audit M2): resolved upstream as rejected.
+        self.assertEqual(
+            self.rest.approval_resolutions,
+            [{"session_id": SESSION_ID, "approval_id": "a-1", "body": {"decision": "rejected"}}],
+        )
 
     def test_unknown_ownership_expires_to_all_attached_chats(self) -> None:
         self._start_and_request_approval(certainty="unknown")
@@ -834,6 +844,33 @@ class ApprovalTests(PipelineTestCase):
             card = self.transport.cards_to(chat_id)[-1]["content"]
             self.assertIn("已过期", json.dumps(card, ensure_ascii=False))
         self.assertEqual(self.timers.live, [])
+        self.assertEqual(
+            self.rest.approval_resolutions,
+            [{"session_id": SESSION_ID, "approval_id": "a-1", "body": {"decision": "rejected"}}],
+        )
+
+    def test_unattributable_approval_resolves_upstream_once(self) -> None:
+        # No active prompt and no turn mapping: the approval cannot be
+        # attributed. Fail-closed (audit M2): expired card + upstream reject,
+        # and a replayed requested event closes nothing twice.
+        self.bind(CHAT_ID)
+        self.rest.set_prompts(SESSION_ID, active=None)
+
+        self.feed(approval_requested())
+
+        cards_sent = self.transport.cards_to(CHAT_ID)
+        self.assertEqual(len(cards_sent), 1)
+        self.assertIn("已过期", json.dumps(cards_sent[0]["content"], ensure_ascii=False))
+        self.assertEqual(
+            self.rest.approval_resolutions,
+            [{"session_id": SESSION_ID, "approval_id": "a-1", "body": {"decision": "rejected"}}],
+        )
+        self.assertEqual(self.timers.live, [])
+
+        self.feed(approval_requested())
+
+        self.assertEqual(len(self.transport.cards_to(CHAT_ID)), 1)
+        self.assertEqual(len(self.rest.approval_resolutions), 1)
 
     def test_external_resolution_freezes_card_and_cancels_timer(self) -> None:
         self._start_and_request_approval()
@@ -974,6 +1011,90 @@ class ApprovalTests(PipelineTestCase):
             )
         )
         self.assertEqual(len(self.transport.patches_to(card_message_id)), patches_before)
+
+    # -- reject-with-feedback state dies with its approval (audit M3) -------
+
+    def _plant_feedback(self) -> None:
+        self._start_and_request_approval()
+        response = self.handler.on_card_action(
+            make_card_action(
+                {
+                    "action": cards.ACTION_APPROVAL_REJECT_WITH_FEEDBACK,
+                    "approval_id": "a-1",
+                    "prompt_id": "p-1",
+                }
+            )
+        )
+        self.assertIn("反馈", response.toast or "")
+
+    def _assert_next_text_is_a_prompt(self) -> None:
+        """The audit M3 scenario: once the approval is closed by ANY path,
+        the user's next plain text must reach the prompt path — never be
+        swallowed as stale feedback."""
+        self.handler.on_message(make_message("现在做点别的", sender=ADMIN_OPEN_ID))
+        self.assertEqual(len(self.rest.submissions), 1)
+        self.assertNotIn(
+            cards.APPROVAL_ALREADY_PROCESSED_NOTICE, self.transport.texts_to(CHAT_ID)
+        )
+
+    def test_feedback_cleared_when_approval_closed_by_another_actor(self) -> None:
+        self._plant_feedback()
+
+        # Another admin approves the still-live approval: it closes, and the
+        # planted feedback entry must die with it.
+        self.handler.on_card_action(
+            make_card_action(
+                {
+                    "action": cards.ACTION_APPROVAL_RESOLVE,
+                    "decision": cards.APPROVAL_DECISION_APPROVED,
+                    "approval_id": "a-1",
+                    "prompt_id": "p-1",
+                },
+                operator=OTHER_OPEN_ID,
+            )
+        )
+
+        self._assert_next_text_is_a_prompt()
+
+    def test_feedback_cleared_on_timeout(self) -> None:
+        self._plant_feedback()
+
+        self.timers.fire(0)
+        self.flush()
+
+        self._assert_next_text_is_a_prompt()
+
+    def test_feedback_cleared_on_external_resolution(self) -> None:
+        self._plant_feedback()
+
+        self.feed(
+            kap_event(
+                "event.approval.resolved",
+                {"approval_id": "a-1", "decision": "approved", "resolved_at": "2026-01-01T00:00:00Z"},
+            )
+        )
+
+        self._assert_next_text_is_a_prompt()
+
+    def test_feedback_cleared_on_rebuild(self) -> None:
+        self._plant_feedback()
+        # The approval is gone upstream (resolved elsewhere while the event
+        # stream was broken): the rebuild freezes the card and drops the
+        # planted feedback entry.
+        self.rest.snapshots[SESSION_ID] = make_snapshot(
+            current_prompt_id="p-1",
+            in_flight=True,
+            turn_id=1,
+        )
+
+        self.pipeline.handle_resync_required(
+            __import__("kite.adapters.kap_server", fromlist=["ResyncRequest"]).ResyncRequest(
+                session_id=SESSION_ID, reason="buffer_overflow", current_seq=None, epoch=None
+            )
+        )
+        self.flush()
+
+        self._assert_next_text_is_a_prompt()
 
 
 # ---------------------------------------------------------------------------
@@ -1304,6 +1425,89 @@ class QuestionTests(PipelineTestCase):
         self.assertEqual(len(texts), 1)
         self.assertIn("已过期", texts[0])
         self.assertEqual(self.timers.live, [])
+        # Fail-closed to the end (audit M2): dismissed upstream too.
+        self.assertEqual(self.rest.dismissals, [(SESSION_ID, "q-1")])
+
+    def test_unattributable_question_dismisses_upstream_once(self) -> None:
+        # No active prompt and no turn mapping: expired notice + upstream
+        # dismiss (audit M2); a replayed requested event is a no-op.
+        self.bind(CHAT_ID)
+        self.rest.set_prompts(SESSION_ID, active=None)
+
+        self.feed(question_requested())
+
+        texts = self.transport.texts_to(CHAT_ID)
+        self.assertEqual(len(texts), 1)
+        self.assertIn("已过期", texts[0])
+        self.assertEqual(self.rest.dismissals, [(SESSION_ID, "q-1")])
+        self.assertEqual(self.timers.live, [])
+
+        self.feed(question_requested())
+
+        self.assertEqual(len(self.transport.texts_to(CHAT_ID)), 1)
+        self.assertEqual(len(self.rest.dismissals), 1)
+
+    def test_timeout_race_with_click_keeps_entry_for_answered_event(self) -> None:
+        # Audit M1(b): the click resolved the question but the answered
+        # event lags; a timer fire already queued on the loop must NOT pop
+        # the entry — the answered event needs it to freeze the other item
+        # cards.
+        self.bind(CHAT_ID)
+        self.start_prompt()
+        self.ownership.record("p-1", CHAT_ID)
+        self.feed(
+            question_requested(
+                questions=[
+                    {
+                        "id": "q_0",
+                        "question": "部署到哪个环境？",
+                        "header": "环境",
+                        "options": [{"id": "opt_0_0", "label": "开发"}],
+                    },
+                    {
+                        "id": "q_1",
+                        "question": "是否备份？",
+                        "header": "备份",
+                        "options": [{"id": "opt_1_0", "label": "是"}],
+                    },
+                ]
+            )
+        )
+        cards_sent = self.transport.cards_to(CHAT_ID)
+        self.assertEqual(len(cards_sent), 3)  # execution card + one card per item
+        other_card_id = cards_sent[-1]["message_id"]
+
+        self._question_click(item_index=0, label="开发")
+        # The queued timer fire lands after the click (the race).
+        self.loop.call(self.pipeline._question_timed_out, "q-1")
+
+        # The entry survived: no dismiss was attempted and the answered
+        # event still freezes the second item's card.
+        self.assertEqual(self.rest.dismissals, [])
+        self.feed(
+            kap_event("event.question.answered", {"question_id": "q-1", "answers": {}, "resolved_at": "2026-01-01T00:00:00Z"})
+        )
+        patches = self.transport.patches_to(other_card_id)
+        self.assertEqual(len(patches), 1)
+        self.assertIn("已在其他客户端回答", json.dumps(patches[0], ensure_ascii=False))
+
+    def test_timeout_dismiss_transient_error_keeps_entry(self) -> None:
+        # Audit M1(a): a transient business error on the timeout dismiss
+        # re-adds the entry (approval-path symmetry) — the card stays
+        # actionable instead of dying as "已失效或已处理".
+        self._start_and_request_question()
+        self.rest.dismiss_error = KapError(40909 - 1, "upstream hiccup")
+
+        self.timers.fire(0)
+        self.flush()
+
+        pending = self.loop.call(lambda: self.pipeline._questions.get("q-1"))
+        self.assertIsNotNone(pending)
+        # The user can still answer from the card afterwards.
+        self.rest.dismiss_error = None
+        response = self._question_click()
+        self.assertEqual(response.toast, "已回答。")
+        self.assertEqual(len(self.rest.question_answers), 1)
 
 
 # ---------------------------------------------------------------------------
@@ -1415,7 +1619,48 @@ class RebuildTests(PipelineTestCase):
         self.assertIn("已过期", expired)
         self.assertIn("KITE 重启后无法确认该审批的发起者", expired)
         self.assertEqual(self.timers.live, [])
-        self.assertEqual(self.rest.approval_resolutions, [])
+        # Fail-closed to the end (audit M2): the approval is also resolved
+        # upstream as rejected, or the turn would block forever.
+        self.assertEqual(
+            self.rest.approval_resolutions,
+            [{"session_id": SESSION_ID, "approval_id": "a-old", "body": {"decision": "rejected"}}],
+        )
+
+    def test_unroutable_approval_is_closed_once_across_rebuilds(self) -> None:
+        # The recorded close-out (audit M2) means a second rebuild of the
+        # same still-unroutable approval neither re-cards nor re-resolves.
+        self.bind(CHAT_ID)
+        self.ownership.record_best_effort("p-9", CHAT_ID)
+        self.rest.set_prompts(SESSION_ID, active="p-9")
+        self.rest.snapshots[SESSION_ID] = make_snapshot(
+            current_prompt_id="p-9",
+            in_flight=True,
+            turn_id=7,
+            pending_interaction="approval",
+            pending_approvals=(
+                ApprovalRequestView(
+                    approval_id="a-old",
+                    turn_id=7,
+                    tool_call_id="tc-1",
+                    tool_name="Bash",
+                    action="execute",
+                    detail="rm -rf /",
+                ),
+            ),
+        )
+
+        self.pipeline.startup_recovery([SESSION_ID])
+        self.flush()
+        self.pipeline.startup_recovery([SESSION_ID])
+        self.flush()
+
+        expired_cards = [
+            item
+            for item in self.transport.cards_to(CHAT_ID)
+            if "已过期" in json.dumps(item["content"], ensure_ascii=False)
+        ]
+        self.assertEqual(len(expired_cards), 1)
+        self.assertEqual(len(self.rest.approval_resolutions), 1)
 
     def test_rebuild_routes_tracked_approval_when_ownership_certain(self) -> None:
         # Runtime resync (no restart): the prompt was submitted by this
@@ -1509,10 +1754,46 @@ class WiringTests(PipelineTestCase):
     def test_ws_hook_defers_when_no_client_and_subscribes_when_set(self) -> None:
         hook = WsSubscriptionHook()
         hook("s-1")  # no client yet: logged, not raised
+        hook.resubscribe_after_rebuild("s-1")  # likewise deferred silently
         ws = FakeWsClient()
         hook.set_client(ws)
         hook("s-1")
         self.assertEqual(ws.subscriptions, ["s-1"])
+        hook.resubscribe_after_rebuild("s-1")
+        self.assertEqual(ws.rebuild_resubscribes, ["s-1"])
+
+    def test_successful_rebuild_fires_snapshot_hook_for_resubscribe(self) -> None:
+        # M7 wiring: kited's snapshot-rebuilt hook is what re-subscribes a
+        # session whose ack-listed resync established no server-side
+        # subscription — the hook must fire on a successful rebuild (and
+        # only then).
+        hook = WsSubscriptionHook()
+        ws = FakeWsClient()
+        hook.set_client(ws)
+        self.pipeline.set_snapshot_rebuilt_hook(
+            lambda session_id, _snapshot: hook.resubscribe_after_rebuild(session_id)
+        )
+        self.bind(CHAT_ID)
+        self.rest.snapshots[SESSION_ID] = make_snapshot(as_of_seq=42)
+
+        self.pipeline.handle_resync_required(
+            __import__("kite.adapters.kap_server", fromlist=["ResyncRequest"]).ResyncRequest(
+                session_id=SESSION_ID, reason=None, current_seq=None, epoch=None
+            )
+        )
+        self.flush()
+
+        self.assertEqual(ws.rebuild_resubscribes, [SESSION_ID])
+
+        # A failed rebuild freezes instead and must NOT re-subscribe.
+        self.rest.snapshots[SESSION_ID] = KapTransportError("connection refused")
+        self.pipeline.handle_resync_required(
+            __import__("kite.adapters.kap_server", fromlist=["ResyncRequest"]).ResyncRequest(
+                session_id=SESSION_ID, reason=None, current_seq=None, epoch=None
+            )
+        )
+        self.flush()
+        self.assertEqual(ws.rebuild_resubscribes, [SESSION_ID])
 
     def test_shutdown_cancels_all_timers(self) -> None:
         self.bind(CHAT_ID)
@@ -1819,6 +2100,9 @@ class SweepTests(PipelineTestCase):
     def test_switch_sweeps_old_session_pending_interactions(self) -> None:
         approval_card_id = self._pending_approval_and_question()
         self.rest.add_session("s-2", title="Beta")
+        # /switch's preflight (mvp-scope aligned item 11) only passes when
+        # the old session is idle upstream — same discipline as /new.
+        self.rest.set_prompts(SESSION_ID, active=None)
 
         self.handler.on_message(make_message("/switch s-2"))
 
@@ -1851,6 +2135,9 @@ class SweepTests(PipelineTestCase):
             ),
         )
         self.rest.add_session("s-2", title="Beta")
+        # Same /switch preflight as /new: allowed only while the old
+        # session is idle upstream.
+        self.rest.set_prompts(SESSION_ID, active=None)
 
         self.handler.on_message(make_message("/switch s-2"))
 

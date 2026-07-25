@@ -17,7 +17,10 @@ Implements the outbound half of the MVP contract
 - approval.requested routes by prompt ownership: a certain owner gets the
   three-button card, other attached chats get a read-only notice, and a
   best-effort/unknown owner gets an explicitly expired card (fail-closed,
-  §4.6 — never routed on a guess). approval.resolved from ANY client freezes
+  §4.6 — never routed on a guess) AND an upstream resolve-as-rejected
+  (audit M2: upstream approvals never expire, so a card-only close-out
+  would block the turn forever; the closed id is recorded so replays and
+  rebuilds never re-card or re-resolve). approval.resolved from ANY client freezes
   the card. Card clicks are two-phase guarded (pending -> processing ->
   resolved; a mid-flight second click gets a "正在处理中" notice, a click on
   a missing entry gets "已失效或已处理" — never an error, never a
@@ -33,7 +36,10 @@ Implements the outbound half of the MVP contract
   clicks are actor-gated identically to approvals (bystander → denial toast,
   no state change, no upstream call), answer over REST, and freeze the
   clicked card; question.answered/dismissed from ANY client freezes every
-  item card. Timeout auto-dismisses and patches the cards closed.
+  item card. Timeout auto-dismisses and patches the cards closed. An
+  unroutable question (unattributable or non-certain ownership) is closed
+  out with an expired notice AND an upstream dismiss (audit M2, same
+  fail-closed discipline as approvals).
 - fail-close sweep: /new /switch unbinds sweep the old session's pending
   approvals/questions routed to that chat, and kited shutdown sweeps all of
   them — responded upstream (approval rejected, question dismissed) and the
@@ -41,7 +47,10 @@ Implements the outbound half of the MVP contract
 - resync_required / startup recovery rebuilds from REST snapshot + prompts
   and refreshes work state / queue / in-flight cards wholesale; a failed
   rebuild freezes the session's execution cards as "状态未知" with a
-  `kitectl session status` hint and never guesses (§4.2-4.3).
+  `kitectl session status` hint and never guesses (§4.2-4.3). A successful
+  rebuild fires the snapshot-rebuilt hook, which kited uses to re-subscribe
+  the session when its ack-listed resync had established no server-side
+  subscription (audit M7).
 - volatile streaming (docs/contracts/streaming-cards.md): assistant.delta
   frames append into a per-prompt in-memory transcript and schedule
   coalesced patches of the execution card's streamed body through the
@@ -417,6 +426,11 @@ class EventPipeline:
         self._approvals: dict[str, _PendingApproval] = {}
         self._questions: dict[str, _PendingQuestion] = {}
         self._pending_feedback: dict[tuple[str, str], _PendingFeedback] = {}
+        # Ids the unroutable path already fail-closed (expired card posted +
+        # upstream resolve attempted, §4.6): replays and rebuilds must never
+        # re-card or re-resolve them (audit M2).
+        self._expired_approval_ids: set[str] = set()
+        self._expired_question_ids: set[str] = set()
         # Terminal delivery dedup: one terminal card per (session, prompt)
         # even when two finalize paths (live event / reconcile retry) race.
         self._terminal_delivered: set[tuple[str, str]] = set()
@@ -1154,14 +1168,16 @@ class EventPipeline:
     # ------------------------------------------------------------------
 
     def _approval_requested(self, event: ApprovalRequested) -> None:
-        if event.approval_id in self._approvals:
-            return  # replayed duplicate
+        if event.approval_id in self._approvals or event.approval_id in self._expired_approval_ids:
+            return  # replayed duplicate (tracked, or already fail-closed)
         prompt_id = self._attribute_prompt(event.session_id, event.turn_id)
         if prompt_id is None:
             logger.warning(
                 "approval %s cannot be attributed to a prompt; expiring", event.approval_id
             )
-            self._send_approval_expired(event.session_id, None, reason="无法确定所属 prompt")
+            self._expire_unroutable_approval(
+                event.session_id, event.approval_id, None, reason="无法确定所属 prompt"
+            )
             return
         self._route_approval(
             session_id=event.session_id,
@@ -1200,7 +1216,8 @@ class EventPipeline:
         owner_chat = entry.chat_id if entry is not None else ""
         if entry is None or entry.certainty != CERTAINTY_CERTAIN or owner_chat not in attached:
             # Fail-closed (§4.6): never route an actionable approval card on a
-            # best-effort guess; close it out as expired instead.
+            # best-effort guess; close it out as expired instead — upstream
+            # included, or the turn would block forever (audit M2).
             if entry is not None and entry.certainty == CERTAINTY_CERTAIN:
                 reason = "该审批的发起聊天当前不可达"
             elif entry is not None:
@@ -1208,7 +1225,9 @@ class EventPipeline:
             else:
                 reason = "无法确定该审批的发起者"
             targets = [owner_chat] if owner_chat in attached else list(attached)
-            self._send_approval_expired(session_id, targets, reason=reason, prompt_id=prompt_id)
+            self._expire_unroutable_approval(
+                session_id, approval_id, targets, reason=reason, prompt_id=prompt_id
+            )
             return
         card = cards.build_approval_card(
             approval_id=approval_id,
@@ -1271,6 +1290,47 @@ class EventPipeline:
             targets,
         )
 
+    def _expire_unroutable_approval(
+        self,
+        session_id: str,
+        approval_id: str,
+        chat_ids: Optional[Sequence[str]],
+        *,
+        reason: str,
+        prompt_id: str = "",
+    ) -> None:
+        """Fail-closed to the end (§4.6): post the expired card AND resolve
+        the approval upstream as rejected.
+
+        design §4.6 says "explicitly expired and closed out": an unroutable
+        approval that is only carded stays pending upstream forever
+        (upstream approvals never expire), blocking its turn until a manual
+        `kitectl interaction sweep` (audit M2; FOCUS always auto-rejects
+        upstream in this case). The id is recorded so replays and snapshot
+        rebuilds never re-card or re-resolve it. The upstream resolve is
+        best-effort: an already-resolved/conflicting approval is fine, and
+        an unreachable kap leaves the close-out recorded locally (the sweep
+        remains the manual backstop).
+        """
+        if approval_id in self._expired_approval_ids:
+            return
+        self._expired_approval_ids.add(approval_id)
+        self._send_approval_expired(session_id, chat_ids, reason=reason, prompt_id=prompt_id)
+        try:
+            self._ops.resolve_approval(
+                session_id, approval_id, decision=cards.APPROVAL_DECISION_REJECTED
+            )
+        except (KapError, KapTransportError) as exc:
+            logger.warning(
+                "unroutable approval %s upstream reject failed: %s", approval_id, exc
+            )
+            return
+        logger.info(
+            "unroutable approval rejected upstream session_id=%s approval_id=%s",
+            session_id,
+            approval_id,
+        )
+
     def _approval_resolved(self, event: ApprovalResolved) -> None:
         """Freeze the card everywhere (resolution may come from any client,
         e.g. the web UI — spike S1 broadcasts approval.resolved to all)."""
@@ -1278,6 +1338,7 @@ class EventPipeline:
         if pending is None:
             return
         self._cancel_timer(pending)
+        self._drop_pending_feedback(event.approval_id)
         if pending.card_message_id:
             self._patch_card(
                 pending.card_message_id,
@@ -1304,6 +1365,7 @@ class EventPipeline:
         except KapError as exc:
             if exc.code in (KAP_ERROR_ALREADY_RESOLVED, KAP_ERROR_APPROVAL_NOT_FOUND):
                 # Resolved (or dropped) upstream meanwhile: freeze as handled.
+                self._drop_pending_feedback(approval_id)
                 if pending.card_message_id:
                     self._patch_card(
                         pending.card_message_id,
@@ -1322,6 +1384,7 @@ class EventPipeline:
             self._approvals[approval_id] = pending
             return
         # Never auto-approve (§3): timeout = rejected + explicit notification.
+        self._drop_pending_feedback(approval_id)
         if pending.card_message_id:
             self._patch_card(
                 pending.card_message_id,
@@ -1512,6 +1575,15 @@ class EventPipeline:
         pending.resolved = True
         self._approvals.pop(pending.approval_id, None)
         self._cancel_timer(pending)
+        self._drop_pending_feedback(pending.approval_id)
+
+    def _drop_pending_feedback(self, approval_id: str) -> None:
+        """Reject-with-feedback step 2 state dies with its approval (audit
+        M3): a leftover entry would swallow the user's next plain text into
+        ``try_handle_interaction_reply`` ("该审批已处理", never a prompt)."""
+        for key, feedback in list(self._pending_feedback.items()):
+            if feedback.approval_id == approval_id:
+                self._pending_feedback.pop(key, None)
 
     # ------------------------------------------------------------------
     # Question card actions (AppHandler E3 seam)
@@ -1634,21 +1706,23 @@ class EventPipeline:
     # ------------------------------------------------------------------
 
     def _question_requested(self, event: QuestionRequested) -> None:
-        if event.question_id in self._questions:
-            return  # replayed duplicate
+        if event.question_id in self._questions or event.question_id in self._expired_question_ids:
+            return  # replayed duplicate (tracked, or already fail-closed)
         prompt_id = self._attribute_prompt(event.session_id, event.turn_id)
         if prompt_id is None:
             logger.warning(
                 "question %s cannot be attributed to a prompt; expiring", event.question_id
             )
-            self._send_question_expired(event.session_id, None)
+            self._expire_unroutable_question(event.session_id, event.question_id, None)
             return
         entry = self._ownership.entry_of(prompt_id)
         attached = dict(self._attached_chats(event.session_id))
         owner_chat = entry.chat_id if entry is not None else ""
         if entry is None or entry.certainty != CERTAINTY_CERTAIN or owner_chat not in attached:
             targets = [owner_chat] if owner_chat in attached else list(attached)
-            self._send_question_expired(event.session_id, targets, prompt_id=prompt_id)
+            self._expire_unroutable_question(
+                event.session_id, event.question_id, targets, prompt_id=prompt_id
+            )
             return
         specs = tuple(_question_spec(item) for item in event.items)
         card_message_ids: list[str] = []
@@ -1728,6 +1802,41 @@ class EventPipeline:
             targets,
         )
 
+    def _expire_unroutable_question(
+        self,
+        session_id: str,
+        question_id: str,
+        chat_ids: Optional[Sequence[str]],
+        *,
+        prompt_id: str = "",
+    ) -> None:
+        """Fail-closed to the end (§4.6): post the expired notice AND dismiss
+        the question upstream.
+
+        Same discipline as ``_expire_unroutable_approval`` (audit M2): an
+        unroutable question that is only notified stays pending upstream,
+        blocking its turn indefinitely. The id is recorded so replays and
+        snapshot rebuilds never re-notify or re-dismiss it; the upstream
+        dismiss is best-effort (the 40909 success quirk is already absorbed
+        by ``KapInteractionOps.dismiss_question``).
+        """
+        if question_id in self._expired_question_ids:
+            return
+        self._expired_question_ids.add(question_id)
+        self._send_question_expired(session_id, chat_ids, prompt_id=prompt_id)
+        try:
+            self._ops.dismiss_question(session_id, question_id)
+        except (KapError, KapTransportError) as exc:
+            logger.warning(
+                "unroutable question %s upstream dismiss failed: %s", question_id, exc
+            )
+            return
+        logger.info(
+            "unroutable question dismissed upstream session_id=%s question_id=%s",
+            session_id,
+            question_id,
+        )
+
     def _question_resolved(self, event: QuestionResolved) -> None:
         """Freeze the item cards (resolution may come from any client, e.g.
         the web UI or the local CLI — the resolved event is broadcast)."""
@@ -1768,11 +1877,14 @@ class EventPipeline:
             )
 
     def _question_timed_out(self, question_id: str) -> None:
-        pending = self._questions.pop(question_id, None)
+        pending = self._questions.get(question_id)
         if pending is None or pending.resolved:
-            # resolved: the timer fire raced the answered event; the click
-            # path already froze the card.
+            # resolved: the timer fire raced the answering click — leave the
+            # entry for the question.answered event, which closes it and
+            # freezes the remaining item cards (popping it here would strand
+            # those cards clickable forever, audit M1).
             return
+        self._questions.pop(question_id, None)
         try:
             self._ops.dismiss_question(pending.session_id, question_id)
         except KapError as exc:
@@ -1780,7 +1892,11 @@ class EventPipeline:
                 # Handled upstream meanwhile: freeze as closed elsewhere.
                 self._patch_question_cards_closed(pending, reason="已在其他客户端处理")
                 return
+            # Transient business error: re-add like the approval path does,
+            # or the entry is lost while the card stays clickable and the
+            # question pends upstream forever (audit M1).
             logger.warning("question dismiss failed %s: %s", question_id, exc)
+            self._questions[question_id] = pending
             return
         except KapTransportError as exc:
             # Keep tracking: the question is still pending upstream and the
@@ -2133,6 +2249,7 @@ class EventPipeline:
                 continue
             self._approvals.pop(approval_id, None)
             self._cancel_timer(pending)
+            self._drop_pending_feedback(approval_id)
             if pending.card_message_id:
                 self._patch_card(
                     pending.card_message_id,
@@ -2149,7 +2266,9 @@ class EventPipeline:
                 else None
             ) or session.active_prompt_id
             if not prompt_id:
-                self._send_approval_expired(session_id, None, reason="无法确定所属 prompt")
+                self._expire_unroutable_approval(
+                    session_id, view.approval_id, None, reason="无法确定所属 prompt"
+                )
                 continue
             self._route_approval(
                 session_id=session_id,
@@ -2183,7 +2302,7 @@ class EventPipeline:
                 else None
             ) or session.active_prompt_id
             if not prompt_id:
-                self._send_question_expired(session_id, None)
+                self._expire_unroutable_question(session_id, view.question_id, None)
                 continue
             self._question_requested(
                 QuestionRequested(
@@ -2529,3 +2648,12 @@ class WsSubscriptionHook:
             )
             return
         ws.subscribe(session_id)
+
+    def resubscribe_after_rebuild(self, session_id: str) -> None:
+        """The pipeline's post-rebuild re-subscribe seam (audit M7), forwarded
+        to the live WS client (which owns the anti-tight-loop guard)."""
+        with self._lock:
+            ws = self._ws
+        if ws is None:
+            return
+        ws.resubscribe_after_rebuild(session_id)

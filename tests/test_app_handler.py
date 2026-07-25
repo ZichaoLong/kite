@@ -996,6 +996,44 @@ class BindingCommandTests(AppHandlerTestCase):
         assert binding is not None
         self.assertTrue(binding["attached"])
 
+    def test_switch_denied_while_prompt_active(self) -> None:
+        # mvp-scope aligned item 11 (audit M9): same denial as /new —
+        # rebinding would strand the in-flight prompt's execution card,
+        # terminal result and approval routing.
+        self.bind("s-1")
+        self.rest.add_session("s-2", title="Beta")
+        self.rest.set_prompts("s-1", active="p-1")
+        self.send("/switch s-2")
+        self.assertIn("请先 /abort 或等待完成", self.transport.last_text())
+        binding = self.store.load(CHAT_ID)
+        assert binding is not None
+        self.assertEqual(binding["session_id"], "s-1")
+        self.assertEqual(self.bound_sessions, [])
+
+    def test_switch_preflight_unverifiable_is_fail_closed(self) -> None:
+        self.bind("s-1")
+        self.rest.add_session("s-2")
+        self.rest.prompts_error = KapTransportError("down")
+        self.send("/switch s-2")
+        self.assertIn("无法连接 kap-server", self.transport.last_text())
+        binding = self.store.load(CHAT_ID)
+        assert binding is not None
+        self.assertEqual(binding["session_id"], "s-1")
+
+    def test_switch_card_button_denied_while_prompt_active(self) -> None:
+        self.bind("s-1")
+        self.rest.add_session("s-2", title="Beta")
+        self.rest.set_prompts("s-1", active="p-1")
+        response = self.handler.on_card_action(
+            make_card_action({"action": ACTION_SESSION_SWITCH, "session_id": "s-2"})
+        )
+        self.assertEqual(response.toast_type, "error")
+        assert response.toast is not None
+        self.assertIn("请先 /abort 或等待完成", response.toast)
+        binding = self.store.load(CHAT_ID)
+        assert binding is not None
+        self.assertEqual(binding["session_id"], "s-1")
+
     def test_detach_pauses_push_and_keeps_binding(self) -> None:
         self.bind("s-1")
         self.send("/detach")
@@ -1056,6 +1094,56 @@ class BindingCommandTests(AppHandlerTestCase):
         binding = self.store.load(CHAT_ID)
         assert binding is not None
         self.assertFalse(binding["attached"])
+
+    def test_attach_denied_when_session_occupied_by_all_mode_group(self) -> None:
+        # Audit M10 path A: this chat detached, then an all-mode group bound
+        # the same session (detached does not count, by design) — re-attaching
+        # must not silently share the occupied session (§3.8 reverse probe).
+        self.bind("s-1", attached=False)
+        self.bind("s-1", chat_id="oc_group")
+        self.group_config_store.activate("oc_group", activated_by=ADMIN_OPEN_ID)
+        self.group_config_store.set_mode("oc_group", "all")
+
+        self.send("/attach")
+
+        text = self.transport.last_text()
+        self.assertIn("独占", text)
+        self.assertIn("被拒绝", text)
+        binding = self.store.load(CHAT_ID)
+        assert binding is not None
+        self.assertFalse(binding["attached"])
+
+    def test_attach_denied_for_all_mode_group_when_session_shared(self) -> None:
+        # Audit M10: an all-mode group re-attaching while another chat is
+        # attached to its session hits the forward probe (§2).
+        self.bind("s-1")  # another attached chat shares the session
+        self.bind("s-1", attached=False, chat_id="oc_group")
+        self.group_config_store.activate("oc_group", activated_by=ADMIN_OPEN_ID)
+        self.group_config_store.set_mode("oc_group", "all")
+
+        self.send("/attach", chat_id="oc_group")
+
+        text = self.transport.last_text()
+        self.assertIn("all 模式", text)
+        self.assertIn("被拒绝", text)
+        binding = self.store.load("oc_group")
+        assert binding is not None
+        self.assertFalse(binding["attached"])
+
+    def test_attach_allowed_when_occupier_deactivated(self) -> None:
+        # A deactivated group is inert (§3.8 edge rule): it does not occupy.
+        self.bind("s-1", attached=False)
+        self.bind("s-1", chat_id="oc_group")
+        self.group_config_store.activate("oc_group", activated_by=ADMIN_OPEN_ID)
+        self.group_config_store.set_mode("oc_group", "all")
+        self.group_config_store.deactivate("oc_group")
+
+        self.send("/attach")
+
+        self.assertIn("已恢复", self.transport.last_text())
+        binding = self.store.load(CHAT_ID)
+        assert binding is not None
+        self.assertTrue(binding["attached"])
 
 
 # ---------------------------------------------------------------------------
@@ -1618,6 +1706,50 @@ class MergeForwardTests(AppHandlerTestCase):
         self.assertIn("第一段", text)
         self.assertIn("第二段", text)
         self.assertEqual(self.transport.replies[-1]["parent_message_id"], "om_fwd2")
+
+    def test_next_text_claims_stash_into_one_merged_prompt(self) -> None:
+        # FOCUS stash-claim (audit M12): the comment sent right after a
+        # forward claims the stashed transcript — ONE prompt with the
+        # transcript FIRST, so the instruction never runs without it.
+        self._bind()
+        self.transport.merge_forward_items = [
+            make_forward_item("om_c1", text="看看这段对话", sender_id="ou_alice"),
+        ]
+        self.handler.on_merge_forward(make_merge_forward(message_id="om_fwd"))
+        self.assertEqual(len(self.forward_timers), 1)
+        self.assertEqual(self.rest.submissions, [])
+
+        self.send("总结一下这段对话")
+
+        self.assertEqual(len(self.rest.submissions), 1)
+        text = self.rest.submissions[0]["body"]["content"][0]["text"]
+        self.assertIn("<forwarded_messages>", text)
+        self.assertLess(text.index("看看这段对话"), text.index("总结一下这段对话"))
+        # The window was claimed: its timer is cancelled and a late fire
+        # submits nothing (no second, transcript-only prompt).
+        self.assertTrue(self.forward_timers[-1].cancelled)
+        self.forward_timers[-1].fire()
+        self.assertEqual(len(self.rest.submissions), 1)
+        # The ack threads to the claiming comment, not the forward.
+        self.assertEqual(self.transport.replies[-1]["parent_message_id"], "om_1")
+        # Ownership records the claiming sender like any text prompt.
+        entry = self.handler.prompt_ownership.entry_of(self.rest.submissions[0]["prompt_id"])
+        assert entry is not None
+        self.assertEqual(entry.sender_open_id, ADMIN_OPEN_ID)
+
+    def test_unclaimed_window_still_submits_transcript_alone(self) -> None:
+        # The other half of the semantics: with no claiming text inside the
+        # window, the transcript flushes on its own.
+        self._bind()
+        self.transport.merge_forward_items = [make_forward_item("om_c1", text="转发的内容")]
+
+        self.handler.on_merge_forward(make_merge_forward(message_id="om_fwd"))
+        self.forward_timers[-1].fire()
+
+        self.assertEqual(len(self.rest.submissions), 1)
+        text = self.rest.submissions[0]["body"]["content"][0]["text"]
+        self.assertIn("<forwarded_messages>", text)
+        self.assertIn("转发的内容", text)
 
     def test_group_merge_forward_dropped_without_prompt_path(self) -> None:
         self.group_config_store.activate("oc_group", activated_by=ADMIN_OPEN_ID)

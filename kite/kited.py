@@ -291,9 +291,14 @@ def run(
                 "bot identity discovery failed; group mention triggering stays disabled"
             )
         outbound.transport_thread.start()
-        outbound.pipeline.set_snapshot_rebuilt_hook(
-            lambda _sid, _snap: status.update(ws={"last_resync_at": time.time()})
-        )
+        def on_snapshot_rebuilt(session_id: str, _snapshot: object) -> None:
+            status.update(ws={"last_resync_at": time.time()})
+            # M7: an ack-listed resync may have established no server-side
+            # subscription (cold/deleted session); the successful rebuild
+            # re-subscribes once (guarded inside the WS client).
+            outbound.ws_hook.resubscribe_after_rebuild(session_id)
+
+        outbound.pipeline.set_snapshot_rebuilt_hook(on_snapshot_rebuilt)
         # The control plane starts with the outbound runtime and publishes
         # its endpoint (control_plane.json) for kitectl discovery.
         if control_token is None:
