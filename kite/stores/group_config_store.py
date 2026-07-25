@@ -2,10 +2,12 @@
 
 Implements the group-chat contract (docs/contracts/group-chat.md): one
 persistent, chat-keyed record ``{activated, activated_by, activated_at,
-mode}`` per group chat. The admitted modes are ``mention_only`` (default)
-and ``assistant`` (every member message is logged; @bot triggers with the
+mode}`` per group chat. The admitted modes are ``mention_only`` (default),
+``assistant`` (every member message is logged; @bot triggers with the
 log since the trigger boundary as context — the log/boundary half lives in
-``kite/stores/group_log_store.py``, state axis 6).
+``kite/stores/group_log_store.py``, state axis 6), and ``all`` (every
+member text message triggers a plain prompt; the group must hold its
+session exclusively — enforced in the application layer, not here).
 
 Fail-closed discipline (contract §4.3): reads never raise on corruption.
 A corrupt store file or a corrupt per-chat record reads as *non-activated*
@@ -34,7 +36,10 @@ SUPPORTED_GROUP_CONFIG_STORE_SCHEMA_VERSIONS = frozenset(
 
 GROUP_MODE_MENTION_ONLY = "mention_only"
 GROUP_MODE_ASSISTANT = "assistant"
-VALID_GROUP_MODES = frozenset({GROUP_MODE_MENTION_ONLY, GROUP_MODE_ASSISTANT})
+GROUP_MODE_ALL = "all"
+VALID_GROUP_MODES = frozenset(
+    {GROUP_MODE_MENTION_ONLY, GROUP_MODE_ASSISTANT, GROUP_MODE_ALL}
+)
 DEFAULT_GROUP_MODE = GROUP_MODE_MENTION_ONLY
 
 
@@ -113,7 +118,7 @@ class GroupConfigStore:
         )
 
     def set_mode(self, chat_id: str, mode: str) -> StoredGroupConfig:
-        """Switch the chat's group mode (mention_only | assistant).
+        """Switch the chat's group mode (mention_only | assistant | all).
 
         The activation fields are preserved; a chat without a record gets a
         non-activated one carrying the mode preference (same convention as

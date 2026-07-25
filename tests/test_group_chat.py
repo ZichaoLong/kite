@@ -2,8 +2,8 @@
 
 Covers the group-chat contract (docs/contracts/group-chat.md):
 - the full ingress matrix (§3.2): p2p/group × admin/activated member/
-  stranger × @/no-@ × slash/text × mode(mention_only/assistant), every cell
-  with an explicit outcome;
+  stranger × @/no-@ × slash/text × mode(mention_only/assistant/all), every
+  cell with an explicit outcome;
 - activation (§3.1): admin-only, persists, first activation of an unbound
   group creates+binds with the instance default cwd, deactivate stops member
   prompting immediately;
@@ -14,6 +14,11 @@ Covers the group-chat contract (docs/contracts/group-chat.md):
   log+backfill context envelope, the boundary advances only after a
   successful submit, and a history fetch failure blocks with the explicit
   notice (§4.5);
+- all mode (§2): every member text message triggers a plain prompt (no log,
+  no context); the bot's own and identity-less messages never trigger;
+  exclusivity (§4.6): /group-mode all is denied with a remediation text
+  while the session is shared, /switch|/new into a shared session while in
+  all mode is denied the same way, and switching back down lifts the rule;
 - /abort gating in groups (§3.4): initiator or admin, everyone else denied;
 - fail-closed corruption (§4.3) and missing identity (§4.4).
 
@@ -33,6 +38,7 @@ from test_app_handler import (
     CHAT_ID,
     DEFAULT_CWD,
     AppHandlerTestCase,
+    make_card_action,
 )
 from test_group_history import (
     FakeListMessages,
@@ -42,10 +48,12 @@ from test_group_history import (
 )
 
 from kite.adapters.kap_server import KapError
+from kite.app_handler import ACTION_SESSION_SWITCH
 from kite.feishu_transport import InboundAttachment, InboundMessage, ListedMessagesPage
 from kite.group_history import GroupHistoryRecovery
 from kite.identity_names import IdentityNames
 from kite.stores.group_config_store import (
+    GROUP_MODE_ALL,
     GROUP_MODE_ASSISTANT,
     GROUP_MODE_MENTION_ONLY,
     GroupConfigStore,
@@ -552,7 +560,7 @@ class GroupModeCommandTests(GroupChatTestCase):
 
     def test_group_mode_invalid_value_shows_usage(self) -> None:
         self.activate_group()
-        self.send_group("/group-mode all", sender=ADMIN_OPEN_ID, mentioned=False)
+        self.send_group("/group-mode bogus", sender=ADMIN_OPEN_ID, mentioned=False)
         self.assertIn("用法", self.transport.last_text())
         config = self.group_config_store.load(GROUP_CHAT_ID)
         assert config is not None
@@ -843,6 +851,279 @@ class AssistantModeTriggerTests(GroupChatTestCase):
         self.assertNotIn("第一条", submitted)
         # The seq counter survived: the new trigger is seq 5.
         self.assertEqual(fresh_log_store.boundary(GROUP_CHAT_ID)["seq"], 5)
+
+
+# ---------------------------------------------------------------------------
+# All mode ingress (§2): every member text message triggers a plain prompt
+# ---------------------------------------------------------------------------
+
+
+class AllModeIngressTests(GroupChatTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.bind_group("s-1")
+        self.rest.add_session("s-1")
+        self.activate_group(mode=GROUP_MODE_ALL)
+
+    def test_member_plain_text_triggers_plain_prompt(self) -> None:
+        self.send_group("直接说点事", sender=MEMBER_OPEN_ID, mentioned=False)
+        self.assertEqual(len(self.rest.submissions), 1)
+        submission = self.rest.submissions[0]
+        # Plain prompt: the raw text, no context envelope (§2).
+        self.assertEqual(
+            submission["body"]["content"],
+            [{"type": "text", "text": "直接说点事"}],
+        )
+        entry = self.handler.prompt_ownership.entry_of(submission["prompt_id"])
+        assert entry is not None
+        self.assertEqual(entry.chat_id, GROUP_CHAT_ID)
+        self.assertEqual(entry.sender_open_id, MEMBER_OPEN_ID)
+        self.assertIn("已提交", self.transport.last_text())
+
+    def test_member_mentioned_text_also_triggers(self) -> None:
+        self.send_group("@我也行", sender=MEMBER_OPEN_ID, mentioned=True)
+        self.assertEqual(len(self.rest.submissions), 1)
+
+    def test_admin_plain_text_triggers_too(self) -> None:
+        # Admins are members; the all-mode trigger has no admin exception.
+        self.send_group("管理员的话", sender=ADMIN_OPEN_ID, mentioned=False)
+        self.assertEqual(len(self.rest.submissions), 1)
+
+    def test_nothing_is_logged(self) -> None:
+        # All mode never touches the assistant-mode log axis (§2).
+        self.send_group("第一条", mentioned=False, message_id="om_g1", create_time=1720000001000)
+        self.send_group("第二条", mentioned=False, message_id="om_g2", create_time=1720000002000)
+        self.assertEqual(len(self.rest.submissions), 2)
+        self.assertEqual(self.log_texts(), [])
+
+    def test_bot_own_message_never_triggers(self) -> None:
+        # App senders (incl. this bot) are non-members (§3.2) — silently, so
+        # the bot's own replies never retrigger it.
+        self.send_group(
+            "机器人自己的话", sender="ou_some_app", sender_type="app", mentioned=False,
+        )
+        self.send_group(
+            "自己 @自己", sender="ou_some_app", sender_type="app", mentioned=True,
+            message_id="om_g2",
+        )
+        self.assert_no_reaction()
+
+    def test_own_open_id_never_triggers(self) -> None:
+        self.transport.bot_open_id = BOT_OPEN_ID
+        self.send_group("自己的 open_id", sender=BOT_OPEN_ID, mentioned=False)
+        self.assert_no_reaction()
+
+    def test_missing_identity_never_triggers(self) -> None:
+        # §4.4: missing sender identity -> non-member; silently ignored.
+        self.send_group("匿名消息", sender="", mentioned=False)
+        self.assert_no_reaction()
+
+    def test_empty_text_never_triggers(self) -> None:
+        self.send_group("", sender=MEMBER_OPEN_ID, mentioned=True)
+        self.assert_no_reaction()
+
+    def test_member_slash_command_stays_admin_only(self) -> None:
+        self.send_group("/status", sender=MEMBER_OPEN_ID, mentioned=False)
+        self.assertIn("仅管理员", self.transport.last_text())
+        self.assertEqual(self.rest.calls, [])
+
+    def test_deactivated_group_ignores_everything(self) -> None:
+        self.group_config_store.deactivate(GROUP_CHAT_ID)
+        self.send_group("做点事", sender=MEMBER_OPEN_ID, mentioned=False)
+        self.assert_no_reaction()
+
+    def test_first_use_creates_and_binds(self) -> None:
+        fresh_chat = "oc_group_fresh"
+        self.group_config_store.activate(fresh_chat, activated_by=ADMIN_OPEN_ID)
+        self.group_config_store.set_mode(fresh_chat, GROUP_MODE_ALL)
+        self.send_group(
+            "帮我看看这段代码", sender=MEMBER_OPEN_ID, chat_id=fresh_chat, mentioned=False,
+        )
+        methods = [(method, path) for method, path, _ in self.rest.calls]
+        self.assertEqual(
+            methods,
+            [("POST", "/sessions"), ("GET", "/sessions/s-2"), ("POST", "/sessions/s-2/prompts")],
+        )
+        create_body = self.rest.calls[0][2]
+        self.assertEqual(create_body["metadata"]["cwd"], DEFAULT_CWD)
+        self.assertEqual(create_body["title"], "帮我看看这段代码")
+        binding = self.store.load(fresh_chat)
+        assert binding is not None
+        self.assertEqual(binding["session_id"], "s-2")
+
+    def test_detached_binding_blocks_the_prompt(self) -> None:
+        # All-mode triggers ride the normal prompt path, including the
+        # detached fail-closed guard.
+        self.bind("s-1", chat_id=GROUP_CHAT_ID, attached=False)
+        self.send_group("做点事", sender=MEMBER_OPEN_ID, mentioned=False)
+        self.assertIn("/attach", self.transport.last_text())
+        self.assertEqual(self.rest.submissions, [])
+
+
+# ---------------------------------------------------------------------------
+# All-mode exclusivity (§2, fail-closed §4.6)
+# ---------------------------------------------------------------------------
+
+
+class AllModeExclusivityTests(GroupChatTestCase):
+    def activate_all_mode(self, chat_id: str = GROUP_CHAT_ID) -> None:
+        self.activate_group(chat_id, mode=GROUP_MODE_ALL)
+
+    def test_group_mode_all_allowed_when_session_exclusive(self) -> None:
+        self.bind_group("s-1")
+        self.activate_group()
+        self.send_group("/group-mode all", sender=ADMIN_OPEN_ID, mentioned=False)
+        self.assertIn("已切换为 all 模式", self.transport.last_text())
+        config = self.group_config_store.load(GROUP_CHAT_ID)
+        assert config is not None
+        self.assertEqual(config["mode"], GROUP_MODE_ALL)
+
+    def test_group_mode_all_allowed_when_unbound(self) -> None:
+        # No binding -> no session to share; first use creates an exclusive
+        # one, so the switch is safe to allow.
+        self.activate_group()
+        self.send_group("/group-mode all", sender=ADMIN_OPEN_ID, mentioned=False)
+        self.assertIn("已切换为 all 模式", self.transport.last_text())
+        config = self.group_config_store.load(GROUP_CHAT_ID)
+        assert config is not None
+        self.assertEqual(config["mode"], GROUP_MODE_ALL)
+
+    def test_group_mode_all_denied_when_session_shared(self) -> None:
+        self.bind("s-1")  # the p2p chat shares the group's session
+        self.bind_group("s-1")
+        self.activate_group()
+        self.send_group("/group-mode all", sender=ADMIN_OPEN_ID, mentioned=False)
+        text = self.transport.last_text()
+        self.assertIn("all 模式", text)
+        self.assertIn("被拒绝", text)
+        # The remediation names the other chats and the way out (§4.6).
+        self.assertIn(f"`{CHAT_ID}`", text)
+        self.assertIn("/detach", text)
+        config = self.group_config_store.load(GROUP_CHAT_ID)
+        assert config is not None
+        self.assertEqual(config["mode"], GROUP_MODE_MENTION_ONLY)
+
+    def test_group_mode_all_denied_names_every_other_chat(self) -> None:
+        self.bind("s-1")
+        self.bind("s-1", chat_id="oc_other")
+        self.bind_group("s-1")
+        self.activate_group()
+        self.send_group("/group-mode all", sender=ADMIN_OPEN_ID, mentioned=False)
+        text = self.transport.last_text()
+        self.assertIn(f"`{CHAT_ID}`", text)
+        self.assertIn("`oc_other`", text)
+        config = self.group_config_store.load(GROUP_CHAT_ID)
+        assert config is not None
+        self.assertEqual(config["mode"], GROUP_MODE_MENTION_ONLY)
+
+    def test_group_mode_all_allowed_when_other_chat_detached(self) -> None:
+        # A detached chat neither prompts nor receives broadcasts, so it
+        # does not count as sharing — /detach is the working remediation.
+        self.bind("s-1", attached=False)
+        self.bind_group("s-1")
+        self.activate_group()
+        self.send_group("/group-mode all", sender=ADMIN_OPEN_ID, mentioned=False)
+        self.assertIn("已切换为 all 模式", self.transport.last_text())
+        config = self.group_config_store.load(GROUP_CHAT_ID)
+        assert config is not None
+        self.assertEqual(config["mode"], GROUP_MODE_ALL)
+
+    def test_switch_into_shared_session_denied_in_all_mode(self) -> None:
+        self.bind_group("s-1")
+        self.rest.add_session("s-1")
+        self.bind("s-2")  # the p2p chat occupies the target session
+        self.rest.add_session("s-2")
+        self.activate_all_mode()
+        self.send_group("/switch s-2", sender=ADMIN_OPEN_ID, mentioned=False)
+        text = self.transport.last_text()
+        self.assertIn("all 模式", text)
+        self.assertIn("被拒绝", text)
+        self.assertIn(f"`{CHAT_ID}`", text)
+        binding = self.store.load(GROUP_CHAT_ID)
+        assert binding is not None
+        self.assertEqual(binding["session_id"], "s-1")
+        self.assertNotIn("s-2", self.bound_sessions)
+
+    def test_switch_into_exclusive_session_allowed_in_all_mode(self) -> None:
+        self.bind_group("s-1")
+        self.rest.add_session("s-1")
+        self.rest.add_session("s-2")
+        self.activate_all_mode()
+        self.send_group("/switch s-2", sender=ADMIN_OPEN_ID, mentioned=False)
+        self.assertIn("已切换到会话", self.transport.last_text())
+        binding = self.store.load(GROUP_CHAT_ID)
+        assert binding is not None
+        self.assertEqual(binding["session_id"], "s-2")
+
+    def test_switch_allowed_in_all_mode_when_other_chat_detached(self) -> None:
+        self.bind_group("s-1")
+        self.rest.add_session("s-1")
+        self.bind("s-2", attached=False)
+        self.rest.add_session("s-2")
+        self.activate_all_mode()
+        self.send_group("/switch s-2", sender=ADMIN_OPEN_ID, mentioned=False)
+        self.assertIn("已切换到会话", self.transport.last_text())
+
+    def test_switch_card_button_denied_in_all_mode(self) -> None:
+        # The /sessions card buttons share the /switch path (same gate).
+        self.bind_group("s-1")
+        self.rest.add_session("s-1")
+        self.bind("s-2")
+        self.rest.add_session("s-2")
+        self.activate_all_mode()
+        response = self.handler.on_card_action(
+            make_card_action(
+                {"action": ACTION_SESSION_SWITCH, "session_id": "s-2"},
+                operator=ADMIN_OPEN_ID,
+                chat_id=GROUP_CHAT_ID,
+            )
+        )
+        self.assertEqual(response.toast_type, "error")
+        self.assertIn("all 模式", response.toast)
+        binding = self.store.load(GROUP_CHAT_ID)
+        assert binding is not None
+        self.assertEqual(binding["session_id"], "s-1")
+
+    def test_new_allowed_in_all_mode(self) -> None:
+        # /new creates a fresh session, which is exclusive by construction.
+        self.bind_group("s-1")
+        self.rest.add_session("s-1")
+        self.activate_all_mode()
+        self.send_group("/new", sender=ADMIN_OPEN_ID, mentioned=False)
+        self.assertIn("已创建并绑定新会话", self.transport.last_text())
+        binding = self.store.load(GROUP_CHAT_ID)
+        assert binding is not None
+        self.assertEqual(binding["session_id"], "s-2")
+
+    def test_switch_back_down_restores_exclusivity_free_behavior(self) -> None:
+        self.bind_group("s-1")
+        self.rest.add_session("s-1")
+        self.bind("s-2")
+        self.rest.add_session("s-2")
+        self.activate_group()
+        self.send_group("/group-mode all", sender=ADMIN_OPEN_ID, mentioned=False)
+        self.assertIn("已切换为 all 模式", self.transport.last_text())
+        # In all mode the shared target is denied...
+        self.send_group("/switch s-2", sender=ADMIN_OPEN_ID, mentioned=False)
+        self.assertIn("被拒绝", self.transport.last_text())
+        # ...but switching back down lifts the exclusivity rule entirely.
+        self.send_group("/group-mode mention_only", sender=ADMIN_OPEN_ID, mentioned=False)
+        self.assertIn("已切换为 mention_only 模式", self.transport.last_text())
+        self.send_group("/switch s-2", sender=ADMIN_OPEN_ID, mentioned=False)
+        self.assertIn("已切换到会话", self.transport.last_text())
+        # ...and the ingress cell is mention_only again: non-@ is ignored.
+        self.send_group("随便聊聊", sender=MEMBER_OPEN_ID, mentioned=False)
+        self.assertEqual(self.rest.submissions, [])
+
+    def test_all_mode_trigger_still_works_after_exclusive_switch(self) -> None:
+        self.bind_group("s-1")
+        self.rest.add_session("s-1")
+        self.rest.add_session("s-2")
+        self.activate_all_mode()
+        self.send_group("/switch s-2", sender=ADMIN_OPEN_ID, mentioned=False)
+        self.send_group("切换后继续", sender=MEMBER_OPEN_ID, mentioned=False)
+        self.assertEqual(len(self.rest.submissions), 1)
+        self.assertEqual(self.rest.submissions[0]["session_id"], "s-2")
 
 
 if __name__ == "__main__":

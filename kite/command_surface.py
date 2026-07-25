@@ -83,8 +83,8 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     ),
     CommandSpec(
         "/group-mode",
-        "/group-mode 〈mention_only|assistant〉",
-        "查看或切换群聊模式（仅管理员，在已激活的群聊中使用）；assistant 模式记录群成员消息并在 @机器人 时携带群聊上下文。",
+        "/group-mode 〈mention_only|assistant|all〉",
+        "查看或切换群聊模式（仅管理员，在已激活的群聊中使用）；assistant 模式记录群成员消息并在 @机器人 时携带群聊上下文，all 模式下每条成员消息直接触发 prompt（本群独占会话）。",
     ),
     CommandSpec(
         "/status",

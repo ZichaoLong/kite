@@ -28,8 +28,13 @@ Implements the MVP inbound contract (docs/contracts/mvp-scope.md):
   since the trigger boundary — merged with a Feishu REST history backfill
   by GroupHistoryRecovery — as the context envelope; a history fetch
   failure blocks the prompt with an explicit notice (fail-closed), and the
-  boundary advances only after a successful submit. Group activation config
-  lives in the GroupConfigStore (state axis 5);
+  boundary advances only after a successful submit. In all mode every
+  member text message triggers a plain prompt directly (no @ needed, no
+  log, no context injection); the mode requires an exclusive session, so
+  /group-mode all and /switch|/new rebinds run the all-mode exclusivity
+  preflight (kite/preflights.py) and deny with a remediation text when the
+  session is or would be shared (contract §2, fail-closed §4.6). Group
+  activation config lives in the GroupConfigStore (state axis 5);
 - merge_forward bundles (p2p only): each merge_forward message's children
   are fetched and buffered per (sender, chat) by the ForwardAggregator; a
   short window later the expanded `<forwarded_messages>` transcript enters
@@ -126,6 +131,7 @@ from kite.stores.binding_store import (
     StoredBinding,
 )
 from kite.stores.group_config_store import (
+    GROUP_MODE_ALL,
     GROUP_MODE_ASSISTANT,
     GROUP_MODE_MENTION_ONLY,
     VALID_GROUP_MODES,
@@ -533,8 +539,10 @@ class AppHandler(TransportHandler):
           like p2p). In assistant mode every member text message is appended
           to the per-chat log (the bot's own and identity-less messages
           never enter) and @bot+text triggers with the log since the trigger
-          boundary as context. A missing sender identity is treated as a
-          non-member (§4.4) and never prompts.
+          boundary as context. In all mode every member text message
+          triggers a plain prompt (no @ needed, no log, no context). A
+          missing sender identity is treated as a non-member (§4.4) and
+          never prompts.
         """
         activated = self._group_config_store.is_activated(message.chat_id)
         is_admin = self._is_admin(message.sender_open_id)
@@ -560,6 +568,9 @@ class AppHandler(TransportHandler):
         mode = group_config["mode"] if group_config is not None else GROUP_MODE_MENTION_ONLY
         if mode == GROUP_MODE_ASSISTANT:
             self._on_assistant_group_message(message, text)
+            return
+        if mode == GROUP_MODE_ALL:
+            self._on_all_group_message(message, text)
             return
         if not message.bot_mentioned:
             # Non-@ group chatter is ignored entirely: no prompt, no
@@ -670,6 +681,30 @@ class AppHandler(TransportHandler):
                 "message_ids": boundary_ids,
             },
         )
+
+    def _on_all_group_message(self, message: InboundMessage, text: str) -> None:
+        """All-mode group ingress (group-chat §2): every member text message
+        triggers a plain prompt — no @mention needed, no log, no context
+        injection; the prompt path is the ordinary one (binding, preflight,
+        ownership). The bot's own and identity-less messages never trigger
+        (§3.2/§4.4), and every non-trigger cell is silent by design: a mode
+        whose point is chatter cannot reply per dropped message.
+        """
+        sender = message.sender_open_id.strip()
+        if message.sender_type == "app" or (sender and sender == self._bot_open_id()):
+            # The bot's own messages never trigger (§3.2) — silently, or the
+            # bot's replies would retrigger itself.
+            return
+        if not sender:
+            # Missing identity -> non-member (§4.4); never prompts.
+            return
+        if not text:
+            # Non-text content carries no prompt; slash commands were
+            # already handled at the command gate.
+            return
+        if self.try_handle_interaction_reply(message):
+            return
+        self._handle_prompt(message)
 
     def _dispatch_command(self, message: InboundMessage, command: SlashCommand) -> None:
         handler = self._commands.get(command.name)
@@ -1248,6 +1283,25 @@ class AppHandler(TransportHandler):
         except KapError as exc:
             self._reply_to(message, f"创建会话失败：{exc.msg}")
             return
+        if message.chat_type == "group":
+            # All-mode exclusivity (group-chat §2, fail-closed §4.6): a
+            # freshly created session is exclusive by construction, so this
+            # probe is the fail-closed assertion of that invariant — an
+            # all-mode group never rebinds into a shared session.
+            exclusive = preflights.all_mode_session_exclusive(
+                chat_id,
+                self._binding_store,
+                self._group_config_store,
+                session_id=info.session_id,
+            )
+            if not exclusive.allowed:
+                logger.info(
+                    "/new denied chat_id=%s reason_code=%s",
+                    chat_id,
+                    exclusive.reason_code,
+                )
+                self._reply_to(message, exclusive.reason_text)
+                return
         # Permission/plan modes are chat-level settings: they carry over.
         binding: StoredBinding = {
             "session_id": info.session_id,
@@ -1448,7 +1502,7 @@ class AppHandler(TransportHandler):
         self._reply_to(message, build_usage_text("/group"))
 
     def _cmd_group_mode(self, message: InboundMessage, arg: str) -> None:
-        """/group-mode 〈mention_only|assistant〉: switch the group mode."""
+        """/group-mode 〈mention_only|assistant|all〉: switch the group mode."""
         if message.chat_type != "group":
             self._reply_to(message, "`/group-mode` 仅在群聊中可用。")
             return
@@ -1469,7 +1523,7 @@ class AppHandler(TransportHandler):
         if not mode:
             self._reply_to(
                 message,
-                f"当前群聊模式：{group_config['mode']}。可选：mention_only / assistant。",
+                f"当前群聊模式：{group_config['mode']}。可选：mention_only / assistant / all。",
             )
             return
         if mode not in VALID_GROUP_MODES:
@@ -1478,6 +1532,24 @@ class AppHandler(TransportHandler):
         if mode == group_config["mode"]:
             self._reply_to(message, f"群聊模式已是 {mode}。")
             return
+        if mode == GROUP_MODE_ALL:
+            # Exclusivity (contract §2, fail-closed §4.6): an all-mode
+            # group's session may not be bound to any other attached chat;
+            # deny with the remediation text, never switch silently.
+            exclusive = preflights.all_mode_session_exclusive(
+                message.chat_id,
+                self._binding_store,
+                self._group_config_store,
+                current_chat_mode=GROUP_MODE_ALL,
+            )
+            if not exclusive.allowed:
+                logger.info(
+                    "/group-mode all denied chat_id=%s reason_code=%s",
+                    message.chat_id,
+                    exclusive.reason_code,
+                )
+                self._reply_to(message, exclusive.reason_text)
+                return
         self._group_config_store.set_mode(message.chat_id, mode)
         logger.info(
             "group mode set chat_id=%s mode=%s operator=%s",
@@ -1485,7 +1557,14 @@ class AppHandler(TransportHandler):
             mode,
             message.sender_open_id,
         )
-        if mode == GROUP_MODE_ASSISTANT:
+        if mode == GROUP_MODE_ALL:
+            self._reply_to(
+                message,
+                "已切换为 all 模式：群成员的每条文字消息都会直接提交 prompt"
+                "（不携带群聊上下文）；该模式下本群独占当前会话。"
+                "发送 /group-mode mention_only 切回。",
+            )
+        elif mode == GROUP_MODE_ASSISTANT:
             self._reply_to(
                 message,
                 "已切换为 assistant 模式：群成员的文字消息会记录到群聊日志；"
@@ -1713,6 +1792,23 @@ class AppHandler(TransportHandler):
                 False,
                 f"会话 `{session_id}` 已归档，不能切换。发送 /sessions 查看可用会话。",
             )
+        # All-mode exclusivity (group-chat §2, fail-closed §4.6): an
+        # all-mode group may only rebind to a session no other attached
+        # chat is bound to. A no-op for every non-all-mode chat.
+        exclusive = preflights.all_mode_session_exclusive(
+            chat_id,
+            self._binding_store,
+            self._group_config_store,
+            session_id=session_id,
+        )
+        if not exclusive.allowed:
+            logger.info(
+                "session switch denied chat_id=%s session_id=%s reason_code=%s",
+                chat_id,
+                session_id,
+                exclusive.reason_code,
+            )
+            return False, exclusive.reason_text
         binding: StoredBinding = {
             "session_id": session_id,
             "attached": True,

@@ -109,7 +109,6 @@ class StrictWriteValidationTests(GroupConfigStoreTestCase):
             self.store.save(CHAT_ID, config)
 
     def test_invalid_mode_is_rejected(self) -> None:
-        self._assert_save_rejected(_activated_config(mode="all"))
         self._assert_save_rejected(_activated_config(mode="unknown"))
 
     def test_assistant_mode_is_admitted(self) -> None:
@@ -118,6 +117,13 @@ class StrictWriteValidationTests(GroupConfigStoreTestCase):
         loaded = self.store.load(CHAT_ID)
         assert loaded is not None
         self.assertEqual(loaded["mode"], "assistant")
+
+    def test_all_mode_is_admitted(self) -> None:
+        saved = self.store.save(CHAT_ID, _activated_config(mode="all"))
+        self.assertEqual(saved["mode"], "all")
+        loaded = self.store.load(CHAT_ID)
+        assert loaded is not None
+        self.assertEqual(loaded["mode"], "all")
 
     def test_set_mode_switches_and_preserves_activation(self) -> None:
         self.store.activate(CHAT_ID, activated_by="ou_admin", activated_at=123.0)
@@ -138,7 +144,7 @@ class StrictWriteValidationTests(GroupConfigStoreTestCase):
 
     def test_set_mode_rejects_invalid_mode(self) -> None:
         with self.assertRaises(ValueError):
-            self.store.set_mode(CHAT_ID, "all")
+            self.store.set_mode(CHAT_ID, "unknown")
 
     def test_activated_must_be_bool(self) -> None:
         self._assert_save_rejected(_activated_config(activated="yes"))
@@ -200,7 +206,7 @@ class FailClosedReadTests(GroupConfigStoreTestCase):
         self._write_raw(
             {
                 "schema_version": GROUP_CONFIG_STORE_SCHEMA_VERSION,
-                "groups": {CHAT_ID: _activated_config(mode="all")},
+                "groups": {CHAT_ID: _activated_config(mode="unknown")},
             }
         )
         self.assertFalse(self.store.is_activated(CHAT_ID))
