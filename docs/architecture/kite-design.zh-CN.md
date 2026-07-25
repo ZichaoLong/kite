@@ -15,8 +15,7 @@
 
 - 本地 TUI wrapper（对应 FOCUS 的 `focus`/`fcodex`)——见
   `docs/decisions/process-shape-and-language.md`。
-- 记忆、语音 ASR、设备操控、文生图、MCP/Skills 热更新——见
-  `docs/research/okbot-vs-focus.md`。
+- 记忆、语音 ASR、设备操控、文生图、MCP/Skills 热更新——永久非目标。
 - session 删除（上游无此能力，不绕过）。
 - 多实例 / 跨实例协调（MVP 单实例为前提；见
   `docs/decisions/concurrency-model.md`)。

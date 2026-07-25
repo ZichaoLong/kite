@@ -21,8 +21,8 @@ Rationale:
    `codex_protocol/client.py`). Choosing Python = replacing those ~1.5k lines +
    revising contracts to kap semantics; choosing TS = rewriting all the other
    38k lines.
-2. **The fork-and-embed route has been disproven.** OKbot proved that the cost
-   of embedding is merging with upstream forever; and since kimi-code is TS,
+2. **The fork-and-embed route has been disproven.** Embedding an agent's
+   internals costs merging with upstream forever; and since kimi-code is TS,
    fork-and-embed physically has no interface to begin with.
 3. **Process isolation is itself an advantage.** A kap-server crash does not
    take down the bridge's state machine; a bridge crash does not take down the

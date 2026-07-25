@@ -17,7 +17,7 @@ kap-server 以库形式导出 `startServer()`，理论上 KITE 可以是一个 T
    (977 + 559,2026-07-21 实测；`adapters/codex_app_server.py` +
    `codex_protocol/client.py`)。选 Python
    = 换掉这 ~1.5k 行 + 按 kap 语义修订合同；选 TS = 其余 3.8 万行全部重写。
-2. **fork 内嵌路线已被证伪。** OKbot 证明内嵌的代价是跟上游 merge 到死;
+2. **fork 内嵌路线已被证伪。** 内嵌 agent 内部的代价是跟上游 merge 到死；
    且 kimi-code 是 TS,fork 内嵌在物理上就不存在接口。
 3. **进程隔离本身是优点。** kap-server 崩溃不带走桥的状态机；桥崩溃不带走
    session runtime。FOCUS 的 managed 模式已验证这个形态。

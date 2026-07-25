@@ -54,8 +54,7 @@ If it cannot answer, cut the requirement. No exceptions.
 - Session delete, fork, compact, undo (upstream capabilities exist, but the
   MVP does not expose them; exposing them requires their own contracts and
   tests)
-- Memory, voice, device control, MCP/Skills management (permanent non-goals,
-  see `docs/research/okbot-vs-focus.md`)
+- Memory, voice, device control, MCP/Skills management (permanent non-goals)
 
 ## 3. Concurrency Behavior (cross-referenced with concurrency-model.md)
 

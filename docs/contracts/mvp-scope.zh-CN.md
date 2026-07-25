@@ -48,8 +48,7 @@
 - 多实例、多飞书应用
 - session 删除、fork、compact、undo（上游能力存在，但 MVP 不暴露；
   暴露即需各自的合同与测试）
-- 记忆、语音、设备操控、MCP/Skills 管理（永久 Non-goal，见
-  `docs/research/okbot-vs-focus.md`)
+- 记忆、语音、设备操控、MCP/Skills 管理（永久 Non-goal)
 
 ## 3. 并发行为（与 concurrency-model.md 互为引用）
 

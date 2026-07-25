@@ -1,7 +1,7 @@
 # kap-server Usability Investigation
 
 > Type: research (evidence material, not a contract). Investigation date: 2026-07-21.
-> Subject: `packages/kap-server` and its surroundings within the `~/llm/kimi/kimi-code` monorepo
+> Subject: `packages/kap-server` and its surroundings within the kimi-code monorepo
 > (`apps/kimi-code`, `apps/kimi-web`, `packages/klient`, `packages/agent-core-v2`).
 > kap-server evolves extremely fast; facts in this document may go stale. When they conflict with the latest upstream code, the upstream code wins.
 

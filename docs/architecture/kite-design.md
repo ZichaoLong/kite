@@ -14,8 +14,8 @@
 
 - Local TUI wrapper (the counterpart of FOCUS's `focus`/`fcodex`) — see
   `docs/decisions/process-shape-and-language.md`.
-- Memory, voice ASR, device control, text-to-image, MCP/Skills hot reload — see
-  `docs/research/okbot-vs-focus.md`.
+- Memory, voice ASR, device control, text-to-image, MCP/Skills hot reload —
+  permanent non-goals.
 - Session deletion (upstream has no such capability; do not work around it).
 - Multi-instance / cross-instance coordination (MVP assumes a single instance; see
   `docs/decisions/concurrency-model.md`).

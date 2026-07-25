@@ -87,8 +87,6 @@ Status guidance:
 
 - [`kap-server-usability.md`](./research/kap-server-usability.zh-CN.md)
   - kap-server 可用性调查（生命周期、认证、API 覆盖、事件模型、并发语义、成熟度、缺口）
-- [`okbot-vs-focus.md`](./research/okbot-vs-focus.zh-CN.md)
-  - 对标项目 OKbot 与 FOCUS 的对比；OKbot 路线的教训
 - [`focus-assets-map.md`](./research/focus-assets-map.zh-CN.md)
   - 从 FOCUS 借鉴什么、为什么（生命周期、鲁棒性、单一事实源资产），映射到已准入的 Phase 2 功能
 
@@ -106,7 +104,7 @@ Status guidance:
 | spike 实测观察到什么、修正了哪些文档事实？ | [`spike-results.md`](./verification/spike-results.zh-CN.md) |
 | 哪些 Phase 2 功能已准入、各在什么合同下？ | [`streaming-cards.md`](./contracts/streaming-cards.zh-CN.md), [`images.md`](./contracts/images.zh-CN.md), [`group-chat.md`](./contracts/group-chat.zh-CN.md) |
 | 为什么 kitectl 要经 loopback 控制面做变更？ | [`control-plane.md`](./decisions/control-plane.zh-CN.md), [`focus-assets-map.md`](./research/focus-assets-map.zh-CN.md) |
-| 为什么不做 memory / ASR / 设备控制？ | [`okbot-vs-focus.md`](./research/okbot-vs-focus.zh-CN.md), [`mvp-scope.md`](./contracts/mvp-scope.zh-CN.md) |
+| 为什么不做 memory / ASR / 设备控制？ | [`mvp-scope.md`](./contracts/mvp-scope.zh-CN.md) |
 
 ## Language
 

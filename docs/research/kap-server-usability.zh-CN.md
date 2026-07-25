@@ -1,7 +1,7 @@
 # kap-server 可用性调查
 
 > 类型：research（证据材料，非合同）。调查时间：2026-07-21。
-> 调查对象：`~/llm/kimi/kimi-code` monorepo 内 `packages/kap-server` 及周边
+> 调查对象：kimi-code monorepo 内 `packages/kap-server` 及周边
 > （`apps/kimi-code`、`apps/kimi-web`、`packages/klient`、`packages/agent-core-v2`)。
 > kap-server 演进极快，本文事实可能过时；与上游最新代码冲突时以上游代码为准。
 

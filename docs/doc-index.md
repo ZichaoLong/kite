@@ -90,8 +90,6 @@ Status guidance:
 
 - [`kap-server-usability.md`](./research/kap-server-usability.md)
   - kap-server usability survey (lifecycle, authentication, API coverage, event model, concurrency semantics, maturity, gaps)
-- [`okbot-vs-focus.md`](./research/okbot-vs-focus.md)
-  - comparison of the benchmark project OKbot with FOCUS; lessons from the OKbot route
 - [`focus-assets-map.md`](./research/focus-assets-map.md)
   - what to borrow from FOCUS and why (lifecycle, robustness, SSOT assets), mapped to the admitted Phase 2 features
 
@@ -109,7 +107,7 @@ Status guidance:
 | What did the spike observe, and which doc facts did it correct? | [`spike-results.md`](./verification/spike-results.md) |
 | Which Phase 2 features are admitted, and under what contracts? | [`streaming-cards.md`](./contracts/streaming-cards.md), [`images.md`](./contracts/images.md), [`group-chat.md`](./contracts/group-chat.md) |
 | Why does kitectl mutate through a loopback control plane? | [`control-plane.md`](./decisions/control-plane.md), [`focus-assets-map.md`](./research/focus-assets-map.md) |
-| Why no memory / ASR / device control? | [`okbot-vs-focus.md`](./research/okbot-vs-focus.md), [`mvp-scope.md`](./contracts/mvp-scope.md) |
+| Why no memory / ASR / device control? | [`mvp-scope.md`](./contracts/mvp-scope.md) |
 
 ## Language
 

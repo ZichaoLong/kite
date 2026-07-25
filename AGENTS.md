@@ -107,8 +107,8 @@ Keep repository facts out of this file.
 
 ## KITE 特有约定
 
-- **上游 source of truth**:kap-server 行为以 `~/llm/kimi/kimi-code` 的实际代码为准；二手描述不可信时先读上游代码。
-- **架构蓝本**:FOCUS(`~/llm/focus`)。复用其上游无关资产（飞书传输层、卡片、RuntimeLoop、stores、service 管理）时，按 KITE 词汇（session/agent/prompt/approval/question）重命名，不保留 codex 术语。
+- **上游 source of truth**:kap-server 行为以 kimi-code 仓库的实际代码为准（引用一律用仓库相对路径，如 `packages/kap-server/src/...`)；二手描述不可信时先读上游代码。
+- **架构蓝本**:FOCUS（姊妹仓库，引用为 `bot/...`)。复用其上游无关资产（飞书传输层、卡片、RuntimeLoop、stores、service 管理）时，按 KITE 词汇（session/agent/prompt/approval/question）重命名，不保留 codex 术语。
 - **上游版本跟随，不钉死**（2026-07-21 对齐）：不指望长期停留在一个旧 kimi-code 版本上；CI 必须有 kap-server OpenAPI 快照 diff 护栏感知漂移；安装/启动做版本检测，与已验证版本不符时警告但不阻止运行。
 - **安装纪律**（沿用 FOCUS）：不使用 `pip install .` / `pip install -e .`；唯一支持的安装路径是仓库提供的 install 脚本。
 
