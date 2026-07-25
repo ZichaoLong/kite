@@ -65,6 +65,11 @@ class SessionListTests(KitectlTestCase):
 
         self.assertEqual(code, 0)
         self.assertIn("SESSION_ID", out)
+        self.assertIn("s-abc", out)
+        self.assertIn("demo", out)
+        self.assertIn("/work/demo", out)
+        self.assertIn("yes", out)
+        self.assertIn("s-def", out)
 
     def test_lists_sessions_sorted_by_recent_activity(self) -> None:
         old = self.state.create_session("s-old", title="old")
@@ -76,11 +81,6 @@ class SessionListTests(KitectlTestCase):
 
         self.assertEqual(code, 0)
         self.assertLess(out.index("s-new"), out.index("s-old"))
-        self.assertIn("s-abc", out)
-        self.assertIn("demo", out)
-        self.assertIn("/work/demo", out)
-        self.assertIn("yes", out)
-        self.assertIn("s-def", out)
 
     def test_empty_session_list(self) -> None:
         code, out, _ = self._run_cli("session", "list")
