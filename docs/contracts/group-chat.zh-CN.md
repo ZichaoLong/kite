@@ -25,22 +25,25 @@
 
 ## 2. 范围
 
-包含：**`mention_only` 与 `assistant` 两种群模式**。管理员在群内
-  `/group activate` 激活一次；模式经 `/group-mode 〈mention_only|assistant〉`
-  切换（默认 `mention_only`)。
+包含：**`mention_only`、`assistant`、`all` 三种群模式**。管理员在群内
+  `/group activate` 激活一次；模式经
+  `/group-mode 〈mention_only|assistant|all〉` 切换（默认 `mention_only`)。
 
 - `mention_only`：仅成员的 @bot+文字 触发；其余全部忽略（不记日志、
   不留上下文）。
 - `assistant`：成员的每条消息写入每群日志；@bot+文字 触发时，将上次
   触发边界以来的日志作为上下文注入。历史拉取失败则阻断该 prompt 并
   显式提示（fail-closed——绝不静默地不带上下文作答）。
+- `all`：成员的每条消息直接触发 prompt（不注入上下文）。**排他规则**:
+  all 模式群的 session 不得绑定到任何其他 chat（防跨会话噪声）；当
+  session 已被共享时，切到 `all` 以整改文案拒绝；`all` 模式下
+  `/switch`/`/new` 换入共享 session 同样拒绝（FOCUS 的会话访问规则）。
 
 群内斜杠命令仍仅管理员可用。未激活群或陌生人内容一律静默忽略（仅在
 @/斜杠时给一次拒绝提示，不刷屏）。
 
-不含（明确非目标）:`all` 模式（每条消息都触发——会灌爆 FIFO 且需
-  排他规则）、群内 merge_forward、超出操作者规则的按成员 ACL、经
-  kitectl 建群/管群。
+不含（明确非目标）：群内 merge_forward、超出操作者规则的按成员 ACL、
+经 kitectl 建群/管群。
 
 ## 3. 行为合同
 
@@ -80,6 +83,8 @@
 4. 事件缺少发送者身份 → 按非成员处理。
 5. assistant 模式历史拉取失败 → 阻断该 prompt 并显式提示；绝不静默
    地不带上下文作答。
+6. all 模式排他违规（群的 session 已共享或将被共享到其他 chat)→ 模式
+   切换/改绑以整改文案拒绝；绝不静默放行。
 
 ## 5. 锁定行为的测试
 
@@ -87,7 +92,10 @@
   模式（mention_only/assistant)（每格有显式结果）。
 - 激活：仅管理员；重启后保留；deactivate 立即停止全部成员 prompt。
 - 模式切换：`/group-mode` 仅管理员；assistant → 每条成员消息入日志
-  （机器人自身除外）;mention_only → 不写日志。
+  （机器人自身除外）;mention_only → 不写日志；all → 每条成员消息直接
+  触发 prompt。
+- all 排他：session 被其他 chat 共享时切 `all` 拒绝（整改文案）;`all`
+  模式下 `/switch`/`/new` 换入共享 session 拒绝；独占时放行。
 - assistant 上下文：日志/边界与 REST 回填合并、边界三元组去重（同毫
   秒消息）、自身消息过滤、封套结构、上限（50/24h/5s)、拉取失败阻断
   并提示。
@@ -103,8 +111,6 @@
 
 ## 6. 推迟项与指引
 
-- `all` 模式（每条消息都触发）：需排他规则以防跨会话噪声共享;
-  FOCUS 的 `thread_access_policy.py` 是参考设计（资产地图 §1)。
 - 群内合并转发：聚合器目前仅单聊（转发不携带 @,mention_only 群按
   定义丢弃）；群内准入需要单独的触发语义决策。
 - 群内富 question 表单：同操作者规则，无需新合同。

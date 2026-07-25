@@ -28,9 +28,9 @@
 
 ## 2. Scope
 
-In: **`mention_only` and `assistant` group modes.** An admin activates a
-group once (`/group activate`); the mode is switchable via
-`/group-mode 〈mention_only|assistant〉` (default `mention_only`).
+In: **`mention_only`, `assistant`, and `all` group modes.** An admin
+activates a group once (`/group activate`); the mode is switchable via
+`/group-mode 〈mention_only|assistant|all〉` (default `mention_only`).
 
 - `mention_only`: only @bot + text from members triggers; everything else is
   ignored (no logging, no context).
@@ -38,13 +38,18 @@ group once (`/group activate`); the mode is switchable via
   text triggers with the log since the last trigger boundary injected as
   context. History fetch failure blocks the prompt with an explicit notice
   (fail-closed — never answer silently without the context).
+- `all`: every member message triggers a prompt directly (no context
+  injection). **Exclusivity rule**: an all-mode group's session may not be
+  bound to any other chat (noise pollution across chats); switching to
+  `all` is denied with a remediation text when the session is shared, and
+  `/switch`/`/new` into a shared session while in `all` mode is denied the
+  same way (FOCUS's thread-access rule).
 
 Slash commands in groups stay admin-only. Deactivated or stranger content is
 silently ignored (one denial hint on @/slash, no spam).
 
-Out (explicit non-goals for now): `all` mode (every message triggers —
-floods the FIFO and needs an exclusivity rule), merge_forward in groups,
-per-member ACL beyond the actor rule, group creation/admin via kitectl.
+Out (explicit non-goals for now): merge_forward in groups, per-member ACL
+beyond the actor rule, group creation/admin via kitectl.
 
 ## 3. Behavior Contract
 
@@ -93,6 +98,9 @@ per-member ACL beyond the actor rule, group creation/admin via kitectl.
 4. Sender identity missing from an event → treat as non-member.
 5. Assistant-mode history fetch failure → the prompt is blocked with an
    explicit notice; never answer without the context (no silent fallback).
+6. All-mode exclusivity violation (the group's session is or would be
+   shared with another chat) → mode switch / rebind denied with the
+   remediation text; never silently allowed.
 
 ## 5. Tests That Lock the Behavior
 
@@ -102,7 +110,11 @@ per-member ACL beyond the actor rule, group creation/admin via kitectl.
 - Activation: admin-only; persists across restart; deactivate stops all
   member prompting immediately.
 - Mode switching: `/group-mode` admin-only; assistant → every member
-  message logged (bot's own excluded); mention_only → nothing logged.
+  message logged (bot's own excluded); mention_only → nothing logged;
+  all → every member message triggers a plain prompt.
+- All-mode exclusivity: mode switch to `all` denied when the session is
+  shared with another chat (remediation text); `/switch`/`/new` into a
+  shared session while in `all` mode denied; allowed when exclusive.
 - Assistant context: log/boundary merge with REST backfill, boundary-triple
   dedup (same-millisecond messages), self-app filtering, envelope shape,
   limits (50/24h/5s), fetch failure blocks with the notice.
@@ -119,9 +131,6 @@ per-member ACL beyond the actor rule, group creation/admin via kitectl.
 
 ## 6. Deferred With Pointers
 
-- `all` mode (every message triggers): needs an exclusivity rule against
-  noisy cross-chat thread sharing; FOCUS's `thread_access_policy.py` is the
-  reference design (asset map §1).
 - Merge-forward in groups: the aggregator is p2p-only today (forwards never
   carry @mention, so mention_only groups drop them); admitting them in
   groups needs its own trigger-semantics decision.
