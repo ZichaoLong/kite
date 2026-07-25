@@ -19,6 +19,9 @@ Covers the group-chat contract (docs/contracts/group-chat.md):
   exclusivity (§4.6): /group-mode all is denied with a remediation text
   while the session is shared, /switch|/new into a shared session while in
   all mode is denied the same way, and switching back down lifts the rule;
+  reverse exclusivity (§3.8): any other chat (p2p or group) rebinding into
+  a session an attached all-mode group occupies is denied with the
+  remediation text naming the occupier;
 - merge-forward in groups (§3.7): mention_only drops silently, assistant
   logs the flattened bundle as context material without a reply (a fetch
   failure drops quietly), all aggregates through the shared window into a
@@ -1250,6 +1253,133 @@ class GroupMergeForwardTests(GroupChatTestCase):
 
         self.assertEqual(self.rest.submissions, [])
         self.assertEqual(self.transport.replies, [])
+
+
+# ---------------------------------------------------------------------------
+# All-mode reverse exclusivity (§3.8): no chat rebinds into an occupied session
+# ---------------------------------------------------------------------------
+
+
+class AllModeReverseExclusivityTests(GroupChatTestCase):
+    def occupy_all_mode_session(
+        self,
+        session_id: str = "s-1",
+        *,
+        group_chat_id: str = GROUP_CHAT_ID,
+        attached: bool = True,
+    ) -> None:
+        """An activated all-mode group bound to ``session_id`` (the occupier)."""
+        self.bind(session_id, chat_id=group_chat_id, attached=attached)
+        self.rest.add_session(session_id)
+        self.activate_group(group_chat_id, mode=GROUP_MODE_ALL)
+
+    def test_p2p_switch_into_occupied_session_denied(self) -> None:
+        self.occupy_all_mode_session("s-1")
+        self.send("/switch s-1")
+        text = self.transport.last_text()
+        self.assertIn("all 模式", text)
+        self.assertIn("被拒绝", text)
+        # The remediation names the occupying group and the way out (§3.8).
+        self.assertIn(f"`{GROUP_CHAT_ID}`", text)
+        self.assertIn("/group-mode", text)
+        self.assertIn("/detach", text)
+        # The would-be newcomer stays unbound; no session got subscribed.
+        self.assertIsNone(self.store.load(CHAT_ID))
+        self.assertEqual(self.bound_sessions, [])
+
+    def test_p2p_switch_denied_leaves_existing_binding_untouched(self) -> None:
+        self.occupy_all_mode_session("s-1")
+        self.bind("s-2")
+        self.rest.add_session("s-2")
+        self.send("/switch s-1")
+        self.assertIn("被拒绝", self.transport.last_text())
+        binding = self.store.load(CHAT_ID)
+        assert binding is not None
+        self.assertEqual(binding["session_id"], "s-2")
+
+    def test_detached_occupier_lifts_the_denial(self) -> None:
+        # Symmetric with the forward rule: a detached occupier neither
+        # prompts nor receives broadcasts, so it does not occupy (§3.8).
+        self.occupy_all_mode_session("s-1", attached=False)
+        self.send("/switch s-1")
+        self.assertIn("已切换到会话", self.transport.last_text())
+        binding = self.store.load(CHAT_ID)
+        assert binding is not None
+        self.assertEqual(binding["session_id"], "s-1")
+
+    def test_occupier_group_rebinding_own_session_is_not_denied(self) -> None:
+        # The reverse rule only bites for OTHER chats; the group re-binding
+        # its own session is the forward path's business (§3.8).
+        self.occupy_all_mode_session("s-1")
+        self.send_group("/switch s-1", sender=ADMIN_OPEN_ID, mentioned=False)
+        self.assertIn("当前已绑定该会话", self.transport.last_text())
+        self.assertNotIn("被拒绝", self.transport.last_text())
+
+    def test_reverse_denial_does_not_fire_for_assistant_mode(self) -> None:
+        self.bind_group("s-1")
+        self.rest.add_session("s-1")
+        self.activate_group(mode=GROUP_MODE_ASSISTANT)
+        self.send("/switch s-1")
+        self.assertIn("已切换到会话", self.transport.last_text())
+
+    def test_reverse_denial_does_not_fire_for_mention_only_mode(self) -> None:
+        self.bind_group("s-1")
+        self.rest.add_session("s-1")
+        self.activate_group(mode=GROUP_MODE_MENTION_ONLY)
+        self.send("/switch s-1")
+        self.assertIn("已切换到会话", self.transport.last_text())
+
+    def test_reverse_denial_does_not_fire_when_occupier_deactivated(self) -> None:
+        # A deactivated record keeps the all-mode preference but is inert:
+        # the group's own ingress ignores everything, so it cannot occupy.
+        self.occupy_all_mode_session("s-1")
+        self.group_config_store.deactivate(GROUP_CHAT_ID)
+        self.send("/switch s-1")
+        self.assertIn("已切换到会话", self.transport.last_text())
+
+    def test_group_switch_into_occupied_session_denied(self) -> None:
+        # §3.8 covers any other chat — p2p or group.
+        self.occupy_all_mode_session("s-1")
+        self.send_group("/switch s-1", sender=ADMIN_OPEN_ID, chat_id="oc_group_2", mentioned=False)
+        text = self.transport.last_text()
+        self.assertIn("被拒绝", text)
+        self.assertIn(f"`{GROUP_CHAT_ID}`", text)
+        self.assertIsNone(self.store.load("oc_group_2"))
+
+    def test_switch_card_button_into_occupied_session_denied(self) -> None:
+        # The /sessions card buttons share the /switch path (same gate).
+        self.occupy_all_mode_session("s-1")
+        response = self.handler.on_card_action(
+            make_card_action(
+                {"action": ACTION_SESSION_SWITCH, "session_id": "s-1"},
+                operator=ADMIN_OPEN_ID,
+                chat_id=CHAT_ID,
+            )
+        )
+        self.assertEqual(response.toast_type, "error")
+        self.assertIn(f"`{GROUP_CHAT_ID}`", response.toast)
+        self.assertIsNone(self.store.load(CHAT_ID))
+
+    def test_first_use_plain_text_creates_fresh_session_despite_occupation(self) -> None:
+        # Plain first-use creates a FRESH session, which no all-mode group
+        # can occupy — the reverse rule never fires on this path.
+        self.occupy_all_mode_session("s-1")
+        self.send("做点事")
+        self.assertEqual(len(self.rest.submissions), 1)
+        binding = self.store.load(CHAT_ID)
+        assert binding is not None
+        self.assertEqual(binding["session_id"], "s-2")
+        self.assertNotIn("被拒绝", self.transport.last_text())
+
+    def test_new_creates_fresh_session_despite_occupation(self) -> None:
+        self.occupy_all_mode_session("s-1")
+        self.bind("s-2")
+        self.rest.add_session("s-2")
+        self.send("/new")
+        self.assertIn("已创建并绑定新会话", self.transport.last_text())
+        binding = self.store.load(CHAT_ID)
+        assert binding is not None
+        self.assertEqual(binding["session_id"], "s-3")
 
 
 if __name__ == "__main__":

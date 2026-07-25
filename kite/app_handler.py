@@ -33,7 +33,9 @@ Implements the MVP inbound contract (docs/contracts/mvp-scope.md):
   log, no context injection); the mode requires an exclusive session, so
   /group-mode all and /switch|/new rebinds run the all-mode exclusivity
   preflight (kite/preflights.py) and deny with a remediation text when the
-  session is or would be shared (contract §2, fail-closed §4.6). Group
+  session is or would be shared (contract §2, fail-closed §4.6); the rule
+  applies in both directions (§3.8) — any chat rebinding into a session an
+  all-mode group already occupies is denied the same way. Group
   activation config lives in the GroupConfigStore (state axis 5);
 - merge_forward bundles: each merge_forward message's children are fetched
   and buffered per (sender, chat) by the ForwardAggregator; a short window
@@ -1124,6 +1126,26 @@ class AppHandler(TransportHandler):
         except KapError as exc:
             self._reply(chat_id, f"创建会话失败：{exc.msg}")
             return None
+        # Reverse all-mode exclusivity (group-chat §3.8): plain first-use
+        # creates a FRESH session, which no all-mode group can occupy — the
+        # probe is the fail-closed assertion of that invariant (the same
+        # discipline as the /new forward probe). Binding into an EXISTING
+        # session only ever happens in _switch_to_session.
+        occupied = preflights.all_mode_session_occupied(
+            chat_id,
+            self._binding_store,
+            self._group_config_store,
+            session_id=info.session_id,
+        )
+        if not occupied.allowed:
+            logger.info(
+                "first-use bind denied chat_id=%s session_id=%s reason_code=%s",
+                chat_id,
+                info.session_id,
+                occupied.reason_code,
+            )
+            self._reply(chat_id, occupied.reason_text)
+            return None
         binding: StoredBinding = {
             "session_id": info.session_id,
             "attached": DEFAULT_ATTACHED,
@@ -1959,6 +1981,23 @@ class AppHandler(TransportHandler):
                 exclusive.reason_code,
             )
             return False, exclusive.reason_text
+        # Reverse exclusivity (group-chat §3.8): no chat — p2p or group —
+        # may rebind into a session a DIFFERENT chat already occupies as an
+        # attached all-mode group. The requester's own mode is irrelevant.
+        occupied = preflights.all_mode_session_occupied(
+            chat_id,
+            self._binding_store,
+            self._group_config_store,
+            session_id=session_id,
+        )
+        if not occupied.allowed:
+            logger.info(
+                "session switch denied chat_id=%s session_id=%s reason_code=%s",
+                chat_id,
+                session_id,
+                occupied.reason_code,
+            )
+            return False, occupied.reason_text
         binding: StoredBinding = {
             "session_id": session_id,
             "attached": True,

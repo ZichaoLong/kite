@@ -20,7 +20,9 @@ Covered here:
 - all-mode group exclusivity (group-chat contract §2, fail-closed §4.6):
   ``/group-mode all`` and ``/switch``/``/new`` rebinds verify the all-mode
   group's session is not bound to any other attached chat and deny with a
-  remediation text otherwise (FOCUS thread-access-policy port).
+  remediation text otherwise (FOCUS thread-access-policy port). The rule
+  applies in both directions (§3.8): any other chat rebinding into a
+  session an all-mode group already occupies is denied the same way.
 
 Only normalized adapter types are consumed; kap wire knowledge stays in the
 adapter.
@@ -39,6 +41,7 @@ from kite.stores.group_config_store import GROUP_MODE_ALL, GroupConfigStore
 NEW_DENIED_BY_ACTIVE_PROMPT = "new_denied_by_active_prompt"
 DETACH_NOTE_ACTIVE_PROMPT = "detach_note_active_prompt"
 GROUP_ALL_MODE_SESSION_SHARED = "group_all_mode_session_shared"
+GROUP_ALL_MODE_SESSION_OCCUPIED = "group_all_mode_session_occupied"
 
 NEW_ACTIVE_PROMPT_REASON_TEXT = "当前有执行中的 prompt，请先 /abort 或等待完成。"
 DETACH_ACTIVE_PROMPT_NOTE = "执行中的 prompt 仍在继续，推送已暂停。"
@@ -152,6 +155,67 @@ def _all_mode_session_shared_text(other_chat_ids: Sequence[str]) -> str:
         f"（{chats}），本次操作被拒绝。"
         "请先在那些聊天中发送 /detach（或将它们 /switch 到其他会话），"
         "或将本群 /switch 到一个未被共享的会话，然后重试。"
+    )
+
+
+def all_mode_session_occupied(
+    chat_id: str,
+    binding_store: BindingStore,
+    group_config_store: GroupConfigStore,
+    *,
+    session_id: str,
+) -> ReasonedCheck:
+    """Reverse all-mode exclusivity (group-chat §3.8, fail-closed §4.6).
+
+    The exclusivity rule applies in both directions: any chat (p2p or
+    group) rebinding into a session a DIFFERENT chat already occupies as an
+    activated, attached all-mode group is denied — otherwise the newcomer
+    would start receiving (and sharing) every member message's prompt
+    traffic. The denial names the occupying group(s) plus the remediation;
+    it is never silently allowed.
+
+    Edge rules, symmetric with the forward probe: a DETACHED occupier is
+    inert (it can neither prompt nor receive broadcasts) and lifts the
+    denial; the occupying group re-binding its OWN session is not a denial
+    case here (that is the forward rule's business); a deactivated or
+    corrupt-config record reads as non-all (store fail-closed convention),
+    so it never occupies.
+    """
+    normalized_chat_id = str(chat_id or "").strip()
+    normalized_session_id = str(session_id or "").strip()
+    if not normalized_chat_id or not normalized_session_id:
+        return ReasonedCheck.allow()
+    occupier_chat_ids = sorted(
+        candidate
+        for candidate, candidate_binding in binding_store.load_all().items()
+        if candidate != normalized_chat_id
+        and candidate_binding["session_id"] == normalized_session_id
+        and candidate_binding["attached"]
+        and _is_all_mode_group(group_config_store, candidate)
+    )
+    if not occupier_chat_ids:
+        return ReasonedCheck.allow()
+    return ReasonedCheck.deny(
+        GROUP_ALL_MODE_SESSION_OCCUPIED,
+        _all_mode_session_occupied_text(occupier_chat_ids),
+    )
+
+
+def _is_all_mode_group(group_config_store: GroupConfigStore, chat_id: str) -> bool:
+    config = group_config_store.load(chat_id)
+    return bool(
+        config is not None
+        and config["activated"]
+        and config["mode"] == GROUP_MODE_ALL
+    )
+
+
+def _all_mode_session_occupied_text(occupier_chat_ids: Sequence[str]) -> str:
+    chats = "、".join(f"`{chat_id}`" for chat_id in occupier_chat_ids)
+    return (
+        f"该会话正被 all 模式的群聊（{chats}）独占，本次操作被拒绝。"
+        "请先将该群的群聊模式切回 mention_only / assistant"
+        "（在该群中发送 /group-mode），或在该群中发送 /detach，然后重试。"
     )
 
 
