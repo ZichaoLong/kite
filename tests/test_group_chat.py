@@ -19,6 +19,11 @@ Covers the group-chat contract (docs/contracts/group-chat.md):
   exclusivity (§4.6): /group-mode all is denied with a remediation text
   while the session is shared, /switch|/new into a shared session while in
   all mode is denied the same way, and switching back down lifts the rule;
+- merge-forward in groups (§3.7): mention_only drops silently, assistant
+  logs the flattened bundle as context material without a reply (a fetch
+  failure drops quietly), all aggregates through the shared window into a
+  plain prompt with the forwarder as owner, and a mid-window mode flip
+  fails closed;
 - /abort gating in groups (§3.4): initiator or admin, everyone else denied;
 - fail-closed corruption (§4.3) and missing identity (§4.4).
 
@@ -39,6 +44,8 @@ from test_app_handler import (
     DEFAULT_CWD,
     AppHandlerTestCase,
     make_card_action,
+    make_forward_item,
+    make_merge_forward,
 )
 from test_group_history import (
     FakeListMessages,
@@ -1124,6 +1131,125 @@ class AllModeExclusivityTests(GroupChatTestCase):
         self.send_group("切换后继续", sender=MEMBER_OPEN_ID, mentioned=False)
         self.assertEqual(len(self.rest.submissions), 1)
         self.assertEqual(self.rest.submissions[0]["session_id"], "s-2")
+
+
+# ---------------------------------------------------------------------------
+# Merge-forward in groups (§3.7): trigger semantics per mode
+# ---------------------------------------------------------------------------
+
+
+class GroupMergeForwardTests(GroupChatTestCase):
+    def _forward(self, *, sender: str = MEMBER_OPEN_ID, message_id: str = "om_fwdg") -> None:
+        self.handler.on_merge_forward(
+            make_merge_forward(
+                chat_id=GROUP_CHAT_ID,
+                chat_type="group",
+                sender=sender,
+                message_id=message_id,
+            )
+        )
+
+    def test_mention_only_drops_forward_silently(self) -> None:
+        self.bind_group("s-1")
+        self.rest.add_session("s-1")
+        self.activate_group()  # mention_only
+        self.transport.merge_forward_items = [make_forward_item("om_c1", text="群里的转发")]
+
+        self._forward()
+
+        # A forward never carries an @mention: no fetch, no window, no
+        # prompt, no reply, no log (§3.7).
+        self.assertEqual(self.transport.merge_forward_fetches, [])
+        self.assertEqual(self.forward_timers, [])
+        self.assert_no_reaction()
+        self.assertEqual(self.log_texts(), [])
+
+    def test_assistant_mode_logs_forward_without_reply(self) -> None:
+        self.bind_group("s-1")
+        self.rest.add_session("s-1")
+        self.activate_group(mode=GROUP_MODE_ASSISTANT)
+        self.transport.merge_forward_items = [
+            make_forward_item("om_c1", text="转发的内容", sender_id="ou_alice"),
+        ]
+
+        self._forward()
+
+        # Context material only: fetched and logged, never a trigger, a
+        # reply, or an aggregation window (§3.7).
+        self.assertEqual(self.transport.merge_forward_fetches, ["om_fwdg"])
+        self.assertEqual(self.forward_timers, [])
+        self.assert_no_reaction()
+        entries = self.group_log_store.entries_since(GROUP_CHAT_ID, 0)
+        self.assertEqual(len(entries), 1)
+        entry = entries[0]
+        # Same shape as a member message, marked as forwarded content.
+        self.assertEqual(entry["msg_type"], "merge_forward")
+        self.assertEqual(entry["sender_open_id"], MEMBER_OPEN_ID)
+        self.assertEqual(entry["sender_name"], "成员小王")
+        self.assertIn("<forwarded_messages>", entry["text"])
+        self.assertIn("转发的内容", entry["text"])
+
+    def test_assistant_mode_forward_fetch_failure_drops_quietly(self) -> None:
+        self.bind_group("s-1")
+        self.rest.add_session("s-1")
+        self.activate_group(mode=GROUP_MODE_ASSISTANT)
+        self.transport.merge_forward_error = RuntimeError("network down")
+
+        self._forward()
+
+        # Dropped with a log line only: no reply, no log entry, no prompt.
+        self.assert_no_reaction()
+        self.assertEqual(self.log_texts(), [])
+        self.assertEqual(self.forward_timers, [])
+
+    def test_all_mode_forward_aggregates_and_submits(self) -> None:
+        self.bind_group("s-1")
+        self.rest.add_session("s-1")
+        self.activate_group(mode=GROUP_MODE_ALL)
+        self.transport.merge_forward_items = [make_forward_item("om_c1", text="第一段")]
+
+        self._forward(sender=MEMBER_OPEN_ID, message_id="om_fwd1")
+
+        # Buffered, not yet submitted: the aggregation window is still open.
+        self.assertEqual(self.transport.merge_forward_fetches, ["om_fwd1"])
+        self.assertEqual(len(self.forward_timers), 1)
+        self.assertEqual(self.rest.submissions, [])
+
+        self.forward_timers[-1].fire()
+
+        self.assertEqual(len(self.rest.submissions), 1)
+        submission = self.rest.submissions[0]
+        self.assertEqual(submission["session_id"], "s-1")
+        content = submission["body"]["content"]
+        self.assertEqual([part["type"] for part in content], ["text"])
+        text = content[0]["text"]
+        self.assertIn("<forwarded_messages>", text)
+        self.assertIn("第一段", text)
+        # Ownership records the forwarder: actor rules (§3.4) still work.
+        entry = self.handler.prompt_ownership.entry_of(submission["prompt_id"])
+        assert entry is not None
+        self.assertEqual(entry.chat_id, GROUP_CHAT_ID)
+        self.assertEqual(entry.sender_open_id, MEMBER_OPEN_ID)
+        # The ack threads to the original merge_forward message.
+        self.assertIn("已提交", self.transport.last_text())
+        self.assertEqual(self.transport.replies[-1]["parent_message_id"], "om_fwd1")
+        # All mode never touches the assistant log axis.
+        self.assertEqual(self.log_texts(), [])
+
+    def test_all_mode_forward_dropped_when_mode_flips_inside_window(self) -> None:
+        self.bind_group("s-1")
+        self.rest.add_session("s-1")
+        self.activate_group(mode=GROUP_MODE_ALL)
+        self.transport.merge_forward_items = [make_forward_item("om_c1", text="第一段")]
+        self._forward()
+        self.assertEqual(len(self.forward_timers), 1)
+
+        # The mode flips before the window flushes: fail closed, never prompt.
+        self.group_config_store.set_mode(GROUP_CHAT_ID, GROUP_MODE_MENTION_ONLY)
+        self.forward_timers[-1].fire()
+
+        self.assertEqual(self.rest.submissions, [])
+        self.assertEqual(self.transport.replies, [])
 
 
 if __name__ == "__main__":

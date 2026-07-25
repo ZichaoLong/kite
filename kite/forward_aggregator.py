@@ -1,10 +1,10 @@
 """Merge-forward aggregation for inbound Feishu merge_forward messages.
 
 Ported from FOCUS ``bot/forward_aggregator.py``, cut to KITE's group contract
-(docs/contracts/group-chat.md): FOCUS's group-mode matrix (all / assistant /
-log-only) does not exist here — KITE groups are mention_only and a forward
-never carries an @mention, so group forwards are dropped by the handler at
-ingress and never reach this aggregator. What remains is the p2p core:
+(docs/contracts/group-chat.md §3.7): group forwards dispatch per mode at
+ingress — mention_only groups drop them, assistant-mode groups append the
+flattened transcript to the group log via ``render_transcript()`` (never a
+trigger), and all-mode groups buffer here exactly like p2p. The shared core:
 
 - Feishu delivers one forwarded bundle as N separate merge_forward messages;
   ``buffer()`` keeps them per (sender, chat) and (re)arms a short aggregation
@@ -69,13 +69,16 @@ class MergedForwardBatch:
 
     ``message_id`` is the latest buffered merge_forward message and serves as
     the reply anchor; ``text`` is the full ``<forwarded_messages>`` transcript
-    covering every bundle buffered in the window.
+    covering every bundle buffered in the window. ``chat_type`` carries the
+    ingress chat kind through the timer hop so the handler can dispatch the
+    flush (p2p prompt path vs all-mode group path, group-chat §3.7).
     """
 
     chat_id: str
     sender_open_id: str
     message_id: str
     text: str
+    chat_type: str
 
 
 @dataclass(slots=True)
@@ -88,6 +91,7 @@ class _BufferedForward:
 class _PendingForward:
     bundles: list[_BufferedForward] = field(default_factory=list)
     timer: Optional[_Timer] = field(default=None, repr=False)
+    chat_type: str = "p2p"
 
 
 class ForwardAggregator:
@@ -135,6 +139,7 @@ class ForwardAggregator:
         chat_id: str,
         message_id: str,
         items: list[Any],
+        chat_type: str = "p2p",
     ) -> None:
         """Add one merge_forward bundle to the window and (re)arm the timer."""
         key = (sender_open_id, chat_id)
@@ -158,6 +163,7 @@ class ForwardAggregator:
             pending.bundles.append(
                 _BufferedForward(message_id=message_id, items=list(items))
             )
+            pending.chat_type = chat_type
             pending.timer = timer
             bundle_count = len(pending.bundles)
         timer.start()
@@ -207,6 +213,7 @@ class ForwardAggregator:
                     sender_open_id=sender_open_id,
                     message_id=pending.bundles[-1].message_id,
                     text=text,
+                    chat_type=pending.chat_type,
                 )
             )
         except Exception:  # noqa: BLE001 - a timer thread must never die noisy
@@ -234,6 +241,19 @@ class ForwardAggregator:
     # ------------------------------------------------------------------
     # Expansion / rendering
     # ------------------------------------------------------------------
+
+    def render_transcript(self, root_message_id: str, items: list[Any]) -> str:
+        """Render one fetched bundle as the full ``<forwarded_messages>``
+        transcript; "" when nothing in the bundle is renderable.
+
+        The assistant-mode group path (group-chat §3.7) logs the flattened
+        content directly instead of buffering, and shares the same recursive
+        expansion + tag shape the flush produces.
+        """
+        rendered = self._render_bundle(root_message_id, items)
+        if not rendered:
+            return ""
+        return f"{_FORWARDED_OPEN}\n{rendered}\n{_FORWARDED_CLOSE}"
 
     def _render_bundle(self, root_message_id: str, items: list[Any]) -> str:
         """Render one bundle's flattened child list as an indented transcript.

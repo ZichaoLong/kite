@@ -35,12 +35,14 @@ Implements the MVP inbound contract (docs/contracts/mvp-scope.md):
   preflight (kite/preflights.py) and deny with a remediation text when the
   session is or would be shared (contract §2, fail-closed §4.6). Group
   activation config lives in the GroupConfigStore (state axis 5);
-- merge_forward bundles (p2p only): each merge_forward message's children
-  are fetched and buffered per (sender, chat) by the ForwardAggregator; a
-  short window later the expanded `<forwarded_messages>` transcript enters
-  the normal prompt path (admin-gated like any p2p text). Groups drop
-  forwards at ingress — a forward never carries an @mention, so the
-  mention_only ingress matrix drops it by definition;
+- merge_forward bundles: each merge_forward message's children are fetched
+  and buffered per (sender, chat) by the ForwardAggregator; a short window
+  later the expanded `<forwarded_messages>` transcript enters the normal
+  prompt path (admin-gated like any p2p text). Group forwards dispatch per
+  mode at ingress (group-chat §3.7): mention_only drops them silently (a
+  forward never carries an @mention), assistant appends the flattened
+  transcript to the group log as context material (never a trigger), and
+  all aggregates them through the same window into a plain prompt;
 - the MVP slash commands (/new /sessions /switch /detach /attach /mode
   /plan /group /group-mode /status /abort /help /init); in-flight-work-sensitive commands run
   the reason-coded preflights in kite/preflights.py (/new denies with an
@@ -384,11 +386,11 @@ class AppHandler(TransportHandler):
             ttl_seconds=kite_config.attachment_ttl_seconds(config),
             max_bytes=self._attachment_max_bytes,
         )
-        # Merge-forward aggregation (FOCUS forward_aggregator port, p2p
-        # only): merge_forward children buffer for a short window, then the
-        # merged transcript enters the prompt path as one message. Test
-        # doubles can inject a fake timer factory; production kited injects
-        # the shared IdentityNames cache.
+        # Merge-forward aggregation (FOCUS forward_aggregator port; p2p and
+        # all-mode groups): merge_forward children buffer for a short window,
+        # then the merged transcript enters the prompt path as one message.
+        # Test doubles can inject a fake timer factory; production kited
+        # injects the shared IdentityNames cache.
         if names is None:
             names = IdentityNames(getattr(transport, "fetch_user_name", lambda _open_id: None))
         self._names = names
@@ -728,18 +730,104 @@ class AppHandler(TransportHandler):
 
     def _on_merge_forward_impl(self, message: InboundMergeForward) -> None:
         if message.chat_type == "group":
-            # mention_only ingress matrix (group-chat §3.2): a forward never
-            # carries an @mention, so group forwards are dropped here by
-            # definition — no prompt, no reply, no buffer.
-            logger.info(
-                "merge_forward dropped in group chat=%s message_id=%s",
-                message.chat_id,
-                message.message_id,
-            )
+            self._on_group_merge_forward(message)
             return
         if not self._is_admin(message.sender_open_id):
             self._reply(message.chat_id, _NON_ADMIN_TEXT, parent_message_id=message.message_id)
             return
+        self._buffer_merge_forward(message)
+
+    def _on_group_merge_forward(self, message: InboundMergeForward) -> None:
+        """Group merge_forward dispatch (group-chat §3.7), per mode:
+
+        - mention_only (and non-activated groups): dropped silently — a
+          forward never carries an @mention, so no fetch, no buffer, no reply;
+        - assistant: the flattened transcript joins the group log as context
+          material, never a trigger, never a Feishu reply;
+        - all: buffered through the shared aggregation window and flushed
+          into the normal prompt path like a member text message.
+        """
+        group_config = self._group_config_store.load(message.chat_id)
+        activated = group_config is not None and group_config["activated"]
+        mode = group_config["mode"] if activated else GROUP_MODE_MENTION_ONLY
+        if mode == GROUP_MODE_ASSISTANT:
+            self._log_group_merge_forward(message)
+            return
+        if mode == GROUP_MODE_ALL:
+            sender = message.sender_open_id.strip()
+            if message.sender_type == "app" or (sender and sender == self._bot_open_id()):
+                # The bot's own forwards never trigger (§3.2) — silently.
+                return
+            if not sender:
+                # Missing identity -> non-member (§4.4); never triggers.
+                return
+            self._buffer_merge_forward(message)
+            return
+        logger.info(
+            "merge_forward dropped in group chat=%s message_id=%s",
+            message.chat_id,
+            message.message_id,
+        )
+
+    def _log_group_merge_forward(self, message: InboundMergeForward) -> None:
+        """Assistant-mode cell (§3.7): log the flattened bundle, never trigger.
+
+        Same log entry shape as member messages (sender display name + text),
+        with ``msg_type="merge_forward"`` marking it as forwarded content. A
+        fetch failure or an unrenderable bundle is dropped with a log line —
+        never a Feishu reply.
+        """
+        if self._group_log_store is None:
+            # Same fail-closed as the text path: assistant mode cannot work
+            # without the log axis; drop and log, never reply.
+            logger.error(
+                "assistant mode active but group log not wired: chat=%s",
+                message.chat_id,
+            )
+            return
+        sender = message.sender_open_id.strip()
+        if message.sender_type == "app" or (sender and sender == self._bot_open_id()):
+            # The bot's own forwards never enter the log (§3.2).
+            return
+        if not sender:
+            # Missing identity -> non-member (§4.4); never enters the log.
+            return
+        try:
+            items = self._transport.fetch_merge_forward_items(message.message_id)
+        except Exception as exc:
+            logger.warning(
+                "merge_forward fetch failed in assistant group chat=%s message_id=%s: %s",
+                message.chat_id,
+                message.message_id,
+                exc,
+            )
+            return
+        text = self._forward_aggregator.render_transcript(message.message_id, items)
+        if not text:
+            logger.info(
+                "merge_forward had no renderable content in assistant group chat=%s message_id=%s",
+                message.chat_id,
+                message.message_id,
+            )
+            return
+        self._group_log_store.append(
+            message.chat_id,
+            {
+                "message_id": message.message_id,
+                "created_at": max(int(message.create_time or 0), 0),
+                "sender_open_id": sender,
+                "sender_type": message.sender_type.strip() or "user",
+                "sender_name": self._names.name_of(
+                    sender, sender_type=message.sender_type
+                ),
+                "msg_type": "merge_forward",
+                "text": text,
+            },
+        )
+
+    def _buffer_merge_forward(self, message: InboundMergeForward) -> None:
+        """Fetch one bundle's children and buffer it into the aggregation
+        window (shared by the p2p and all-mode group paths, §3.7)."""
         try:
             items = self._transport.fetch_merge_forward_items(message.message_id)
         except Exception as exc:
@@ -767,6 +855,7 @@ class AppHandler(TransportHandler):
             chat_id=message.chat_id,
             message_id=message.message_id,
             items=items,
+            chat_type=message.chat_type,
         )
 
     def _on_forward_batch(self, batch: MergedForwardBatch) -> None:
@@ -785,7 +874,14 @@ class AppHandler(TransportHandler):
             )
 
     def _submit_merged_forward(self, batch: MergedForwardBatch) -> None:
-        """The flushed transcript enters the normal p2p prompt path."""
+        """The flushed transcript enters the normal prompt path.
+
+        p2p batches ride the p2p path (admin-gated); group batches ride the
+        all-mode group path (group-chat §3.7).
+        """
+        if batch.chat_type == "group":
+            self._submit_group_merged_forward(batch)
+            return
         if not self._is_admin(batch.sender_open_id):
             # Defense in depth: the admin gate ran at ingress; the admin set
             # cannot shrink at runtime, so this never fires in practice.
@@ -797,6 +893,45 @@ class AppHandler(TransportHandler):
             message_id=batch.message_id,
             chat_id=batch.chat_id,
             chat_type="p2p",
+            msg_type="merge_forward",
+            text=batch.text,
+            sender_open_id=batch.sender_open_id,
+            sender_user_id="",
+            sender_type="user",
+            bot_mentioned=False,
+            mentions=[],
+            thread_id="",
+            root_id="",
+            parent_id="",
+            create_time=0,
+        )
+        if self.try_handle_interaction_reply(message):
+            return
+        self._handle_prompt(message)
+
+    def _submit_group_merged_forward(self, batch: MergedForwardBatch) -> None:
+        """All-mode group cell (§3.7): the merged transcript triggers like a
+        member text message — a plain prompt via the normal path, with
+        ownership recording the forwarder so actor rules (§3.4) still work.
+        """
+        group_config = self._group_config_store.load(batch.chat_id)
+        if (
+            group_config is None
+            or not group_config["activated"]
+            or group_config["mode"] != GROUP_MODE_ALL
+        ):
+            # The group was buffered in all mode but the activation/mode
+            # flipped inside the window: fail closed, never prompt on stale
+            # state (mirror of the p2p admin re-check above).
+            logger.info(
+                "merged group forward dropped (no longer all-mode): chat=%s",
+                batch.chat_id,
+            )
+            return
+        message = InboundMessage(
+            message_id=batch.message_id,
+            chat_id=batch.chat_id,
+            chat_type="group",
             msg_type="merge_forward",
             text=batch.text,
             sender_open_id=batch.sender_open_id,

@@ -1520,7 +1520,8 @@ class AttachmentTests(AppHandlerTestCase):
 
 
 # ---------------------------------------------------------------------------
-# Merge-forward aggregation (p2p only; groups drop at ingress)
+# Merge-forward aggregation (p2p + the mention_only group drop; the
+# assistant/all group cells live in test_group_chat.py, §3.7)
 # ---------------------------------------------------------------------------
 
 
