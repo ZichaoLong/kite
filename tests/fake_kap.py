@@ -146,6 +146,29 @@ class FakeKapState:
                     pass
         return frame
 
+    def append_global_event(self, session: FakeSession, event_type: str, payload: Any) -> dict[str, Any]:
+        """Journaled like a durable event but fanned out to EVERY connection,
+        subscribed or not — the 0.29.1 ``event.session.work_changed``
+        semantics (upstream d751b6796; audit U1)."""
+        with self.lock:
+            session.seq += 1
+            frame = {
+                "type": event_type,
+                "seq": session.seq,
+                "epoch": session.epoch,
+                "session_id": session.id,
+                "timestamp": "2026-01-01T00:00:00Z",
+                "payload": payload,
+            }
+            session.journal.append(frame)
+            subscribers = list(self._subscribers.values())
+        for connection, _session_ids in subscribers:
+            try:
+                connection.send(json.dumps(frame))
+            except Exception:  # noqa: BLE001 - a dead subscriber is dropped lazily
+                pass
+        return frame
+
     def register(self, connection: Any) -> int:
         with self.lock:
             key = id(connection)
@@ -180,7 +203,22 @@ class FakeKapState:
             session.pending_questions.append({
                 "question_id": question_id,
                 "session_id": session.id,
-                "items": [{"question": "继续吗？", "options": [{"label": "是"}, {"label": "否"}]}],
+                # Real wire shape (audit T4, upstream routes/questions
+                # toWireQuestion): ``questions[]`` with synthesized ids
+                # ``q_<i>`` / ``opt_<i>_<o>`` and allow_other always
+                # advertised — never the ``items`` key, so adapter parsing
+                # can never silently yield zero items.
+                "questions": [
+                    {
+                        "id": "q_0",
+                        "question": "继续吗？",
+                        "options": [
+                            {"id": "opt_0_0", "label": "是"},
+                            {"id": "opt_0_1", "label": "否"},
+                        ],
+                        "allow_other": True,
+                    }
+                ],
                 "created_at": "2026-01-01T00:00:00Z",
             })
 
@@ -333,8 +371,11 @@ class FakeKapRestHandler(BaseHTTPRequestHandler):
                 "session": _session_wire(session),
                 "messages": {"items": [], "has_more": False},
                 "in_flight_turn": session.in_flight_turn,
-                "pending_approvals": [],
-                "pending_questions": [],
+                # Project the seeded pendings (upstream snapshotSchema): a
+                # hardcoded [] here made question-rebuild tests silently
+                # parse zero items (audit T4).
+                "pending_approvals": list(session.pending_approvals),
+                "pending_questions": list(session.pending_questions),
             }))
             return
         self._send(_envelope(40404, None, "route not found"))

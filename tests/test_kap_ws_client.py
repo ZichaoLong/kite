@@ -1,9 +1,10 @@
 import tempfile
 import time
 import unittest
+import unittest.mock
 
 import fake_kap
-from kite.adapters.kap_server import KapRestClient, KapWsClient
+from kite.adapters.kap_server import KapEvent, KapRestClient, KapWsClient, KapWsError
 from kite.stores.event_cursor_store import EventCursor, EventCursorStore
 
 
@@ -167,6 +168,52 @@ class KapWsClientTests(unittest.TestCase):
         self.assertEqual(error.session_id, "s-1")
         self.assertEqual(error.agent_id, "main")
         self.assertFalse(error.retryable)
+
+    def test_ack_not_found_drops_session_from_wanted(self) -> None:
+        session = self.state.create_session("s-1")
+        client = self._start_client()
+        client.subscribe("s-1")
+        self.assertTrue(wait_until(lambda: self.cursors.get("s-1") is not None))
+        # A deleted session must leave the resubscribe loop (audit L33).
+        client.subscribe("s-missing")
+        self.assertTrue(wait_until(lambda: "s-missing" not in client._wanted_sessions))
+
+    def test_send_and_wait_timeout_leaves_no_pending_ack(self) -> None:
+        client = self._start_client()
+        self.assertTrue(wait_until(lambda: client.connected))
+        with self.assertRaises(KapWsError):
+            # The fake ignores unknown frame types, so no ack can arrive.
+            client._send_and_wait(client._ws, "bogus", {"session_ids": []}, 0.3)
+        self.assertEqual(client._pending_acks, {})
+
+    def test_is_auth_failure_classification(self) -> None:
+        from kite.adapters.kap_server import _is_auth_failure
+
+        self.assertTrue(_is_auth_failure(Exception("401 Unauthorized")))
+        self.assertTrue(_is_auth_failure(type("E", (Exception,), {"status": 401})()))
+        self.assertTrue(_is_auth_failure(type("E", (Exception,), {"code": 4401})()))
+        self.assertFalse(_is_auth_failure(Exception("connection refused")))
+
+    def test_reconnect_backoff_grows_exponentially(self) -> None:
+        client = self._start_client()
+        self.assertTrue(wait_until(lambda: client.connected))
+        client.stop()
+        delays: list[float] = []
+        failing = KapWsClient(
+            host="127.0.0.1",
+            port=self.ws_server.port,
+            token=self.state.token,
+            rest_client=self.rest,
+            reconnect_delay_seconds=0.05,
+        )
+        failing._stop_event.wait = lambda timeout: (delays.append(timeout), False)[1]  # type: ignore[method-assign]
+        with unittest.mock.patch.object(KapWsClient, "_connect_once", side_effect=OSError("down")):
+            failing.start()
+            while len(delays) < 6:
+                time.sleep(0.01)
+            failing.stop()
+        self.assertLess(delays[0], delays[3])  # growing, not flat
+        self.assertLessEqual(delays[-1], 60.0)
 
     def test_error_frame_advances_cursor_and_never_replays(self) -> None:
         # Audit M6: the error frame is a durable event; the cursor must
@@ -390,6 +437,128 @@ class KapWsClientTests(unittest.TestCase):
         self.assertTrue(snapshot.in_flight)
         self.assertEqual(snapshot.in_flight_turn_id, 7)
         self.assertEqual(snapshot.in_flight_assistant_text, "半截回复")
+
+    def test_snapshot_parses_pending_question_wire_shape(self) -> None:
+        # Audit T4: the fake's question records mirror toWireQuestion
+        # (questions[] + synthesized q_<i>/opt_<i>_<o> ids + allow_other), so
+        # adapter parsing can never silently yield zero items.
+        session = self.state.create_session("s-1")
+        self.state.add_pending_question(session, "q-1")
+
+        snapshot = self.rest.get_snapshot("s-1")
+
+        self.assertEqual(len(snapshot.pending_questions), 1)
+        view = snapshot.pending_questions[0]
+        self.assertEqual(view.question_id, "q-1")
+        self.assertEqual(len(view.items), 1)
+        item = view.items[0]
+        self.assertEqual(item.item_id, "q_0")
+        self.assertTrue(item.allow_other)
+        self.assertEqual([option.option_id for option in item.options], ["opt_0_0", "opt_0_1"])
+        self.assertEqual([option.label for option in item.options], ["是", "否"])
+
+    def test_epoch_rotation_with_lower_seq_fires_resync_immediately(self) -> None:
+        # Audit L11: the seq guard used to run before the epoch check, so an
+        # epoch rotation whose new seq was below the stored high-water mark
+        # never triggered the defensive resync.
+        session = self.state.create_session("s-1")
+        self.cursors.set("s-1", EventCursor(seq=100, epoch="e-old"))
+        client = KapWsClient(
+            host="127.0.0.1",
+            port=self.ws_server.port,
+            token=self.state.token,
+            rest_client=self.rest,
+            cursor_store=self.cursors,
+            on_resync_required=self.resyncs.append,
+        )
+
+        client._advance_cursor(
+            KapEvent(
+                type="turn.started",
+                session_id="s-1",
+                seq=5,  # lower than the stored watermark, but a NEW epoch
+                epoch=session.epoch,
+                volatile=False,
+                offset=None,
+                timestamp="2026-01-01T00:00:00Z",
+                payload={},
+            )
+        )
+
+        self.assertEqual(len(self.resyncs), 1)
+        self.assertEqual(self.resyncs[0].session_id, "s-1")
+        self.assertEqual(self.resyncs[0].reason, "epoch_changed")
+        # The cursor was not advanced into the new epoch's low seq.
+        self.assertEqual(self.cursors.get("s-1"), EventCursor(seq=100, epoch="e-old"))
+
+    def test_same_epoch_lower_seq_still_skips(self) -> None:
+        # The L11 reorder must not weaken the monotonic guard within one epoch.
+        session = self.state.create_session("s-1")
+        self.cursors.set("s-1", EventCursor(seq=100, epoch=session.epoch))
+        client = KapWsClient(
+            host="127.0.0.1",
+            port=self.ws_server.port,
+            token=self.state.token,
+            rest_client=self.rest,
+            cursor_store=self.cursors,
+            on_resync_required=self.resyncs.append,
+        )
+
+        client._advance_cursor(
+            KapEvent(
+                type="turn.started",
+                session_id="s-1",
+                seq=5,
+                epoch=session.epoch,
+                volatile=False,
+                offset=None,
+                timestamp="2026-01-01T00:00:00Z",
+                payload={},
+            )
+        )
+
+        self.assertEqual(self.resyncs, [])
+        self.assertEqual(self.cursors.get("s-1"), EventCursor(seq=100, epoch=session.epoch))
+
+    def test_unsolicited_work_changed_is_ignored(self) -> None:
+        # Audit U1 (upstream 0.29.1 d751b6796): event.session.work_changed is
+        # fanned out to EVERY connection without a subscription — only the
+        # wanted set may advance cursors or feed event tracking.
+        subscribed = self.state.create_session("s-1")
+        other = self.state.create_session("s-2")
+        client = self._start_client()
+        client.subscribe("s-1")
+        self.assertTrue(wait_until(lambda: client.connected))
+
+        self.state.append_global_event(other, "event.session.work_changed", {"busy": True})
+
+        # The unsolicited session never reaches on_event and never writes a
+        # cursor; the wanted session still flows afterwards.
+        time.sleep(0.3)
+        self.assertEqual(self.events, [])
+        self.assertIsNone(self.cursors.get("s-2"))
+        self.state.append_event(subscribed, "turn.started", {"turn": 1})
+        self.assertTrue(wait_until(lambda: len(self.events) == 1))
+        self.assertEqual(self.events[0].session_id, "s-1")
+
+
+class ToolDisplayDetailTests(unittest.TestCase):
+    def test_todo_list_branch(self) -> None:
+        from kite.adapters.kap_server import _tool_display_detail
+
+        self.assertEqual(
+            _tool_display_detail(
+                {
+                    "kind": "todo_list",
+                    "items": [
+                        {"title": "修 bug", "status": "in_progress"},
+                        {"title": "写测试", "status": "pending"},
+                    ],
+                }
+            ),
+            "修 bug, 写测试",
+        )
+        self.assertEqual(_tool_display_detail({"kind": "todo_list", "items": "nope"}), "")
 
 
 if __name__ == "__main__":

@@ -76,3 +76,6 @@
 - mvp-scope §3 的并发展示不变（队列长度仍来自 durable 状态）。
 - kite-design §5 的 durable 事件列表仍是状态转换的唯一驱动；本合同为
   展示层增加 volatile 旁路——正是该节已登记的 "volatile later" 条款。
+- 卡死兜底：FOCUS 的镜像看门狗 / 卡死"执行中" reconcile 是有意延后的
+  hardening 项（已在 focus-assets-map 登记）。落地前，卡在"执行中"的
+  卡片通过 `kitectl session status` 排查路径兜底恢复。

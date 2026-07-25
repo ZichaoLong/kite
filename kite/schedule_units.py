@@ -404,20 +404,32 @@ def _is_executable_file(path: pathlib.Path) -> bool:
     return path.is_file() and os.access(path, os.X_OK)
 
 
+def _ctl_path_candidates() -> tuple[pathlib.Path, ...]:
+    """Default kitectl locations, per platform (audit L20): the user bin dir
+    wrapper, then the managed venv — ``bin/kitectl`` on POSIX, but
+    ``Scripts/kitectl.exe`` on Windows (a venv has no ``bin/`` there)."""
+    if is_windows():
+        return (
+            default_user_bin_dir() / "kitectl.exe",
+            default_data_root() / ".venv" / "Scripts" / "kitectl.exe",
+        )
+    return (
+        default_user_bin_dir() / "kitectl",
+        default_data_root() / ".venv" / "bin" / "kitectl",
+    )
+
+
 def resolve_ctl_path(explicit: str = "") -> str:
     """Contract §3 order: explicit `--ctl-path` > `KITE_BIN_DIR/kitectl` (or
-    `~/.local/bin/kitectl`) > `<data root>/.venv/bin/kitectl`. The resolved
-    absolute path is stored in the timer definition — an OS timer has no PATH
-    to search."""
+    `~/.local/bin/kitectl`) > the managed venv (`bin/kitectl`, or
+    `Scripts/kitectl.exe` on Windows). The resolved absolute path is stored
+    in the timer definition — an OS timer has no PATH to search."""
     if str(explicit or "").strip():
         candidate = pathlib.Path(explicit).expanduser()
         if not _is_executable_file(candidate):
             raise ScheduleError(f"--ctl-path is not an executable file: {candidate}")
         return str(candidate.resolve())
-    candidates = (
-        default_user_bin_dir() / "kitectl",
-        default_data_root() / ".venv" / "bin" / "kitectl",
-    )
+    candidates = _ctl_path_candidates()
     for candidate in candidates:
         if _is_executable_file(candidate):
             return str(candidate.resolve())

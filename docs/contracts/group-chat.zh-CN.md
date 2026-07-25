@@ -59,7 +59,9 @@
    `<group_chat_scope>/<group_chat_context>/<group_chat_current_turn>`——
    边界以来的日志（与飞书 REST 历史回填合并、按边界三元组去重、过滤
    机器人自身消息）加当前消息；封套文案告诉模型回答当前消息而不是
-   复述历史。上限：50 条 / 24h 回看 / 边界 5s 宽限（可配）；历史拉取
+   复述历史。上限：50 条 / 24h 回看（两者可配：
+   `group_history_fetch_limit` / `group_history_fetch_lookback_seconds`)/
+   边界 5s 宽限（固定常量，未接配置）；历史拉取
    失败阻断该 prompt 并显式提示（fail-closed)。
 4. **群内审批/question**：卡片发到群聊（按 mvp-scope §3 广播）；点击
    处理者校验 `点击者 open_id == 发起者 open_id || 管理员`——旁观者
@@ -140,3 +142,16 @@
    read-through 缓存。回退链与 FOCUS 同构：`name` 或 `nickname` → 回退
    `open_id[:8]`（机器人发送者为 `机器人:{id[:8]}`);fail-soft，不占状态轴。
    测试：缓存命中/TTL/负缓存/回退链，以及有/无可解析名两种通知文案。
+
+## 补充对齐（2026-07-25，审查 C2)
+
+1. **机器人被移出群 / 群解散**：收到 chat 不可用生命周期事件时，该群的
+   激活配置被停用（fail 向静默，与 §4.3 同一立场）；模式偏好、binding
+   与群日志文件保留。之后重新拉机器人进群不会静默复活旧激活状态——
+   需要管理员显式再次 `/group activate`。
+2. **飞书话题（thread）回复并入主流上下文**（范围裁剪，审查 L16 后登记）:
+   FOCUS 按话题 scope 建模、将话题回复排除在主流上下文之外；本刀每群
+   只有一条边界三元组、无话题 scope，因此成员在话题中回复的消息与普通
+   群消息一样进入 assistant 模式日志与 REST 历史回填。消息 wire 上带有
+   `thread_id`，未来可以在客户端过滤；历史列表 API 本身不提供服务端
+   话题过滤。

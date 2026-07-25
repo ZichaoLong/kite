@@ -16,6 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from kite.stores.binding_store import VALID_PERMISSION_MODES
+from kite.stores.group_config_store import VALID_GROUP_MODES
 
 _PLAN_ON = "on"
 _PLAN_OFF = "off"
@@ -104,7 +105,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec(
         "/init",
         "/init 〈token〉",
-        "注册管理员；token 在安装时生成。",
+        "注册管理员；token 由 kited 首次启动时生成（见 `kitectl config init-token`）。",
     ),
     CommandSpec(
         "/help",
@@ -122,11 +123,14 @@ _SPECS_BY_NAME = {spec.name: spec for spec in COMMAND_SPECS}
 
 
 def parse_slash_command(text: str) -> SlashCommand | None:
-    """Parse ``/name arg...``; None for plain text or a bare ``/``.
+    """Parse ``/name arg...``; None for plain (non-slash) text.
 
     The name is lowercased and a trailing ``@BotName`` mention suffix (group
     convention) is stripped; the argument keeps its original casing with
-    surrounding whitespace trimmed.
+    surrounding whitespace trimmed. A bare ``/`` (or ``/ xxx``, where the
+    head is just the slash) still parses — with name ``/`` — so it is
+    answered as an unknown command instead of leaking into the prompt path
+    (FOCUS parity, audit L13).
     """
     stripped = (text or "").strip()
     if not stripped.startswith("/"):
@@ -136,7 +140,7 @@ def parse_slash_command(text: str) -> SlashCommand | None:
     if "@" in name:
         name = name.split("@", 1)[0]
     if len(name) <= 1:
-        return None
+        name = "/"
     return SlashCommand(name=name, arg=tail.strip(), raw=stripped)
 
 
@@ -178,4 +182,19 @@ def parse_plan_mode_arg(arg: str) -> bool | None:
         return True
     if normalized == _PLAN_OFF:
         return False
+    return None
+
+
+def parse_group_mode_arg(arg: str) -> str | None:
+    """Normalize a /group-mode argument; None when not a valid group mode.
+
+    Spelling tolerance (FOCUS ``codex_group_domain`` parity, audit L14):
+    ``-`` reads as ``_`` (``mention-only`` → ``mention_only``) and the
+    shorthand ``mention`` reads as ``mention_only``.
+    """
+    normalized = str(arg or "").strip().lower().replace("-", "_")
+    if normalized == "mention":
+        normalized = "mention_only"
+    if normalized in VALID_GROUP_MODES:
+        return normalized
     return None

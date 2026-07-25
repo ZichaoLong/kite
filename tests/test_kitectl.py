@@ -154,6 +154,32 @@ class SessionStatusTests(KitectlTestCase):
         self.assertEqual(code, 0)
         self.assertIn("s-abc", out)
 
+    def test_status_one_broken_session_does_not_kill_the_report(self) -> None:
+        # Audit L27: one session whose queue fetch fails gets a per-session
+        # error line; the rest of the report renders and the exit is
+        # non-zero so scripts notice.
+        self.state.create_session("s-abc", title="demo")
+        self._bind("chat-1", "s-abc")
+        self._bind("chat-2", "s-missing")  # unknown upstream: 40401 on fetch
+
+        code, out, _ = self._run_cli("session", "status")
+
+        self.assertEqual(code, 1)
+        self.assertIn("s-missing: error:", out)
+        row = next(line for line in out.splitlines() if line.startswith("s-abc"))
+        self.assertIn("demo", row)
+
+    def test_status_corrupt_bindings_is_a_clean_error(self) -> None:
+        # Audit L30: a corrupt bindings.json surfaces as a CliError, not a
+        # bare traceback.
+        (self.data_dir / "bindings.json").write_text("{corrupt", encoding="utf-8")
+
+        code, _, err = self._run_cli("session", "status")
+
+        self.assertEqual(code, 2)
+        self.assertIn("cannot read the binding store", err)
+        self.assertNotIn("Traceback", err)
+
 
 class ErrorPathTests(KitectlTestCase):
     def test_missing_token_is_fail_closed(self) -> None:
@@ -259,6 +285,22 @@ class ServiceCommandTests(KitectlTestCase):
         self.assertEqual(definition.data_dir, self.data_dir)
         self.assertEqual(definition.stdout_log_path, self.data_dir / "service.stdout.log")
 
+    def test_install_writes_custom_dirs_into_exec_start(self) -> None:
+        # Audit L26: the CLI runs here with custom --config-dir/--data-dir,
+        # so the unit's daemon command must carry them explicitly — the
+        # service runs without this shell's env and would otherwise start
+        # kited with the DEFAULT directories (self-contradictory unit).
+        manager = self._fake_manager()
+
+        code, _, _ = self._run_cli("service", "install")
+
+        self.assertEqual(code, 0)
+        command = list(manager.definitions[0].daemon_command)
+        self.assertIn("--config-dir", command)
+        self.assertIn("--data-dir", command)
+        self.assertEqual(command[command.index("--config-dir") + 1], str(self.config_dir))
+        self.assertEqual(command[command.index("--data-dir") + 1], str(self.data_dir))
+
     def test_start_stop_restart_uninstall(self) -> None:
         manager = self._fake_manager()
         done_words = {
@@ -293,8 +335,21 @@ class ServiceCommandTests(KitectlTestCase):
 
         code, out, _ = self._run_cli("service", "status")
 
-        self.assertEqual(code, 0)
+        # FOCUS exit-code semantics (audit L22): not running -> exit 3.
+        self.assertEqual(code, 3)
         self.assertIn("installed: no", out)
+        self.assertIn("running: no", out)
+
+    def test_status_installed_but_stopped_exits_3(self) -> None:
+        manager = self._fake_manager()
+        manager.status_result = service_manager.ServiceStatus(
+            installed=True, running=False, detail="inactive (dead)"
+        )
+
+        code, out, _ = self._run_cli("service", "status")
+
+        self.assertEqual(code, 3)
+        self.assertIn("installed: yes", out)
         self.assertIn("running: no", out)
 
     def test_autostart_enable_disable(self) -> None:
@@ -507,6 +562,17 @@ class BindingListTests(KitectlTestCase):
 
         self.assertEqual(code, 0)
         self.assertIn("(no bindings)", out)
+
+    def test_corrupt_bindings_is_a_clean_error(self) -> None:
+        # Audit L30: a corrupt bindings.json surfaces as a CliError, not a
+        # bare traceback.
+        (self.data_dir / "bindings.json").write_text("{corrupt", encoding="utf-8")
+
+        code, _, err = self._run_cli("binding", "list")
+
+        self.assertEqual(code, 2)
+        self.assertIn("cannot read the binding store", err)
+        self.assertNotIn("Traceback", err)
 
 
 class PromptSendTests(KitectlTestCase):
@@ -939,6 +1005,27 @@ class ConfigShowTests(KitectlTestCase):
         self.assertEqual(code, 0)
         self.assertIn("system.yaml", out)
         self.assertIn("(no config file)", out)
+
+
+class ConfigInitTokenTests(KitectlTestCase):
+    """`config init-token` (audit L21/D6): shows the kited-generated /init
+    token and where it lives."""
+
+    def test_shows_token_and_path(self) -> None:
+        (self.config_dir / "init.token").write_text("tok-secret-123\n", encoding="utf-8")
+
+        code, out, _ = self._run_cli("config", "init-token")
+
+        self.assertEqual(code, 0)
+        self.assertIn(str(self.config_dir / "init.token"), out)
+        self.assertIn("tok-secret-123", out)
+
+    def test_missing_token_means_kited_never_started(self) -> None:
+        code, out, _ = self._run_cli("config", "init-token")
+
+        self.assertEqual(code, 3)
+        self.assertIn("not created yet", out)
+        self.assertIn("first start", out)
 
 
 if __name__ == "__main__":

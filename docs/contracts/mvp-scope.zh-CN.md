@@ -70,7 +70,11 @@
    "状态未知"，附 `kitectl session status` 排查提示，**不猜状态**。
 3. `resync_required`（超窗/epoch 变更）→ snapshot 重建，同第 2 条。
 4. 审批/表单响应 REST 返回幂等冲突（40902) → 提示"已被处理"，卡片定格。
-5. prompt REST 返回业务错误码 → 执行卡直接转终态（失败），展示上游 msg。
+5. prompt 失败有两个显式出口（2026-07-25 按审查改写——旧措辞是 FOCUS
+   "提交即建卡"模型的遗留）：**提交期**业务错误码（submit REST 拒绝）→
+   会话内回复明确的错误文本（此时还没有执行卡——卡片由事件驱动创建）;
+   **执行期** `error` durable 事件帧 → 执行卡直接转终态（失败），展示
+   上游 msg。
 6. kited 重启 → binding/permission mode/plan mode/cursor 从 store 恢复；
    内存中的
    prompt 归属尽量从 `GET .../prompts` + snapshot 重建；建不回的审批卡
@@ -80,8 +84,9 @@
 
 ## 5. 权限与身份
 
-- 首个管理员通过在飞书内发送 `/init <token>` 登记（init token 安装时
-  生成，流程仿 FOCUS)；管理员集合存实例配置。
+- 首个管理员通过在飞书内发送 `/init <token>` 登记（init token 由 kited
+  首次启动时生成——`kitectl config init-token` 可查看 token 及其存放
+  位置；流程仿 FOCUS)；管理员集合存实例配置。
 - MVP 只有两级：**管理员**（全部命令 + `kitectl`）与**非管理员**（不可
   使用，`/help` 与 `/whoami` 除外）。允许名单（多用户）是 Phase 2 候选。
 - binding 级 permission mode 默认 `auto`;`yolo` 需要管理员显式设置，
@@ -102,8 +107,9 @@
    摸底保留，但用途从"取舍依据"变为"设计输入"（有哪些问题类型、选项
    形态，决定卡片布局）。
 3. `/sessions` MVP 一页 + 按最近活跃排序；session 数增长后再议分页。
-4. 管理员登记采用 FOCUS 式 init token 流程（安装时生成 token，飞书内
-   `/init <token>` 登记首个管理员）。
+4. 管理员登记采用 FOCUS 式 init token 流程（token 由 kited 首次启动时
+   生成——2026-07-25 更正，原写"安装时生成";`kitectl config init-token`
+   可查看——飞书内 `/init <token>` 登记首个管理员）。
 5. `/mode` 枚举按上游修正为 `auto/manual/yolo`（证据：
    `packages/protocol/src/rest/prompt.ts:41`）；`plan` 不是
    `permission_mode` 取值，而是独立的 `plan_mode` 布尔字段，以

@@ -81,6 +81,7 @@ import re
 import threading
 import time
 import urllib.parse
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Optional, Sequence
 
@@ -132,6 +133,12 @@ KAP_ERROR_QUESTION_NOT_FOUND = 40405
 KAP_ERROR_QUESTION_DISMISSED = 40909
 
 _MAX_TOOL_LINES = 30
+# Head line once the cap evicted something (audit L6, FOCUS parity with
+# ``_LOG_TRUNCATION_NOTICE``): the cap keeps the TAIL — the newest activity
+# is never silently dropped — and this notice says so.
+_TOOL_LINES_TRUNCATION_NOTICE = "**[工具调用已截断，仅保留最近部分]**"
+# FIFO cap for the terminal-delivery dedup registry (audit L9).
+_TERMINAL_DELIVERED_CAP = 1024
 _LATEST_ASSISTANT_PAGE_SIZE = 20
 
 _KAP_UNREACHABLE_TOAST = "无法连接 kap-server，操作未完成，请稍后再试。"
@@ -293,6 +300,9 @@ class _ExecutionCardState:
     queue_length: int = 0
     tool_lines: list[str] = field(default_factory=list)
     open_tools: dict[str, int] = field(default_factory=dict)  # tool_call_id -> line index
+    # Set once the _MAX_TOOL_LINES cap evicted an oldest line (audit L6):
+    # the card then renders a truncation notice above the kept tail.
+    tool_lines_truncated: bool = False
     # Streaming throttle state (§3.3): last dispatch + the single trailing
     # timer. The state object's identity doubles as the generation guard for
     # stale timer flushes and stale queued renders (§3.8).
@@ -387,6 +397,7 @@ class EventPipeline:
         terminal_card_byte_budget: int = _DEFAULT_TERMINAL_CARD_BYTE_BUDGET,
         patch_dispatcher: Optional[CardPatchDispatcher] = None,
         names: Any = None,
+        group_mode_of: Any = None,
     ) -> None:
         self._transport = transport
         self._rest = rest
@@ -402,6 +413,9 @@ class EventPipeline:
         self._timer_factory = timer_factory
         self._monotonic = monotonic
         self._names = names
+        # chat_id -> activated group mode (wired from the group config store;
+        # used for mode-aware feedback instructions, audit L17).
+        self._group_mode_of = group_mode_of
         self._on_snapshot_rebuilt = on_snapshot_rebuilt
         self._terminal_empty_retry_count = max(int(terminal_empty_retry_count), 0)
         self._terminal_retry_delay = max(float(terminal_empty_retry_delay_seconds), 0.0)
@@ -433,7 +447,11 @@ class EventPipeline:
         self._expired_question_ids: set[str] = set()
         # Terminal delivery dedup: one terminal card per (session, prompt)
         # even when two finalize paths (live event / reconcile retry) race.
+        # Bounded hygiene (audit L9): FIFO-evict beyond the cap — eviction
+        # only re-arms the dedup for a long-finished prompt (a duplicate
+        # finalize would re-deliver; never worse than missing the dedup).
         self._terminal_delivered: set[tuple[str, str]] = set()
+        self._terminal_delivered_order: deque[tuple[str, str]] = deque()
         self._terminal_retry_timers: dict[tuple[str, str], TimerHandle] = {}
         # Volatile streaming transcripts, keyed by (session_id, prompt_id).
         self._transcripts: dict[tuple[str, str], StreamingTranscript] = {}
@@ -559,13 +577,32 @@ class EventPipeline:
         session.turn_prompts[event.turn_id] = prompt_id
         session.busy = True
         title = self._session_title(event.session_id)
+        owner_entry = self._ownership.entry_of(prompt_id)
         logger.info(
-            "prompt started session_id=%s prompt_id=%s turn=%s",
+            "prompt started chat_id=%s session_id=%s prompt_id=%s turn=%s",
+            owner_entry.chat_id if owner_entry is not None else "-",
             event.session_id,
             prompt_id,
             event.turn_id,
         )
         for chat_id, _binding in self._attached_chats(event.session_id):
+            existing = self._cards.get(chat_id)
+            if (
+                existing is not None
+                and existing.anchor.session_id == event.session_id
+                and existing.anchor.prompt_id == prompt_id
+            ):
+                # Duplicate/replayed turn.started for the prompt that already
+                # owns the chat's card (audit L7; FOCUS reuse_existing_card):
+                # keep the live card — freezing and re-sending would churn
+                # the chat for zero information.
+                logger.info(
+                    "duplicate turn.started session=%s prompt=%s turn=%s; reusing existing card",
+                    event.session_id,
+                    prompt_id,
+                    event.turn_id,
+                )
+                continue
             self._create_execution_card(
                 chat_id, event.session_id, prompt_id, event.prompt_text, title, session.queue_depth
             )
@@ -624,7 +661,18 @@ class EventPipeline:
         line = self._render_tool_line("⏳", event.name, event.detail or event.description)
         for state in self._cards_for_prompt(event.session_id, prompt_id):
             if len(state.tool_lines) >= _MAX_TOOL_LINES:
-                continue
+                # Tail eviction (audit L6, FOCUS parity): drop the OLDEST
+                # line, never the newest activity, and let the card show a
+                # truncation notice. Open-tool indices shift with the
+                # eviction; a tool whose line was evicted simply loses its
+                # result update (the pop below finds nothing).
+                del state.tool_lines[0]
+                state.open_tools = {
+                    call_id: index - 1
+                    for call_id, index in state.open_tools.items()
+                    if index > 0
+                }
+                state.tool_lines_truncated = True
             state.open_tools[event.tool_call_id] = len(state.tool_lines)
             state.tool_lines.append(line)
             self._patch_execution_card(state)
@@ -650,9 +698,26 @@ class EventPipeline:
             detail = detail[:119] + "…"
         return f"{marker} `{name}` {detail}".rstrip()
 
+    @staticmethod
+    def _tool_lines_for_card(state: _ExecutionCardState) -> list[str]:
+        """Tool lines as rendered on the card: the kept tail plus the
+        truncation notice head line once the cap evicted something (L6)."""
+        if not state.tool_lines_truncated:
+            return state.tool_lines
+        return [_TOOL_LINES_TRUNCATION_NOTICE, *state.tool_lines]
+
     def _turn_ended(self, event: TurnEnded) -> None:
         session = self._sessions.get(event.session_id)
         prompt_id = session.turn_prompts.pop(event.turn_id, None) if session else None
+        if event.reason == "completed" and prompt_id:
+            # Audit L3: the reconcile's moved_on guard reads
+            # session.active_prompt_id, which this handler is about to clear
+            # and which only the trailing queue refresh repopulates — so
+            # attempt-1 always used to run with a stale watermark (the
+            # "secondary window"). Refresh the watermark FIRST: a session
+            # that already advanced to the next prompt must never fetch
+            # unattributable text for this one.
+            self._refresh_active_prompt_watermark(event.session_id)
         if session is not None and session.active_prompt_id == prompt_id:
             session.active_prompt_id = None
         if not prompt_id:
@@ -680,6 +745,15 @@ class EventPipeline:
         session has moved on to a newer active prompt the fetch is skipped —
         the latest assistant text can no longer be attributed to this prompt
         (monotonic rule: never pin stale text on its terminal card).
+
+        Attribution boundary (audit L3): the fetch heuristic takes the
+        newest assistant text on the latest page. When the finished turn
+        produced NO assistant text of its own (it ended on tool output) and
+        no newer prompt has activated, the previous prompt's reply is
+        unattributable yet indistinguishable — the moved_on guard cannot
+        fire. Recorded as a known boundary; the mid-term fix is upstream
+        per-message prompt attribution (not populated today), not another
+        local heuristic.
         """
         key = (session_id, prompt_id)
         self._terminal_retry_timers.pop(key, None)  # the timer that fired is spent
@@ -845,6 +919,9 @@ class EventPipeline:
             self._transcripts.pop(key, None)
             return
         self._terminal_delivered.add(key)
+        self._terminal_delivered_order.append(key)
+        while len(self._terminal_delivered_order) > _TERMINAL_DELIVERED_CAP:
+            self._terminal_delivered.discard(self._terminal_delivered_order.popleft())
         retry = self._terminal_retry_timers.pop(key, None)
         if retry is not None:
             retry.cancel()
@@ -862,18 +939,33 @@ class EventPipeline:
         if not states:
             # The anchor vanished while the terminal reconcile was pending
             # (rebound / snapshot rebuild froze it): deliver the terminal
-            # standalone so the result is never lost silently.
+            # standalone so the result is never lost silently — and persist
+            # it like the anchored path (audit L4), or /last loses it.
             for chat_id, _binding in self._attached_chats(session_id):
-                self._deliver_terminal_card(
+                terminal_message_id = self._deliver_terminal_card(
                     chat_id,
                     outcome,
                     text,
                     result_id=prompt_id,
                     checksum=cards.terminal_result_checksum(text),
                 )
+                if terminal_message_id and text:
+                    self._terminal_store.upsert(
+                        TerminalResultRecord(
+                            message_id=terminal_message_id,
+                            execution_message_id="",
+                            final_reply_text=text,
+                            recorded_at=time.time(),
+                            terminal_result_id=prompt_id,
+                            session_id=session_id,
+                            checksum=cards.terminal_result_checksum(text),
+                        )
+                    )
         self._transcripts.pop(key, None)
+        owner_entry = self._ownership.entry_of(prompt_id)
         logger.info(
-            "prompt ended session_id=%s prompt_id=%s outcome=%s",
+            "prompt ended chat_id=%s session_id=%s prompt_id=%s outcome=%s",
+            owner_entry.chat_id if owner_entry is not None else "-",
             session_id,
             prompt_id,
             outcome,
@@ -970,7 +1062,7 @@ class EventPipeline:
             state=execution_state,
             elapsed_seconds=self._elapsed(state),
             queue_length=0,
-            tool_lines=state.tool_lines,
+            tool_lines=self._tool_lines_for_card(state),
             reply_text=self._stream_projection(state),
         )
         result = self._patch_card_result(message_id, card)
@@ -1010,6 +1102,17 @@ class EventPipeline:
         except (KapError, KapTransportError) as exc:
             logger.warning("prompts fetch failed session=%s: %s", session_id, exc)
             return None
+
+    def _refresh_active_prompt_watermark(self, session_id: str) -> None:
+        """Best-effort active-prompt watermark refresh (no card patches).
+
+        The full queue-depth refresh still runs at the end of turn.ended;
+        this only moves the attribution watermark read by the terminal
+        reconcile's moved_on guard (audit L3).
+        """
+        queue = self._fetch_queue(session_id)
+        if queue is not None and queue.active_prompt_id:
+            self._session(session_id).active_prompt_id = queue.active_prompt_id
 
     def _refresh_queue_depth(self, session_id: str) -> None:
         queue = self._fetch_queue(session_id)
@@ -1135,7 +1238,7 @@ class EventPipeline:
             state=cards.EXECUTION_STATE_RUNNING,
             elapsed_seconds=self._elapsed(state),
             queue_length=state.queue_length,
-            tool_lines=state.tool_lines,
+            tool_lines=self._tool_lines_for_card(state),
             reply_text=self._stream_projection(state),
             prompt_id=state.anchor.prompt_id,
         )
@@ -1381,8 +1484,10 @@ class EventPipeline:
                 ),
             )
         logger.info(
-            "approval resolved session_id=%s approval_id=%s decision=%s",
+            "approval resolved chat_id=%s session_id=%s prompt_id=%s approval_id=%s decision=%s",
+            pending.owner_chat_id if pending is not None else "-",
             event.session_id,
+            pending.prompt_id if pending is not None else "-",
             event.approval_id,
             event.decision,
         )
@@ -1497,10 +1602,15 @@ class EventPipeline:
                 chat_id=action.chat_id,
                 operator_open_id=action.operator_open_id,
             )
-            return CardActionResponse(
-                toast="请直接回复一段文字作为拒绝反馈（你的下一条消息将作为反馈提交；"
-                "群聊中需 @机器人 回复）。"
-            )
+            toast = "请直接回复一段文字作为拒绝反馈（你的下一条消息将作为反馈提交"
+            # The @ clause only applies where plain text is @-gated: in
+            # mention_only/assistant groups non-@ text never reaches the
+            # interaction claim; in `all` mode every text does (audit L17).
+            group_mode = self._group_mode_of(action.chat_id) if self._group_mode_of else None
+            if group_mode in ("mention_only", "assistant"):
+                toast += "；群聊中需 @机器人 回复"
+            toast += "）。"
+            return CardActionResponse(toast=toast)
         return CardActionResponse()
 
     def handle_abort_action(
@@ -2188,11 +2298,12 @@ class EventPipeline:
             except Exception:
                 logger.exception("on_snapshot_rebuilt hook failed session=%s", session_id)
         logger.info(
-            "session rebuilt (%s) session=%s as_of_seq=%d busy=%s",
+            "session rebuilt (%s) session=%s as_of_seq=%d busy=%s prompt_id=%s",
             origin,
             session_id,
             snapshot.as_of_seq,
             snapshot.busy,
+            snapshot.current_prompt_id or "-",
         )
 
     def _adopt_snapshot_cursor(self, session_id: str, snapshot: SessionSnapshot) -> None:
@@ -2380,10 +2491,12 @@ class EventPipeline:
             return session.title
         try:
             info = self._session_ops.get_session(session_id)
-            session.title = info.title
         except (KapError, KapTransportError) as exc:
+            # Do NOT cache the failure (audit L8): a transient REST error
+            # must not pin an empty title forever — retry on the next card.
             logger.warning("session title fetch failed session=%s: %s", session_id, exc)
-            session.title = ""
+            return ""
+        session.title = info.title
         return session.title
 
     def _elapsed(self, state: _ExecutionCardState) -> int:
@@ -2397,7 +2510,7 @@ class EventPipeline:
             state=cards.EXECUTION_STATE_RUNNING,
             elapsed_seconds=self._elapsed(state),
             queue_length=state.queue_length,
-            tool_lines=state.tool_lines,
+            tool_lines=self._tool_lines_for_card(state),
             reply_text=self._stream_projection(state),
             prompt_id=state.anchor.prompt_id,
         )

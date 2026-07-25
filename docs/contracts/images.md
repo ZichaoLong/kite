@@ -43,7 +43,11 @@
 5. **Hygiene**: TTL lazy sweep on each new attachment/message; expired
    records delete their files; consumption deletes consumed files.
 6. In groups (once the group contract lands): pending attachments are
-   per-`(sender, chat)` — members' attachments never mix.
+   per-`(sender, chat)` — members' attachments never mix. **Group staging
+   is admin-only in this cut** (aligned 2026-07-25, audit L19/D5): in an
+   activated group only an admin's attachment is staged; a non-admin
+   member's attachment is silently ignored (fail-closed, no per-message
+   reply — same stance as the group ingress matrix).
 
 ## 3. Outbound Contract
 

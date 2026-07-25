@@ -15,7 +15,9 @@ import pathlib
 import re
 import tempfile
 import unittest
+from unittest import mock
 
+import kite.event_pipeline as event_pipeline_module
 from kite import cards
 from kite.message_patch_result import MessagePatchResult
 from kite.adapters.kap_server import (
@@ -37,6 +39,7 @@ from kite.event_pipeline import (
     SwappableKapRest,
     TimerHandle,
     WsSubscriptionHook,
+    _MAX_TOOL_LINES,
     _PendingApproval,
 )
 from kite.feishu_transport import CardAction, InboundMessage
@@ -674,6 +677,129 @@ class ExecutionCardTests(PipelineTestCase):
             )
         )
         self.assertEqual(len(self.transport.patches_to(message_id)), 1)
+
+    def test_turn_ended_with_successor_active_does_not_pin_stale_text(self) -> None:
+        # Audit L3: attempt-1 of the terminal reconcile used to run before
+        # the queue refresh (and after the handler cleared the watermark), so
+        # the moved_on guard could never fire for it — the previous prompt's
+        # reply got pinned on this prompt's terminal card AND into the store.
+        self.bind(CHAT_ID)
+        message_id = self.start_prompt()
+        # The server already advanced to the next prompt; the session's last
+        # assistant text belongs to an earlier prompt.
+        self.rest.set_prompts(SESSION_ID, active="p-2")
+        self.rest.assistant_text = "上一轮答复"
+
+        self.feed(kap_event("turn.ended", {"turnId": 1, "reason": "completed"}))
+
+        terminal = self.transport.cards_to(CHAT_ID)[-1]["content"]
+        self.assertNotIn("上一轮答复", json.dumps(terminal, ensure_ascii=False))
+        # The unattributable text must not reach the terminal store either.
+        self.assertEqual(self.terminal_store.list_all(), ())
+        # The execution card still froze as done.
+        patches = self.transport.patches_to(message_id)
+        self.assertIn("已结束", json.dumps(patches[-1], ensure_ascii=False))
+
+    def test_orphan_terminal_delivery_is_persisted_for_last(self) -> None:
+        # Audit L4: the standalone (orphan) terminal path delivered the card
+        # but never upserted the terminal store, so /last lost the result.
+        self.bind(CHAT_ID)
+        self.start_prompt()
+        # The anchor vanishes mid-flight: a failed rebuild freezes the card
+        # as unknown and drops it from the registry.
+        self.rest.snapshots[SESSION_ID] = KapTransportError("connection refused")
+        self.pipeline.handle_resync_required(
+            ResyncRequest(session_id=SESSION_ID, reason=None, current_seq=None, epoch=None)
+        )
+        self.flush()
+
+        self.feed(kap_event("turn.ended", {"turnId": 1, "reason": "completed"}))
+
+        records = self.terminal_store.list_all()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].final_reply_text, "最终答复文本")
+        self.assertEqual(records[0].session_id, SESSION_ID)
+        self.assertEqual(records[0].terminal_result_id, "p-1")
+
+    def test_tool_lines_cap_keeps_tail_with_truncation_notice(self) -> None:
+        # Audit L6: the cap used to drop the NEWEST tool line silently.
+        self.bind(CHAT_ID)
+        message_id = self.start_prompt()
+        for index in range(1, _MAX_TOOL_LINES + 2):  # one past the cap
+            self.feed(
+                kap_event(
+                    "tool.call.started",
+                    {
+                        "turnId": 1,
+                        "toolCallId": f"tc-{index}",
+                        "name": "Bash",
+                        "display": {"kind": "command", "command": f"step{index:02d}"},
+                    },
+                )
+            )
+
+        rendered = json.dumps(self.transport.patches_to(message_id)[-1], ensure_ascii=False)
+        self.assertIn(f"step{_MAX_TOOL_LINES + 1:02d}", rendered)  # newest kept
+        self.assertNotIn("step01", rendered)  # oldest evicted
+        self.assertIn("已截断", rendered)  # truncation notice shown
+
+        # A result for the evicted tool is a harmless no-op; a result for a
+        # live tool still flips exactly its own line (indices shifted right).
+        self.feed(kap_event("tool.result", {"turnId": 1, "toolCallId": "tc-1", "isError": False}))
+        self.feed(
+            kap_event(
+                "tool.result",
+                {"turnId": 1, "toolCallId": f"tc-{_MAX_TOOL_LINES + 1}", "isError": False},
+            )
+        )
+        rendered = json.dumps(self.transport.patches_to(message_id)[-1], ensure_ascii=False)
+        self.assertIn(f"✅ `Bash` step{_MAX_TOOL_LINES + 1:02d}", rendered)
+        self.assertNotIn("✅ `Bash` step02", rendered)
+
+    def test_duplicate_turn_started_reuses_existing_card(self) -> None:
+        # Audit L7: a replayed turn.started used to freeze the live card and
+        # send a replacement; it must be idempotent (FOCUS reuse_existing_card).
+        self.bind(CHAT_ID)
+        message_id = self.start_prompt()
+
+        self.feed(turn_started(turn_id=1, prompt="做点事"))
+
+        self.assertEqual(len(self.transport.cards_to(CHAT_ID)), 1)
+        self.assertEqual(self.transport.patches_to(message_id), [])
+        # The live card still belongs to the prompt: tool events patch it.
+        self.feed(
+            kap_event("tool.call.started", {"turnId": 1, "toolCallId": "tc-1", "name": "Bash"})
+        )
+        self.assertEqual(len(self.transport.patches_to(message_id)), 1)
+
+    def test_session_title_failure_is_not_cached(self) -> None:
+        # Audit L8: a failed title fetch used to cache "" forever.
+        self.bind(CHAT_ID)
+        del self.rest.sessions[SESSION_ID]  # get_session now fails
+        self.rest.set_prompts(SESSION_ID, active="p-1")
+        self.feed(turn_started(turn_id=1))
+        first = self.transport.cards_to(CHAT_ID)[-1]["content"]
+        self.assertNotIn("测试会话", json.dumps(first, ensure_ascii=False))
+
+        self.rest.add_session(SESSION_ID)  # REST healthy again
+        self.rest.set_prompts(SESSION_ID, active="p-2")
+        self.feed(turn_started(turn_id=2))
+        second = self.transport.cards_to(CHAT_ID)[-1]["content"]
+        self.assertIn("测试会话", json.dumps(second, ensure_ascii=False))
+
+    def test_terminal_delivered_registry_is_bounded(self) -> None:
+        # Audit L9: the dedup registry grew unbounded; it FIFO-evicts at the cap.
+        self.bind(CHAT_ID)
+        with mock.patch.object(event_pipeline_module, "_TERMINAL_DELIVERED_CAP", 3):
+            for index in range(1, 5):
+                self.rest.set_prompts(SESSION_ID, active=f"p-{index}")
+                self.feed(turn_started(turn_id=index))
+                self.feed(kap_event("turn.ended", {"turnId": index, "reason": "completed"}))
+
+        delivered = self.pipeline._terminal_delivered
+        self.assertEqual(len(delivered), 3)
+        self.assertNotIn((SESSION_ID, "p-1"), delivered)
+        self.assertIn((SESSION_ID, "p-4"), delivered)
 
     def test_frozen_card_content_rejected_retries_minimal_once(self) -> None:
         # FOCUS 5787d4c port: a non-running execution card whose full frozen
@@ -2572,6 +2698,81 @@ class AbortActionTests(PipelineTestCase):
         )
         self.assertEqual(self.rest.aborts, [])
         self.assertIn("操作无效", response.toast or "")
+
+
+# ---------------------------------------------------------------------------
+# Reject-with-feedback toast wording (mode-aware, audit L17) and
+# structured-log fields (mvp-scope §6, audit D1)
+# ---------------------------------------------------------------------------
+
+
+class FeedbackToastModeTests(ApprovalTests):
+    def _feedback_action(self) -> CardAction:
+        return make_card_action(
+            {
+                "action": cards.ACTION_APPROVAL_REJECT_WITH_FEEDBACK,
+                "approval_id": "a-1",
+                "prompt_id": "p-1",
+            }
+        )
+
+    def test_all_mode_feedback_toast_has_no_at_clause(self) -> None:
+        self.pipeline._group_mode_of = lambda chat_id: "all"
+        self._start_and_request_approval()
+
+        response = self.handler.handle_approval_action(self._feedback_action())
+
+        self.assertNotIn("@机器人", response.toast or "")
+
+    def test_mention_only_feedback_toast_mentions_at(self) -> None:
+        self.pipeline._group_mode_of = lambda chat_id: "mention_only"
+        self._start_and_request_approval()
+
+        response = self.handler.handle_approval_action(self._feedback_action())
+
+        self.assertIn("@机器人", response.toast or "")
+
+
+class StructuredLogFieldTests(ApprovalTests):
+    def test_prompt_started_log_carries_chat_and_prompt_id(self) -> None:
+        self.bind(CHAT_ID)
+        self.ownership.record("p-1", CHAT_ID, sender_open_id=ADMIN_OPEN_ID)
+
+        with self.assertLogs("kite.outbound", level="INFO") as captured:
+            self.start_prompt()
+
+        started = [line for line in captured.output if "prompt started" in line]
+        self.assertEqual(len(started), 1)
+        self.assertIn(f"chat_id={CHAT_ID}", started[0])
+        self.assertIn("prompt_id=p-1", started[0])
+
+    def test_prompt_ended_log_carries_chat_and_prompt_id(self) -> None:
+        self.bind(CHAT_ID)
+        self.ownership.record("p-1", CHAT_ID, sender_open_id=ADMIN_OPEN_ID)
+        self.start_prompt()
+
+        with self.assertLogs("kite.outbound", level="INFO") as captured:
+            self.feed(kap_event("turn.ended", {"turnId": 1, "reason": "completed"}))
+
+        ended = [line for line in captured.output if "prompt ended" in line]
+        self.assertEqual(len(ended), 1)
+        self.assertIn(f"chat_id={CHAT_ID}", ended[0])
+        self.assertIn("prompt_id=p-1", ended[0])
+
+    def test_approval_resolved_log_carries_prompt_id(self) -> None:
+        self._start_and_request_approval()
+
+        with self.assertLogs("kite.outbound", level="INFO") as captured:
+            self.feed(
+                kap_event(
+                    "event.approval.resolved",
+                    {"approval_id": "a-1", "decision": "approved"},
+                )
+            )
+
+        resolved = [line for line in captured.output if "approval resolved" in line]
+        self.assertEqual(len(resolved), 1)
+        self.assertIn("prompt_id=p-1", resolved[0])
 
 
 if __name__ == "__main__":

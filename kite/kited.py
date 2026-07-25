@@ -190,6 +190,14 @@ def build_outbound_runtime(
         fetch_limit=kite_config.group_history_fetch_limit(config),
         lookback_seconds=kite_config.group_history_fetch_lookback_seconds(config),
     )
+    group_config_store = GroupConfigStore(data_dir)
+
+    def _group_mode_of(chat_id: str) -> str | None:
+        config = group_config_store.load(chat_id)
+        if config is None or not config.get("activated"):
+            return None
+        return str(config.get("mode") or "") or None
+
     pipeline = EventPipeline(
         transport=transport,
         rest=rest_proxy,
@@ -201,6 +209,7 @@ def build_outbound_runtime(
         approval_timeout_seconds=kite_config.approval_timeout_seconds(config),
         question_timeout_seconds=cards.DEFAULT_QUESTION_TIMEOUT_SECONDS,
         names=names,
+        group_mode_of=_group_mode_of,
     )
     handler = OutboundAppHandler(
         event_pipeline=pipeline,
@@ -208,7 +217,7 @@ def build_outbound_runtime(
         rest=rest_proxy,
         binding_store=binding_store,
         attachment_store=PendingAttachmentStore(data_dir),
-        group_config_store=GroupConfigStore(data_dir),
+        group_config_store=group_config_store,
         runtime_loop=loop,
         config=config,
         init_token=init_token,
@@ -253,6 +262,39 @@ def _control_dispatch(outbound: OutboundRuntime) -> Callable[[str, dict[str, Any
         raise ControlError(f"unknown control method: {method}", code="unknown_method")
 
     return dispatch
+
+
+def _start_kap_child(proc: KapServerProcess, stop_event: threading.Event) -> bool:
+    """Spawn kap-server, aborting the blocking readiness wait on shutdown.
+
+    ``KapServerProcess.start()`` blocks in its readiness wait with no stop
+    hook (up to ``readiness_timeout_seconds``, default 60s), so a SIGTERM
+    arriving during startup would otherwise drag the full window (audit
+    L24). The spawn runs on a helper thread; when ``stop_event`` fires
+    mid-startup the child is SIGTERMed, which fails the wait promptly.
+    Returns False when startup was aborted by the stop event; genuine start
+    failures re-raise on the calling thread, exactly as before.
+    """
+    error: list[BaseException] = []
+
+    def _target() -> None:
+        try:
+            proc.start()
+        except BaseException as exc:  # re-raised on the main thread below
+            error.append(exc)
+
+    starter = threading.Thread(target=_target, name="kite-kap-start", daemon=True)
+    starter.start()
+    while starter.is_alive():
+        if stop_event.wait(0.2):
+            logger.info("shutdown requested during kap-server startup; stopping child")
+            proc.stop()
+            starter.join(timeout=10)
+            return False
+    starter.join()
+    if error:
+        raise error[0]
+    return True
 
 
 def run(
@@ -322,7 +364,10 @@ def run(
                 stdout_path=data_dir / "kap-server.stdout.log",
             )
             started_at = time.monotonic()
-            proc.start()
+            if not _start_kap_child(proc, stop_event):
+                # Shutdown requested while the child was still becoming
+                # ready; it has already been stopped — exit cleanly.
+                break
             assert proc.port is not None and proc.token is not None
             logger.info("kap-server ready: pid=%s port=%d home=%s", proc.pid, proc.port, home)
             status.update(kap={"pid": proc.pid, "port": proc.port})
@@ -386,7 +431,17 @@ def run(
                 binding["session_id"] for binding in binding_store.load_all().values()
             ]
             for session_id in bound_sessions:
-                ws.subscribe(session_id)
+                try:
+                    ws.subscribe(session_id)
+                except Exception:  # noqa: BLE001 - logged; the loop continues
+                    # A single failed startup subscribe (ack timeout, kap
+                    # hiccup) must not crash run() (audit L25): the session
+                    # is re-subscribed on the next WS reconnect, and the
+                    # startup recovery below still rebuilds its state.
+                    logger.exception(
+                        "startup subscribe failed session=%s; continuing supervision",
+                        session_id,
+                    )
 
             if outbound is not None and not recovered:
                 # Restart recovery (§4.6), serialized on the runtime loop:
@@ -495,10 +550,13 @@ def main(argv: list[str] | None = None) -> int:
     env_overlay = env_file.load_env_file()
     try:
         config = kite_config.load_config()
+        kap = kite_config.kap_settings(config)
     except (FileNotFoundError, ValueError) as exc:
+        # Invalid `kap:` values (bad port, non-loopback host, ...) get the
+        # same clean exit as a missing/unusable config — never a traceback
+        # (audit L23).
         logger.error("instance config unusable: %s", exc)
         return 2
-    kap = kite_config.kap_settings(config)
 
     kimi_bin = kap_server.resolve_kimi_bin(kap.kimi_bin)
     if not kimi_bin:

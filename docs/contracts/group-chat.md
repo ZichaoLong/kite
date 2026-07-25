@@ -69,8 +69,10 @@ beyond the actor rule, group creation/admin via kitectl.
    — the log since the boundary (merged with a Feishu REST history backfill,
    deduped via the boundary triple, self-app messages filtered) plus the
    current message; the envelope tells the model to answer the current
-   message, not recite history. Limits: 50 messages / 24h lookback /
-   5s boundary slack (config-overridable); history fetch failure blocks the
+   message, not recite history. Limits: 50 messages / 24h lookback (both
+   config-overridable via `group_history_fetch_limit` /
+   `group_history_fetch_lookback_seconds`) / 5s boundary slack (a fixed
+   constant, not wired to config); history fetch failure blocks the
    prompt with an explicit notice (fail-closed).
 4. **Approvals/questions in groups**: the card posts to the group chat
    (broadcast per mvp-scope §3); the click handler verifies
@@ -167,3 +169,20 @@ question row.
    (bot senders `机器人:{id[:8]}`); fail-soft, no state axis. Tests: cache
    hit/TTL/negative-cache/fallback chain, notice wording with and without a
    resolvable name.
+
+## Aligned Additions (2026-07-25, audit C2)
+
+1. **Bot removed / group disbanded**: on the chat-unavailable lifecycle
+   events the group's activation config is deactivated (fail closed to
+   silence, same stance as §4.3); the mode preference, the binding, and the
+   group log file are kept. Re-adding the bot later does NOT silently
+   revive the old activation — coming back requires an explicit admin
+   `/group activate` again.
+2. **Feishu topic (thread) replies join the main-stream context** (scope
+   cut, documented after audit L16): FOCUS models per-thread scopes and
+   keeps topic replies out of the main-stream context; this cut has one
+   boundary triple per chat and no thread scopes, so a member message
+   replied in a Feishu topic is logged and backfilled like any ordinary
+   group message. The message wire carries `thread_id`, so a future cut
+   can filter client-side; the history list API itself offers no
+   server-side thread filter.

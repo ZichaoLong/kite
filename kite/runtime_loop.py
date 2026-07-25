@@ -9,10 +9,13 @@ event-driven runtime instead of a pile of cross-thread shared-state callbacks.
 
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 from dataclasses import dataclass
 from typing import Any, Callable
+
+logger = logging.getLogger(__name__)
 
 _Thread = threading.Thread
 
@@ -96,8 +99,15 @@ class RuntimeLoop:
             assert isinstance(task, _Task)
             try:
                 task.result = task.fn(*task.args, **task.kwargs)
-            except BaseException as exc:  # pragma: no cover - exercised via call()
+            except BaseException as exc:
                 task.error = exc
+                if task.done is None:
+                    # Fire-and-forget submit(): nobody waits on the result,
+                    # so without this log the error vanishes silently
+                    # (audit L10 — _rebuild_session / _shutdown_impl paths).
+                    logger.exception(
+                        "%s: fire-and-forget task failed: %r", self._name, task.fn
+                    )
             finally:
                 if task.done is not None:
                     task.done.set()

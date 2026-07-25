@@ -9,6 +9,7 @@ temp dir and a real RuntimeLoop are used, so the serialization discipline
 from __future__ import annotations
 
 import base64
+import dataclasses
 import json
 import os
 import pathlib
@@ -39,7 +40,8 @@ from kite.identity_names import IdentityNames
 from kite.prompt_ownership import CERTAINTY_BEST_EFFORT, PromptOwnership
 from kite.runtime_loop import RuntimeLoop
 from kite.stores.binding_store import BindingStore
-from kite.stores.group_config_store import GroupConfigStore
+from kite.stores.group_config_store import GROUP_MODE_ASSISTANT, GroupConfigStore
+from kite.stores.group_log_store import GroupLogStore
 from kite.stores.pending_attachment_store import PendingAttachmentStore
 from kite.stores.terminal_result_store import TerminalResultRecord, TerminalResultStore
 from test_forward_aggregator import FakeTimer
@@ -1362,6 +1364,17 @@ class SessionsTests(AppHandlerTestCase):
         self.assertIn("没有可用会话", self.transport.last_text())
         self.assertEqual(self.transport.cards, [])
 
+    def test_sessions_card_includes_cwd(self) -> None:
+        # mvp-scope §2: the /sessions row contract is title/cwd/busy
+        # (audit L12).
+        self.rest.add_session("s-1", title="Alpha", cwd="/work/alpha")
+        self.rest.add_session("s-2", title="NoCwd", cwd=None)
+        self.send("/sessions")
+        markdown = _card_elements(self.transport.cards[0]["card"])[0]["content"]
+        self.assertIn("工作目录：`/work/alpha`", markdown)
+        # A session without a cwd renders no workdir line.
+        self.assertEqual(markdown.count("工作目录"), 1)
+
     def test_sessions_sorted_by_recent_activity(self) -> None:
         self.rest.add_session("s-old", title="Old", updated_at="2026-07-01T00:00:00Z")
         self.rest.add_session("s-new", title="New", updated_at="2026-07-25T00:00:00Z")
@@ -1794,6 +1807,19 @@ class MergeForwardTests(AppHandlerTestCase):
         self.assertEqual(self.forward_timers, [])
         self.assertEqual(self.rest.submissions, [])
 
+    def test_unrenderable_items_reply_and_buffer_nothing(self) -> None:
+        # Audit L15: the fetch succeeded (non-empty items) but nothing in
+        # the bundle is renderable — here the only item is the bundle root
+        # itself, which the renderer skips — so the user gets the same
+        # explicit notice instead of silence.
+        self.transport.merge_forward_items = [make_forward_item("om_fwd")]
+
+        self.handler.on_merge_forward(make_merge_forward(message_id="om_fwd"))
+
+        self.assertIn("未包含可识别的内容", self.transport.last_text())
+        self.assertEqual(self.forward_timers, [])
+        self.assertEqual(self.rest.submissions, [])
+
     def test_close_cancels_pending_window(self) -> None:
         self._bind()
         self.transport.merge_forward_items = [make_forward_item("om_c1", text="x")]
@@ -1806,6 +1832,87 @@ class MergeForwardTests(AppHandlerTestCase):
         self.assertTrue(self.forward_timers[-1].cancelled)
         # A late fire after close finds no pending entry and submits nothing.
         self.forward_timers[-1].fire()
+        self.assertEqual(self.rest.submissions, [])
+
+
+class BareSlashTests(AppHandlerTestCase):
+    """Audit L13 (FOCUS parity): a bare ``/`` (or ``/ text``) is answered as
+    an unknown command, never submitted as a prompt."""
+
+    def test_bare_slash_is_an_unknown_command_not_a_prompt(self) -> None:
+        self.bind("s-1")
+        self.rest.add_session("s-1")
+        self.send("/")
+        self.assertIn("未知命令 `/`", self.transport.last_text())
+        self.assertEqual(self.rest.submissions, [])
+
+    def test_slash_space_text_is_an_unknown_command_not_a_prompt(self) -> None:
+        self.bind("s-1")
+        self.rest.add_session("s-1")
+        self.send("/ 帮我总结一下")
+        self.assertIn("未知命令 `/`", self.transport.last_text())
+        self.assertEqual(self.rest.submissions, [])
+
+    def test_non_admin_bare_slash_gets_the_identity_gate(self) -> None:
+        self.send("/", sender="ou_stranger")
+        self.assertIn("仅对管理员开放", self.transport.last_text())
+        self.assertEqual(self.rest.calls, [])
+
+
+class ChatUnavailableTests(AppHandlerTestCase):
+    """Audit L18: bot removed from a group / group disbanded deactivates the
+    group config (fail-closed to silence); binding and log file survive."""
+
+    def test_activated_group_is_deactivated_when_the_chat_dies(self) -> None:
+        self.bind("s-1", chat_id="oc_group")
+        self.group_config_store.activate("oc_group", activated_by=ADMIN_OPEN_ID)
+        self.group_config_store.set_mode("oc_group", GROUP_MODE_ASSISTANT)
+        log_store = GroupLogStore(self.data_dir)
+        log_store.append(
+            "oc_group",
+            {
+                "message_id": "om_x",
+                "created_at": 1,
+                "sender_open_id": "ou_member",
+                "sender_type": "user",
+                "sender_name": "成员",
+                "msg_type": "text",
+                "text": "hello",
+            },
+        )
+        log_path = log_store.log_path("oc_group")
+        self.assertTrue(log_path.exists())
+
+        self.handler.on_chat_unavailable("oc_group", reason="bot_removed")
+
+        config = self.group_config_store.load("oc_group")
+        assert config is not None
+        self.assertFalse(config["activated"])
+        # The mode preference is kept (store convention), the log file is
+        # kept, and the binding is kept — only the activation switch flips.
+        self.assertEqual(config["mode"], GROUP_MODE_ASSISTANT)
+        self.assertTrue(log_path.exists())
+        self.assertIsNotNone(self.store.load("oc_group"))
+
+    def test_chat_unavailable_without_group_config_is_a_noop(self) -> None:
+        self.handler.on_chat_unavailable("oc_group", reason="disbanded")
+        self.assertIsNone(self.group_config_store.load("oc_group"))
+
+    def test_member_messages_stop_after_bot_removed(self) -> None:
+        # The revived-bot scenario: the deactivated group ignores member
+        # messages until an admin re-activates it explicitly.
+        self.bind("s-1", chat_id="oc_group")
+        self.group_config_store.activate("oc_group", activated_by=ADMIN_OPEN_ID)
+        self.handler.on_chat_unavailable("oc_group", reason="disbanded")
+
+        self.handler.on_message(
+            dataclasses.replace(
+                make_message("大家好", chat_id="oc_group", sender="ou_member"),
+                chat_type="group",
+                bot_mentioned=True,
+            )
+        )
+        # Not activated anymore: the member @message is ignored (no prompt).
         self.assertEqual(self.rest.submissions, [])
 
 

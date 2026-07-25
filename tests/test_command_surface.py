@@ -5,6 +5,7 @@ from kite.command_surface import (
     build_help_text,
     build_usage_text,
     get_command_spec,
+    parse_group_mode_arg,
     parse_permission_mode_arg,
     parse_plan_mode_arg,
     parse_slash_command,
@@ -19,8 +20,20 @@ class ParseSlashCommandTests(unittest.TestCase):
         self.assertIsNone(parse_slash_command(""))
         self.assertIsNone(parse_slash_command("   "))
 
-    def test_bare_slash_is_not_a_command(self) -> None:
-        self.assertIsNone(parse_slash_command("/"))
+    def test_bare_slash_parses_as_an_unknown_command(self) -> None:
+        # Audit L13 (FOCUS parity): a bare "/" must be answered as an
+        # unknown command, never submitted as a prompt — so it parses with
+        # the (handler-less) name "/".
+        command = parse_slash_command("/")
+        assert command is not None
+        self.assertEqual(command.name, "/")
+        self.assertEqual(command.arg, "")
+
+    def test_slash_space_text_parses_as_an_unknown_command(self) -> None:
+        command = parse_slash_command("/ hello there")
+        assert command is not None
+        self.assertEqual(command.name, "/")
+        self.assertEqual(command.arg, "hello there")
 
     def test_parses_name_and_arg(self) -> None:
         command = parse_slash_command("/mode auto")
@@ -138,6 +151,25 @@ class ArgParserTests(unittest.TestCase):
         self.assertIsNone(parse_plan_mode_arg(""))
         self.assertIsNone(parse_plan_mode_arg("1"))
         self.assertIsNone(parse_plan_mode_arg("toggle"))
+
+    def test_group_mode_accepts_valid_values(self) -> None:
+        self.assertEqual(parse_group_mode_arg("mention_only"), "mention_only")
+        self.assertEqual(parse_group_mode_arg("assistant"), "assistant")
+        self.assertEqual(parse_group_mode_arg(" all "), "all")
+        self.assertEqual(parse_group_mode_arg("ASSISTANT"), "assistant")
+
+    def test_group_mode_normalizes_spellings(self) -> None:
+        # Audit L14 (FOCUS codex_group_domain parity): "-" reads as "_" and
+        # the shorthand "mention" reads as "mention_only".
+        self.assertEqual(parse_group_mode_arg("mention-only"), "mention_only")
+        self.assertEqual(parse_group_mode_arg("mention"), "mention_only")
+        self.assertEqual(parse_group_mode_arg(" Mention "), "mention_only")
+
+    def test_group_mode_rejects_invalid_values(self) -> None:
+        self.assertIsNone(parse_group_mode_arg(""))
+        self.assertIsNone(parse_group_mode_arg("bogus"))
+        self.assertIsNone(parse_group_mode_arg("mentions"))
+        self.assertIsNone(parse_group_mode_arg(None))  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":

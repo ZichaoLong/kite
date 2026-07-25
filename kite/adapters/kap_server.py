@@ -1329,9 +1329,14 @@ class KapWsClient:
     # -- connection lifecycle (background thread) ----------------------------
 
     def _run(self) -> None:
+        failures = 0
+        auth_failures = 0
         while not self._stop_event.is_set():
             try:
                 self._connect_once()
+                # A completed handshake resets both counters.
+                failures = 0
+                auth_failures = 0
                 self._recv_loop()
             except _StaleConnection:
                 logger.warning("WS stale: no frame for %.1fs; reconnecting", self._stale_seconds)
@@ -1342,6 +1347,17 @@ class KapWsClient:
             except (KapWsError, KapTransportError, OSError) as exc:
                 if self._stop_event.is_set():
                     break
+                if _is_auth_failure(exc):
+                    auth_failures += 1
+                    if auth_failures >= 3:
+                        # Persistent auth failure used to hot-loop every
+                        # reconnect_delay and feed the upstream auth-failure
+                        # rate limiter (audit L31); surface it loudly.
+                        logger.error(
+                            "WS auth failed %d times in a row; the token may be "
+                            "rotated or revoked — check kitectl session status",
+                            auth_failures,
+                        )
                 logger.warning("WS connection failed: %s", exc)
             except Exception:  # noqa: BLE001 - keep the supervisor thread alive
                 if self._stop_event.is_set():
@@ -1349,7 +1365,10 @@ class KapWsClient:
                 logger.exception("WS loop unexpected error; reconnecting")
             finally:
                 self._mark_disconnected()
-            if self._stop_event.wait(self._reconnect_delay):
+            failures += 1
+            # Exponential backoff with a cap (flat-delay hot loop before).
+            delay = min(self._reconnect_delay * (2 ** min(failures - 1, 5)), 60.0)
+            if self._stop_event.wait(delay):
                 break
 
     def _connect_once(self) -> None:
@@ -1459,6 +1478,12 @@ class KapWsClient:
             # the callback, or a reconnect replays the frame and a healthy
             # prompt can be misjudged failed.
             event = _parse_event_frame(frame)
+            if event is not None and not self._is_session_event_wanted(event):
+                logger.debug(
+                    "dropping error frame for unsubscribed session %s",
+                    event.session_id,
+                )
+                return
             if event is not None and event.seq is not None and not event.volatile and event.session_id:
                 self._advance_cursor(event)
             logger.error("WS error frame: %s", payload)
@@ -1470,6 +1495,18 @@ class KapWsClient:
             return
         event = _parse_event_frame(frame)
         if event is None:
+            return
+        if not self._is_session_event_wanted(event):
+            # 0.29.1 turned event.session.work_changed into a GLOBAL event
+            # fanned out to every connection without a subscription
+            # (upstream d751b6796; audit U1): only wanted (subscribed/bound)
+            # sessions may advance cursors or feed work-state tracking —
+            # unsolicited sessions are ignored.
+            logger.debug(
+                "dropping event %s for unsubscribed session %s",
+                event.type,
+                event.session_id,
+            )
             return
         if event.seq is not None and not event.volatile and event.session_id:
             self._advance_cursor(event)
@@ -1532,11 +1569,27 @@ class KapWsClient:
             else:
                 with self._ack_cond:
                     self._ack_cond.wait(timeout=max(0.05, min(0.5, deadline - time.monotonic())))
+        # A late ack must not leak into the next request's slot (audit L32).
+        with self._ack_cond:
+            self._pending_acks.pop(request_id, None)
         raise KapWsError(f"no ack for {frame_type} within {timeout}s")
 
     def _handle_ack_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Adopt ack cursors (a cursor source of truth) and surface resyncs."""
         cursors = payload.get("cursors") if isinstance(payload.get("cursors"), dict) else {}
+        raw_not_found = payload.get("not_found")
+        not_found_ids = (
+            sorted({raw for raw in raw_not_found if isinstance(raw, str) and raw})
+            if isinstance(raw_not_found, list)
+            else []
+        )
+        if not_found_ids:
+            # Deleted/unknown sessions must leave the resubscribe loop
+            # (audit L33): stop wanting them instead of resyncing forever.
+            with self._state_lock:
+                for session_id in not_found_ids:
+                    self._wanted_sessions.discard(session_id)
+            logger.info("subscribe not_found; dropping sessions: %s", not_found_ids)
         raw_resync = payload.get("resync_required")
         resync_ids = (
             sorted({raw for raw in raw_resync if isinstance(raw, str) and raw})
@@ -1602,8 +1655,10 @@ class KapWsClient:
 
     def _advance_cursor(self, event: KapEvent) -> None:
         current = self._cursor_get(event.session_id or "")
-        if current is not None and event.seq is not None and event.seq <= current.seq:
-            return
+        # Epoch first (audit L11): an epoch rotation invalidates the cursor
+        # no matter where the new seq lands — checking seq first would let a
+        # lower new seq skip the defensive resync until the new epoch's seq
+        # climbs past the old high-water mark.
         if event.epoch and current is not None and event.epoch != current.epoch:
             # A mid-stream epoch change means our cursor is invalid; the
             # server should also resync us, but do not wait for it.
@@ -1622,6 +1677,8 @@ class KapWsClient:
                 )
             )
             return
+        if current is not None and event.seq is not None and event.seq <= current.seq:
+            return
         if event.seq is not None:
             self._cursor_set(
                 event.session_id or "",
@@ -1639,6 +1696,15 @@ class KapWsClient:
                 self._on_resync(request)
             except Exception:  # noqa: BLE001 - a bad callback must not kill the stream
                 logger.exception("on_resync_required callback failed")
+
+    def _is_session_event_wanted(self, event: KapEvent) -> bool:
+        """Wanted-set filter (audit U1): events without a session id cannot
+        be attributed and pass; a session-scoped event passes iff its
+        session is in the wanted (subscribed/bound) set."""
+        if not event.session_id:
+            return True
+        with self._state_lock:
+            return event.session_id in self._wanted_sessions
 
     def _cursor_get(self, session_id: str) -> EventCursor | None:
         if not session_id:
@@ -1687,6 +1753,17 @@ class KapWsClient:
 
 class _StaleConnection(Exception):
     """No frame of any kind arrived within the stale window."""
+
+
+def _is_auth_failure(exc: BaseException) -> bool:
+    """Whether a connect failure looks like an auth rejection (401 / 4401)."""
+    status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+    if status == 401:
+        return True
+    code = getattr(exc, "code", None) or getattr(exc, "rcvd_code", None)
+    if code in (4401, 401):
+        return True
+    return "401" in str(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -1799,6 +1876,15 @@ def _tool_display_detail(display: Any) -> str:
         return f"{name} {args}".strip()
     if kind == "task":
         return str(display.get("description") or "")
+    if kind == "todo_list":
+        items = display.get("items")
+        if isinstance(items, list):
+            return ", ".join(
+                str(item.get("title") or "")
+                for item in items
+                if isinstance(item, dict) and str(item.get("title") or "").strip()
+            )
+        return ""
     if kind == "task_stop":
         return str(display.get("task_description") or "")
     if kind == "plan_review":

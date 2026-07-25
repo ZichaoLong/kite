@@ -92,6 +92,23 @@ class RuntimeLoopTests(unittest.TestCase):
         loop.start()
         self.assertIs(loop._worker, worker)
 
+    def test_submit_exception_is_logged_not_swallowed(self) -> None:
+        # Audit L10: fire-and-forget submit() tasks (e.g. _rebuild_session /
+        # _shutdown_impl) used to have their exceptions swallowed silently.
+        loop = self._make_loop()
+
+        def boom() -> None:
+            raise KeyError("fire-and-forget")
+
+        with self.assertLogs("kite.runtime_loop", level="ERROR") as captured:
+            loop.submit(boom)
+            loop.call(lambda: None)  # flush: the failing task ran first
+            with self.assertRaises(KeyError):
+                loop.call(boom)  # call() still propagates instead of logging
+
+        matching = [line for line in captured.output if "fire-and-forget task failed" in line]
+        self.assertEqual(len(matching), 1)  # the submit() failure, exactly once
+
 
 if __name__ == "__main__":
     unittest.main()

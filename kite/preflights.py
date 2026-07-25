@@ -224,14 +224,12 @@ class ServiceStopPreview:
     """Live-state probe for `kitectl service stop|restart`.
 
     ``verifiable=False`` means kap could not be queried at all; the operation
-    is then force-only (never silently available). ``kited_running`` is
-    observability for the preview message (from runtime_status.json).
+    is then force-only (never silently available).
     """
 
     verifiable: bool
     busy_sessions: int = 0
     pending_interactions: int = 0
-    kited_running: Optional[bool] = None
 
     @property
     def force_only(self) -> bool:
@@ -256,7 +254,6 @@ class ServiceStopPreview:
 def preview_service_stop(
     sessions: Optional[Sequence[SessionSummary]],
     *,
-    kited_running: Optional[bool],
     verified_pending: Optional[int] = None,
 ) -> ServiceStopPreview:
     """Build the preview from a kap session list; ``None`` = unverifiable.
@@ -267,7 +264,7 @@ def preview_service_stop(
     flag count is used as the conservative fallback.
     """
     if sessions is None:
-        return ServiceStopPreview(verifiable=False, kited_running=kited_running)
+        return ServiceStopPreview(verifiable=False)
     pending = (
         verified_pending
         if verified_pending is not None
@@ -277,5 +274,4 @@ def preview_service_stop(
         verifiable=True,
         busy_sessions=sum(1 for session in sessions if session.busy),
         pending_interactions=pending,
-        kited_running=kited_running,
     )

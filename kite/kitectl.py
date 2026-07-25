@@ -3,13 +3,19 @@ kitectl — the KITE local admin CLI.
 
 Implemented slice (docs/contracts/mvp-scope.md §2 kitectl row, §6):
   - `kitectl config show`     — the effective config with secrets redacted
+  - `kitectl config init-token`
+                              — the /init admin-registration token (kited
+                                generates it on first start)
   - `kitectl service install|uninstall|start|stop|restart|status|log`
                               — the single-instance OS service over
                                 kite.service_manager; install only writes the
                                 definition, it does not start it (design §9).
                                 stop/restart run a destructive-op preview gate:
                                 busy sessions or pending interactions (or an
-                                unverifiable live state) require --force
+                                unverifiable live state) require --force;
+                                status exits 0 while running, 3 otherwise
+                                (FOCUS semantics, pollable as a liveness
+                                check)
   - `kitectl binding list`    — chat ↔ session bindings from the local store
   - `kitectl session list`    — sessions visible on kap-server
   - `kitectl session status`  — binding mapping, work state, queue depth,
@@ -163,10 +169,25 @@ def _cmd_session_list(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _read_bindings(store: BindingStore, chat_id: str | None = None) -> Any:
+    """Read the binding store, mapping corruption onto a clean CLI error.
+
+    The store raises ValueError fail-closed on a corrupt bindings.json (and
+    OSError on an unreadable one); kitectl must surface that as a CliError,
+    not a bare traceback (audit L30).
+    """
+    try:
+        if chat_id is None:
+            return store.load_all()
+        return store.load(chat_id)
+    except (ValueError, OSError) as exc:
+        _die(f"cannot read the binding store (bindings.json): {exc}")
+
+
 def _cmd_session_status(_args: argparse.Namespace) -> int:
     client = _connect()
     data_dir = default_data_root()
-    bindings = BindingStore(data_dir).load_all()
+    bindings = _read_bindings(BindingStore(data_dir))
     sessions = {s.session_id: s for s in _checked(client.list_sessions)}
 
     print("Bindings:")
@@ -188,9 +209,18 @@ def _cmd_session_status(_args: argparse.Namespace) -> int:
     print("Sessions:")
     bound_ids = sorted({binding["session_id"] for binding in bindings.values()})
     rows = []
+    session_errors = 0
     for session_id in bound_ids:
         summary = sessions.get(session_id)
-        queue = _checked(lambda: client.get_prompts(session_id))
+        try:
+            queue = client.get_prompts(session_id)
+        except (kap_server.KapError, kap_server.KapTransportError) as exc:
+            # One broken session must not kill the whole report (audit
+            # L27): a per-session error line, and a non-zero exit at the
+            # end so scripts notice.
+            session_errors += 1
+            print(f"  {session_id}: error: {exc}")
+            continue
         rows.append(
             [
                 session_id,
@@ -207,7 +237,7 @@ def _cmd_session_status(_args: argparse.Namespace) -> int:
                 ["SESSION_ID", "TITLE", "BUSY", "QUEUE", "ACTIVE_PROMPT", "PENDING"], rows
             )
         )
-    else:
+    elif not session_errors:
         print("  (no bound sessions)")
 
     print("Daemon:")
@@ -234,7 +264,7 @@ def _cmd_session_status(_args: argparse.Namespace) -> int:
             print(f"  last resync: {_format_age(last_resync, now=now)} ago")
         else:
             print("  last resync: never")
-    return 0
+    return 1 if session_errors else 0
 
 
 def _redact_secrets(value: Any) -> Any:
@@ -263,11 +293,46 @@ def _cmd_config_show(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_config_init_token(_args: argparse.Namespace) -> int:
+    """Show the /init admin-registration token (mvp-scope §5).
+
+    kited generates the token on first start (not at install time); it lives
+    next to system.yaml. Printed in clear on purpose — the instance operator
+    running kitectl needs the value to register the first admin from Feishu.
+    """
+    path = kite_config.init_token_path()
+    print(f"init token file: {path}")
+    try:
+        token = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        print("(not created yet — kited generates it on first start)")
+        return 3
+    print(f"token: {token}")
+    return 0
+
+
 def _service_definition() -> service_manager.ServiceDefinition:
-    """The single-instance service definition, honoring --config-dir/--data-dir."""
+    """The single-instance service definition, honoring --config-dir/--data-dir.
+
+    The unit's ExecStart carries the instance directories explicitly: the
+    service runs without this shell's environment (KITE_CONFIG_DIR /
+    KITE_DATA_ROOT), so a definition written under custom
+    --config-dir/--data-dir but lacking the flags would start kited with
+    the DEFAULT directories — a self-contradictory unit (audit L26).
+    """
+    config_dir = kite_config.config_dir()
+    data_dir = default_data_root()
+    command = [
+        *service_manager.default_daemon_command(),
+        "--config-dir",
+        str(config_dir),
+        "--data-dir",
+        str(data_dir),
+    ]
     return service_manager.build_service_definition(
-        config_dir=kite_config.config_dir(),
-        data_dir=default_data_root(),
+        config_dir=config_dir,
+        data_dir=data_dir,
+        daemon_command=command,
     )
 
 
@@ -361,11 +426,8 @@ def _service_in_flight_gate(args: argparse.Namespace, *, verb: str) -> None:
     except (CliError, kap_server.KapError, kap_server.KapTransportError):
         sessions = None
         verified_pending = None
-    status = read_runtime_status(default_data_root())
-    kited_pid = status.get("kited_pid") if status else None
     preview = preflights.preview_service_stop(
         sessions,
-        kited_running=isinstance(kited_pid, int) and process_exists(kited_pid),
         verified_pending=verified_pending,
     )
     if not preview.force_only:
@@ -390,7 +452,9 @@ def _cmd_service_status(_args: argparse.Namespace) -> int:
         print(f"source: {status.source}")
     if status.detail:
         print(f"detail: {status.detail}")
-    return 0
+    # FOCUS exit-code semantics: 0 only while running, 3 otherwise — scripts
+    # can poll `kitectl service status` directly as the liveness check.
+    return 0 if status.running else 3
 
 
 def _cmd_service_autostart(args: argparse.Namespace) -> int:
@@ -447,7 +511,7 @@ def _cmd_service_log(args: argparse.Namespace) -> int:
 
 
 def _cmd_binding_list(_args: argparse.Namespace) -> int:
-    bindings = BindingStore(default_data_root()).load_all()
+    bindings = _read_bindings(BindingStore(default_data_root()))
     if not bindings:
         print("(no bindings)")
         return 0
@@ -606,7 +670,7 @@ def _cmd_schedule_create(args: argparse.Namespace) -> int:
     # Contract §3/§4.3: the target chat must already be bound — reject before
     # writing anything (at fire time the control plane's no_binding error is
     # the fail-closed outcome; creating anyway would build a dead timer).
-    if BindingStore(default_data_root()).load(chat_id) is None:
+    if _read_bindings(BindingStore(default_data_root()), chat_id) is None:
         _die(f"no binding for chat {chat_id}; bind the chat from Feishu first")
     try:
         if args.at is not None:
@@ -806,6 +870,11 @@ def _build_parser() -> argparse.ArgumentParser:
     config_sub.add_parser(
         "show", help="show the effective config with secrets redacted"
     ).set_defaults(func=_cmd_config_show)
+    config_sub.add_parser(
+        "init-token",
+        help="show the /init admin-registration token "
+        "(generated by kited on first start)",
+    ).set_defaults(func=_cmd_config_init_token)
 
     service_parser = subparsers.add_parser("service", help="OS service management")
     service_sub = service_parser.add_subparsers(dest="service_command", required=True)

@@ -60,7 +60,7 @@ kitectl —— 本地管理面（配置/启停/binding/session/prompt/image)
 | 飞书传输层 | lark-oapi WS 长连接；消息去重、收发、卡片 patch、附件下载 | 只依赖飞书 SDK；不认识 kap-server |
 | 应用层 | 命令路由、binding 解析、状态机、卡片模型、审批路由 | 所有跨连接/跨任务状态变更经 **RuntimeLoop** 单线程串行化 |
 | 适配层 | kap-server REST 客户端 + WS 订阅客户端；类型归一化；resync 纪律 | kap 的 schema/envelope/DomainEvent **只允许出现在本层** |
-| 本地状态层 | binding、UI 临时态、事件 cursor 等 JSON stores（原子写 + 文件锁） | session 元数据以 kimi-code 为单一事实源，本地不复制 |
+| 本地状态层 | binding、UI 临时态、事件 cursor 等 JSON stores（单写者原子写；仅跨进程写用文件锁） | session 元数据以 kimi-code 为单一事实源，本地不复制 |
 
 词汇一律采用 kimi-code 原生术语：**session、agent、prompt、approval、
 question**。不引入 codex 时代的 thread/turn 命名（FOCUS 资产移植时须改名的

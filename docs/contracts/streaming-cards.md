@@ -94,3 +94,7 @@ volatile-derived state that survives into durable decisions.
 - The durable-event list in kite-design §5 stays the sole driver of state
   transitions; this contract adds a volatile side-channel for presentation
   only — exactly the "volatile later" clause already registered there.
+- Stuck-running backstop: the FOCUS mirror-watchdog / stuck-running
+  reconcile is a deliberate later hardening item (registered in
+  focus-assets-map). Until it lands, a card stuck in "执行中" is recovered
+  through the `kitectl session status` troubleshooting path.

@@ -590,6 +590,22 @@ class GroupModeCommandTests(GroupChatTestCase):
         assert config is not None
         self.assertEqual(config["mode"], GROUP_MODE_MENTION_ONLY)
 
+    def test_group_mode_normalizes_spellings(self) -> None:
+        # Audit L14 (FOCUS parity): "mention-only" and "mention" both read
+        # as mention_only instead of being rejected.
+        self.activate_group(mode=GROUP_MODE_ASSISTANT)
+        self.send_group("/group-mode mention-only", sender=ADMIN_OPEN_ID, mentioned=False)
+        config = self.group_config_store.load(GROUP_CHAT_ID)
+        assert config is not None
+        self.assertEqual(config["mode"], GROUP_MODE_MENTION_ONLY)
+        self.assertIn("mention_only", self.transport.last_text())
+
+        self.send_group("/group-mode assistant", sender=ADMIN_OPEN_ID, mentioned=False)
+        self.send_group("/group-mode mention", sender=ADMIN_OPEN_ID, mentioned=False)
+        config = self.group_config_store.load(GROUP_CHAT_ID)
+        assert config is not None
+        self.assertEqual(config["mode"], GROUP_MODE_MENTION_ONLY)
+
     def test_group_mode_without_arg_shows_current_mode(self) -> None:
         self.activate_group()
         self.send_group("/group-mode", sender=ADMIN_OPEN_ID, mentioned=False)

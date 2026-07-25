@@ -242,6 +242,12 @@ def group_history_fetch_lookback_seconds(config: Mapping[str, Any]) -> int:
 # ---------------------------------------------------------------------------
 
 
+# kap.host is validated loopback-only (audit L29): the managed kap-server
+# child is spawned without --host and binds loopback, and kap-server has no
+# TLS — a non-loopback host could never connect and only misleads.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
 @dataclass(frozen=True, slots=True)
 class KapSettings:
     """The `kap:` section of system.yaml.
@@ -286,6 +292,12 @@ def kap_settings(config: Mapping[str, Any]) -> KapSettings:
     host = raw.get("host", "127.0.0.1")
     if not isinstance(host, str) or not host.strip():
         raise ValueError("kap.host must be a non-empty string")
+    if host.strip().lower() not in _LOOPBACK_HOSTS:
+        raise ValueError(
+            "kap.host must be a loopback address (127.0.0.1, ::1 or localhost): "
+            "the managed kap-server child is never passed --host and binds "
+            "loopback only, so any other value can never connect"
+        )
 
     port = raw.get("port")
     if port is not None:

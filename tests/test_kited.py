@@ -8,6 +8,7 @@ import threading
 import time
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import fake_kap
 from kite import kited
@@ -155,6 +156,147 @@ class KitedRunTests(unittest.TestCase):
         self.thread.join(timeout=20)
         self.assertEqual(self.result, 0)
         self.assertFalse(process_exists(second_pid))
+
+
+class _BlockingStartProc:
+    """KapServerProcess double whose readiness wait blocks until stop().
+
+    Simulates the worst case of audit L24: the child never becomes ready
+    inside the test window, so the only way startup can finish promptly is
+    the stop event aborting the wait.
+    """
+
+    def __init__(self, **_kwargs) -> None:
+        self.port = None
+        self.token = None
+        self.pid = None
+        self.started = threading.Event()
+        self.stop_called = threading.Event()
+
+    def start(self) -> "_BlockingStartProc":
+        self.started.set()
+        if self.stop_called.wait(timeout=30):
+            raise RuntimeError("kimi web exited early rc=-15")
+        raise RuntimeError("kimi web not ready within 30s")
+
+    def poll(self) -> int | None:
+        return -15 if self.stop_called.is_set() else None
+
+    def stop(self, grace_seconds: float = 10.0) -> int:
+        self.stop_called.set()
+        return -15
+
+
+class _InstantProc:
+    """KapServerProcess double that is immediately ready."""
+
+    def __init__(self, **_kwargs) -> None:
+        self.port = 1
+        self.token = "tok"
+        self.pid = os.getpid()
+
+    def start(self) -> "_InstantProc":
+        return self
+
+    def poll(self) -> None:
+        return None
+
+    def stop(self, grace_seconds: float = 10.0) -> int:
+        return 0
+
+
+class _FakeWsClient:
+    """KapWsClient double recording subscribes; scripted failures."""
+
+    def __init__(self, **_kwargs) -> None:
+        self.subscribed: list[str] = []
+        self.stopped = False
+        self.fail_on: set[str] = set()
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        self.stopped = True
+
+    def subscribe(self, session_id: str) -> None:
+        self.subscribed.append(session_id)
+        if session_id in self.fail_on:
+            raise RuntimeError(f"subscribe boom: {session_id}")
+
+
+class KitedStartupRobustnessTests(KitedRunTests):
+    """Audits L24/L25: startup must honor the stop event and survive a
+    failing subscribe."""
+
+    def test_readiness_wait_aborts_promptly_on_stop(self) -> None:
+        proc = _BlockingStartProc()
+        with patch("kite.kited.KapServerProcess", lambda **_kw: proc):
+            self._start()
+            self.assertTrue(proc.started.wait(timeout=5))
+            time.sleep(0.3)  # let run() settle into the readiness wait
+            started_at = time.monotonic()
+            self.stop_event.set()
+            self.thread.join(timeout=10)
+        self.assertFalse(self.thread.is_alive())
+        self.assertEqual(self.result, 0)
+        self.assertTrue(proc.stop_called.is_set())
+        # Prompt, not the (fake) 30s readiness window.
+        self.assertLess(time.monotonic() - started_at, 10)
+
+    def test_failed_startup_subscribe_does_not_crash_run(self) -> None:
+        store = BindingStore(self.data_dir)
+        for chat_id, session_id in (("chat-1", "s-1"), ("chat-2", "s-bad")):
+            store.save(
+                chat_id,
+                {"session_id": session_id, "attached": True,
+                 "permission_mode": "auto", "plan_mode": False},
+            )
+        ws = _FakeWsClient()
+        ws.fail_on.add("s-bad")
+        with patch("kite.kited.KapServerProcess", lambda **_kw: _InstantProc()), patch(
+            "kite.kited.KapWsClient", lambda **_kw: ws
+        ), patch("kite.kited._log_server_meta", lambda _rest: None):
+            self._start()
+            self.assertTrue(wait_until(lambda: "s-bad" in ws.subscribed))
+            self.stop_event.set()
+            self.thread.join(timeout=10)
+        self.assertFalse(self.thread.is_alive())
+        # Both subscribes were attempted (the failure was logged, not
+        # raised through run()), and the supervision loop exited cleanly.
+        self.assertEqual(set(ws.subscribed), {"s-1", "s-bad"})
+        self.assertEqual(self.result, 0)
+        self.assertTrue(ws.stopped)
+
+
+class KitedMainTests(unittest.TestCase):
+    def test_main_invalid_kap_config_exits_2_cleanly(self) -> None:
+        # Audit L23: an invalid `kap:` value (here a non-loopback host) gets
+        # the same clean exit-2 as an unusable config, never a traceback.
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td)
+            config_dir = root / "cfg"
+            data_dir = root / "data"
+            config_dir.mkdir()
+            data_dir.mkdir()
+            (config_dir / "system.yaml").write_text(
+                "app_id: cli_x\napp_secret: sec\nkap:\n  host: 0.0.0.0\n",
+                encoding="utf-8",
+            )
+            saved_env = {
+                key: os.environ.get(key) for key in ("KITE_CONFIG_DIR", "KITE_DATA_ROOT")
+            }
+            try:
+                rc = kited.main(
+                    ["--config-dir", str(config_dir), "--data-dir", str(data_dir)]
+                )
+            finally:
+                for key, value in saved_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+            self.assertEqual(rc, 2)
 
 
 CONTROL_TOKEN = "test-control-token"

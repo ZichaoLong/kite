@@ -67,7 +67,7 @@ kitectl —— local admin surface (config/start-stop/binding/session/prompt/ima
 | Feishu transport | lark-oapi WS long connection; message dedup, send/receive, card patch, attachment download | Depends only on the Feishu SDK; does not know kap-server |
 | Application | command routing, binding resolution, state machines, card model, approval routing | All cross-connection/cross-task state changes are serialized through the single-threaded **RuntimeLoop** |
 | Adapter | kap-server REST client + WS subscription client; type normalization; resync discipline | kap's schema/envelope/DomainEvent **may only appear in this layer** |
-| Local state | JSON stores for bindings, UI transient state, event cursors, etc. (atomic write + file lock) | Session metadata has kimi-code as its single source of truth; not replicated locally |
+| Local state | JSON stores for bindings, UI transient state, event cursors, etc. (single-writer atomic write; file lock only where a write crosses processes) | Session metadata has kimi-code as its single source of truth; not replicated locally |
 
 Vocabulary uniformly adopts kimi-code native terms: **session, agent, prompt,
 approval, question**. Do not introduce codex-era thread/turn naming (this batch

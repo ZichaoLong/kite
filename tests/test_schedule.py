@@ -158,6 +158,39 @@ class CtlPathResolutionTests(unittest.TestCase):
             with self.assertRaisesRegex(ScheduleError, "kitectl not found"):
                 schedule_units.resolve_ctl_path()
 
+    def test_windows_candidates_use_scripts_and_exe(self) -> None:
+        # Audit L20: on Windows the managed venv has Scripts/kitectl.exe
+        # (no bin/), and the user bin wrapper is kitectl.exe — without these
+        # candidates the default resolution always failed there.
+        venv_ctl = self._make_executable(
+            self.root / "data" / ".venv" / "Scripts" / "kitectl.exe"
+        )
+        with patch("kite.schedule_units.is_windows", return_value=True), patch(
+            "kite.schedule_units.default_user_bin_dir", return_value=self.root / "bin"
+        ), patch(
+            "kite.schedule_units.default_data_root", return_value=self.root / "data"
+        ):
+            self.assertEqual(schedule_units.resolve_ctl_path(), str(venv_ctl.resolve()))
+
+    def test_windows_bin_dir_candidate_beats_venv(self) -> None:
+        bin_ctl = self._make_executable(self.root / "bin" / "kitectl.exe")
+        self._make_executable(self.root / "data" / ".venv" / "Scripts" / "kitectl.exe")
+        with patch("kite.schedule_units.is_windows", return_value=True), patch(
+            "kite.schedule_units.default_user_bin_dir", return_value=self.root / "bin"
+        ), patch(
+            "kite.schedule_units.default_data_root", return_value=self.root / "data"
+        ):
+            self.assertEqual(schedule_units.resolve_ctl_path(), str(bin_ctl.resolve()))
+
+    def test_windows_nothing_found_names_the_checked_paths(self) -> None:
+        with patch("kite.schedule_units.is_windows", return_value=True), patch(
+            "kite.schedule_units.default_user_bin_dir", return_value=self.root / "bin"
+        ), patch(
+            "kite.schedule_units.default_data_root", return_value=self.root / "data"
+        ):
+            with self.assertRaisesRegex(ScheduleError, r"Scripts[/\\]kitectl\.exe"):
+                schedule_units.resolve_ctl_path()
+
 
 def _spec(**overrides) -> schedule_units.ScheduleSpec:
     values = {

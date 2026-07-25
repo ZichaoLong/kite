@@ -233,6 +233,21 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "kap must be a mapping"):
             kap_settings({"kap": "nope"})
 
+    def test_kap_settings_rejects_non_loopback_host(self) -> None:
+        # Audit L29: the managed child is never passed --host and binds
+        # loopback only, so a non-loopback kap.host could never connect —
+        # reject it at config validation with a clear error.
+        for bad in ("0.0.0.0", "192.168.1.10", "example.internal", "::"):
+            with self.subTest(host=bad):
+                with self.assertRaisesRegex(ValueError, "kap.host must be a loopback"):
+                    kap_settings({"kap": {"host": bad}})
+
+    def test_kap_settings_accepts_loopback_host_spellings(self) -> None:
+        for good in ("127.0.0.1", "::1", "localhost", " LOCALHOST "):
+            with self.subTest(host=good):
+                settings = kap_settings({"kap": {"host": good}})
+                self.assertTrue(settings.host)
+
 
 if __name__ == "__main__":
     unittest.main()

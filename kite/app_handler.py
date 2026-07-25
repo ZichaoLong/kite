@@ -103,6 +103,7 @@ from kite.command_surface import (
     SlashCommand,
     build_help_text,
     build_usage_text,
+    parse_group_mode_arg,
     parse_permission_mode_arg,
     parse_plan_mode_arg,
     parse_slash_command,
@@ -142,7 +143,6 @@ from kite.stores.group_config_store import (
     GROUP_MODE_ALL,
     GROUP_MODE_ASSISTANT,
     GROUP_MODE_MENTION_ONLY,
-    VALID_GROUP_MODES,
     GroupConfigStore,
 )
 from kite.stores.group_log_store import GroupLogStore
@@ -513,9 +513,34 @@ class AppHandler(TransportHandler):
         logger.info("message recalled: chat=%s message_id=%s (ignored)", chat_id, message_id)
 
     def on_chat_unavailable(self, chat_id: str, *, reason: str = "") -> None:
-        # MVP: the binding is kept; a p2p chat cannot come back under the
-        # same id, and silently dropping the bookmark would lose history.
-        logger.info("chat unavailable: chat=%s reason=%s (binding kept)", chat_id, reason)
+        try:
+            self._loop.call(self._on_chat_unavailable_impl, chat_id, reason)
+        except Exception:
+            logger.exception(
+                "failed to handle chat unavailable chat=%s reason=%s", chat_id, reason
+            )
+
+    def _on_chat_unavailable_impl(self, chat_id: str, reason: str) -> None:
+        # The binding is kept: a p2p chat cannot come back under the same
+        # id, and silently dropping the bookmark would lose history. But a
+        # group the bot was removed from (or that was disbanded) gets its
+        # activation config deactivated (fail-closed to silence, audit
+        # L18): re-adding the bot later must not silently revive the old
+        # activation/mode — coming back requires an explicit admin
+        # /group activate. The group log file is kept (context material,
+        # not an access switch).
+        group_config = self._group_config_store.load(chat_id)
+        if group_config is not None and group_config["activated"]:
+            self._group_config_store.deactivate(chat_id)
+            logger.info(
+                "group deactivated on chat unavailable: chat=%s reason=%s (log kept)",
+                chat_id,
+                reason,
+            )
+            return
+        logger.info(
+            "chat unavailable: chat=%s reason=%s (binding kept)", chat_id, reason
+        )
 
     def on_bot_menu(self, open_id: str, event_key: str) -> None:
         logger.info("bot menu click: open_id=%s event_key=%s (ignored)", open_id, event_key)
@@ -882,6 +907,22 @@ class AppHandler(TransportHandler):
             )
             return
         if not items:
+            self._reply(
+                message.chat_id,
+                "合并转发的消息中未包含可识别的内容。",
+                parent_message_id=message.message_id,
+            )
+            return
+        if not self._forward_aggregator.render_transcript(message.message_id, items):
+            # The fetch succeeded but nothing in the bundle is renderable
+            # (every child unparseable/unsupported): say so explicitly,
+            # same as the empty-items branch above, instead of buffering a
+            # stash that would flush into silence (FOCUS parity, audit L15).
+            logger.info(
+                "merge_forward had no renderable content chat=%s message_id=%s",
+                message.chat_id,
+                message.message_id,
+            )
             self._reply(
                 message.chat_id,
                 "合并转发的消息中未包含可识别的内容。",
@@ -1844,14 +1885,14 @@ class AppHandler(TransportHandler):
             # corrupt record reads as non-activated here too (§4.3).
             self._reply_to(message, "本群尚未激活，请先发送 /group activate 激活。")
             return
-        mode = arg.strip().lower()
-        if not mode:
+        if not arg.strip():
             self._reply_to(
                 message,
                 f"当前群聊模式：{group_config['mode']}。可选：mention_only / assistant / all。",
             )
             return
-        if mode not in VALID_GROUP_MODES:
+        mode = parse_group_mode_arg(arg)
+        if mode is None:
             self._reply_to(message, build_usage_text("/group-mode"))
             return
         if mode == group_config["mode"]:
@@ -2376,7 +2417,11 @@ def _build_sessions_card(sessions: list[SessionSummary], *, bound_id: str) -> di
         if session.pending_interaction:
             state += f"；待处理：{session.pending_interaction}"
         title = session.title or "（无标题）"
-        lines.append(f"{index}. {title}{marker}\n`{session.session_id}` — {state}")
+        entry = f"{index}. {title}{marker}\n`{session.session_id}` — {state}"
+        if session.cwd:
+            # mvp-scope §2: the row contract is title/cwd/busy.
+            entry += f"\n工作目录：`{session.cwd}`"
+        lines.append(entry)
     if len(sessions) > len(shown):
         lines.append(f"（仅显示前 {len(shown)} 个，共 {len(sessions)} 个）")
     if len(shown) > _SESSIONS_BUTTON_CAP:
