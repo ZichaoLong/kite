@@ -31,7 +31,8 @@ Implemented slice (docs/contracts/mvp-scope.md §2 kitectl row, §6):
                                 with the per-chat report.
   - `kitectl schedule create|list|show|remove|run-now`
                               — scheduled prompts (docs/contracts/scheduled-prompts.md):
-                                Linux systemd --user timers that fire
+                                OS timers (Linux systemd --user, macOS launchd,
+                                Windows Task Scheduler) that fire
                                 `kitectl prompt send` back into the daemon.
                                 Validation is fail-closed before anything is
                                 written (past --at, unparseable --cron,
@@ -72,7 +73,7 @@ from kite.control_plane import (
     ControlRefusedError,
     discover_live_control_metadata,
 )
-from kite.platform_paths import default_data_root, is_linux
+from kite.platform_paths import default_data_root
 from kite.process_utils import process_exists
 from kite.runtime_status import read_runtime_status
 from kite.stores.binding_store import BindingStore
@@ -576,23 +577,26 @@ def _cmd_image_send(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
-# schedule — Linux systemd --user timers (docs/contracts/scheduled-prompts.md)
+# schedule — OS timer backends (docs/contracts/scheduled-prompts.md §2):
+# Linux systemd --user timers, macOS launchd, Windows Task Scheduler
 # ---------------------------------------------------------------------------
 
 
-def _require_schedule_platform() -> None:
-    if not is_linux():
-        _die("kitectl schedule is Linux-only (systemd --user timers)")
+def _schedule_backend() -> schedule_units.ScheduleBackend:
+    try:
+        return schedule_units.current_schedule_backend()
+    except schedule_units.ScheduleError as exc:
+        _die(str(exc))
 
 
 def _schedule_error(exc: Exception) -> NoReturn:
-    if isinstance(exc, schedule_units.ScheduleSystemctlError):
+    if isinstance(exc, schedule_units.ScheduleBackendError):
         _die(str(exc), exit_code=1)
     _die(str(exc))
 
 
 def _cmd_schedule_create(args: argparse.Namespace) -> int:
-    _require_schedule_platform()
+    backend = _schedule_backend()
     text = str(args.text or "").strip()
     if not text:
         _die("prompt text must not be empty")
@@ -604,37 +608,35 @@ def _cmd_schedule_create(args: argparse.Namespace) -> int:
         _die(f"no binding for chat {chat_id}; bind the chat from Feishu first")
     try:
         if args.at is not None:
-            on_calendar = schedule_units.parse_at_on_calendar(args.at)
-            recurring = False
+            plan = schedule_units.parse_at_schedule(args.at)
         else:
-            on_calendar = schedule_units.parse_cron_on_calendar(args.cron)
-            recurring = True
+            plan = schedule_units.parse_cron_schedule(args.cron)
         ctl_path = schedule_units.resolve_ctl_path(args.ctl_path)
-        spec = schedule_units.create_schedule(
+        spec = schedule_units.build_schedule_spec(
             chat_id=chat_id,
             text=text,
-            on_calendar=on_calendar,
-            recurring=recurring,
+            plan=plan,
             display=args.display,
             ctl_path=ctl_path,
         )
-    except (schedule_units.ScheduleError, schedule_units.ScheduleSystemctlError) as exc:
+        artifacts = backend.install(spec)
+    except (schedule_units.ScheduleError, schedule_units.ScheduleBackendError) as exc:
         _schedule_error(exc)
     print(f"name: {spec.name}")
     print(f"chat_id: {spec.chat_id}")
     print(f"on_calendar: {spec.on_calendar}")
     print(f"display: {spec.display}")
     print(f"ctl_path: {spec.ctl_path}")
-    print(f"timer_unit: {schedule_units.timer_unit_path(spec.name)}")
-    print(f"service_unit: {schedule_units.service_unit_path(spec.name)}")
-    if recurring:
+    for label, path in artifacts:
+        print(f"{label}: {path}")
+    if plan.recurring:
         # Contract §4.4: a recurring timer has no natural end and kitectl
         # cannot tell whether the prompt carries a termination strategy, so
         # every --cron create warns.
         print(
             "warning: recurring schedule without a verified termination strategy; "
-            "systemd keeps firing until the timer is removed — give the prompt a "
-            f"self-removal condition (`kitectl schedule remove {spec.name} --yes`) "
+            "the OS timer keeps firing until the schedule is removed — give the "
+            f"prompt a self-removal condition (`kitectl schedule remove {spec.name} --yes`) "
             "or a one-shot cleanup prompt (docs/contracts/scheduled-prompts.md §4.4)",
             file=sys.stderr,
         )
@@ -642,8 +644,11 @@ def _cmd_schedule_create(args: argparse.Namespace) -> int:
 
 
 def _cmd_schedule_list(_args: argparse.Namespace) -> int:
-    _require_schedule_platform()
-    entries = schedule_units.list_schedules()
+    backend = _schedule_backend()
+    try:
+        entries = backend.list()
+    except (schedule_units.ScheduleError, schedule_units.ScheduleBackendError) as exc:
+        _schedule_error(exc)
     if not entries:
         print("(no schedules)")
         return 0
@@ -653,39 +658,38 @@ def _cmd_schedule_list(_args: argparse.Namespace) -> int:
 
 
 def _cmd_schedule_show(args: argparse.Namespace) -> int:
-    _require_schedule_platform()
+    backend = _schedule_backend()
     try:
-        shown = schedule_units.show_schedule(args.name)
+        files = backend.show(args.name)
     except schedule_units.ScheduleError as exc:
         _schedule_error(exc)
-    print(f"# {shown.timer_path}")
-    print(shown.timer_text, end="")
-    print(f"# {shown.service_path}")
-    print(shown.service_text, end="")
+    for path, text in files:
+        print(f"# {path}")
+        print(text, end="")
     return 0
 
 
 def _cmd_schedule_remove(args: argparse.Namespace) -> int:
-    _require_schedule_platform()
+    backend = _schedule_backend()
     try:
-        base, _, _ = schedule_units.schedule_unit_paths(args.name)
+        base = backend.resolve_name(args.name)
     except schedule_units.ScheduleError as exc:
         _schedule_error(exc)
     if not args.yes:
         _die(f"re-run with --yes to disable and delete schedule '{base}'")
     try:
-        schedule_units.remove_schedule(base)
-    except (schedule_units.ScheduleError, schedule_units.ScheduleSystemctlError) as exc:
+        backend.remove(base)
+    except (schedule_units.ScheduleError, schedule_units.ScheduleBackendError) as exc:
         _schedule_error(exc)
     print(f"schedule '{base}' removed")
     return 0
 
 
 def _cmd_schedule_run_now(args: argparse.Namespace) -> int:
-    _require_schedule_platform()
+    backend = _schedule_backend()
     try:
-        base = schedule_units.run_schedule_now(args.name)
-    except (schedule_units.ScheduleError, schedule_units.ScheduleSystemctlError) as exc:
+        base = backend.run_now(args.name)
+    except (schedule_units.ScheduleError, schedule_units.ScheduleBackendError) as exc:
         _schedule_error(exc)
     print(f"schedule '{base}' started")
     return 0
@@ -933,11 +937,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
     schedule_parser = subparsers.add_parser(
         "schedule",
-        help="scheduled prompts via systemd --user timers (Linux only)",
+        help="scheduled prompts via OS timers (systemd --user / launchd / Task Scheduler)",
     )
     schedule_sub = schedule_parser.add_subparsers(dest="schedule_command", required=True)
     create_parser = schedule_sub.add_parser(
-        "create", help="create a scheduled prompt (writes + enables the timer)"
+        "create", help="create a scheduled prompt (writes + enables the OS timer)"
     )
     create_parser.add_argument(
         "--chat",
@@ -978,12 +982,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "list", help="list scheduled prompts with their next elapse"
     ).set_defaults(func=_cmd_schedule_list)
     show_parser = schedule_sub.add_parser(
-        "show", help="print the timer + service definitions of one schedule"
+        "show", help="print the stored timer definition(s) of one schedule"
     )
     show_parser.add_argument("name", help="schedule name (kite-schedule-<hash> or the hash)")
     show_parser.set_defaults(func=_cmd_schedule_show)
     remove_parser = schedule_sub.add_parser(
-        "remove", help="disable + delete a schedule's unit pair"
+        "remove", help="disable + delete a schedule"
     )
     remove_parser.add_argument("name", help="schedule name (kite-schedule-<hash> or the hash)")
     remove_parser.add_argument(
@@ -993,7 +997,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     remove_parser.set_defaults(func=_cmd_schedule_remove)
     run_now_parser = schedule_sub.add_parser(
-        "run-now", help="fire a schedule's service unit once immediately"
+        "run-now", help="fire a schedule once immediately"
     )
     run_now_parser.add_argument("name", help="schedule name (kite-schedule-<hash> or the hash)")
     run_now_parser.set_defaults(func=_cmd_schedule_run_now)
