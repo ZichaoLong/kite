@@ -38,7 +38,6 @@ import logging
 import os
 import pathlib
 import re
-import secrets
 import shutil
 import signal
 import socket
@@ -51,7 +50,6 @@ import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
 
 import websockets.exceptions
@@ -514,7 +512,7 @@ def normalize_durable_event(event: KapEvent) -> DurableEvent | None:
             return SessionWorkChanged(
                 session_id=session_id,
                 busy=bool(payload.get("busy")),
-                pending_interaction=_optional_str(payload.get("pending_interaction")),
+                pending_interaction=_optional_pending_interaction(payload.get("pending_interaction")),
                 last_turn_reason=_optional_str(payload.get("last_turn_reason")),
             )
     except ValueError as exc:
@@ -891,7 +889,7 @@ class KapRestClient:
             as_of_seq=_non_negative_int(data.get("as_of_seq")),
             epoch=str(data.get("epoch") or ""),
             busy=bool(session.get("busy")),
-            pending_interaction=_optional_str(session.get("pending_interaction")),
+            pending_interaction=_optional_pending_interaction(session.get("pending_interaction")),
             current_prompt_id=_optional_str(session.get("current_prompt_id")),
             in_flight=isinstance(in_flight_turn, dict),
             pending_approval_ids=_collect_ids(data.get("pending_approvals"), "approval_id"),
@@ -1188,7 +1186,6 @@ class KapWsClient:
         on_connection_change: Callable[[bool], None] | None = None,
         on_error_frame: Callable[[KapErrorFrame], None] | None = None,
         on_volatile: Callable[[AssistantDelta], None] | None = None,
-        ping_timeout_seconds: float = 10.0,
     ) -> None:
         self._url = f"ws://{host}:{port}{API_PREFIX}/ws"
         self._token = token
@@ -1204,7 +1201,6 @@ class KapWsClient:
         self._on_connection_change = on_connection_change
         self._on_error_frame = on_error_frame
         self._on_volatile = on_volatile
-        self._ping_timeout = float(ping_timeout_seconds)
 
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -1363,13 +1359,12 @@ class KapWsClient:
                 return
             try:
                 raw = ws.recv(timeout=self._stale_seconds)
-            except TimeoutError:
-                # kap has no heartbeat, but answers app-level ping: probe
-                # before declaring the connection stale (avoids reconnecting
-                # healthy idle connections every stale window).
-                if not self._probe_with_ping(ws):
-                    raise _StaleConnection() from None
-                continue
+            except TimeoutError as exc:
+                # kap has no heartbeat and does NOT answer app-level pings
+                # (schema-defined but dropped by the server's default branch —
+                # verified live against 0.29.1, audit 2026-07-25): a silent
+                # window is the only staleness signal available.
+                raise _StaleConnection() from exc
             try:
                 frame = json.loads(raw)
             except ValueError:
@@ -1378,26 +1373,6 @@ class KapWsClient:
             if not isinstance(frame, dict):
                 continue
             self._dispatch_frame(ws, frame)
-
-    def _probe_with_ping(self, ws: Any) -> bool:
-        """Send an app-level ping; any frame back within the window = alive."""
-        frame = {
-            "type": "ping",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "payload": {"nonce": secrets.token_hex(8)},
-        }
-        try:
-            ws.send(json.dumps(frame))
-            raw = ws.recv(timeout=self._ping_timeout)
-        except Exception:  # noqa: BLE001 - any failure means a dead connection
-            return False
-        try:
-            incoming = json.loads(raw)
-        except ValueError:
-            return True  # unparseable, but the socket is clearly alive
-        if isinstance(incoming, dict):
-            self._dispatch_frame(ws, incoming)
-        return True
 
     def _dispatch_frame(self, ws: Any, frame: dict[str, Any]) -> None:
         frame_type = frame.get("type")
@@ -1633,6 +1608,13 @@ def _optional_str(value: Any) -> str | None:
     return None
 
 
+def _optional_pending_interaction(value: Any) -> str | None:
+    """Upstream enum is 'none' | 'approval' | 'question'; 'none' means no
+    pending interaction and must not reach consumers as a truthy string."""
+    parsed = _optional_str(value)
+    return None if parsed in (None, "none") else parsed
+
+
 def _optional_non_negative_int(value: Any) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         return None
@@ -1678,7 +1660,7 @@ def _parse_session_summary(raw: dict[str, Any]) -> SessionSummary:
         title=str(raw.get("title") or ""),
         cwd=_optional_str(metadata.get("cwd")),
         busy=bool(raw.get("busy")),
-        pending_interaction=_optional_str(raw.get("pending_interaction")),
+        pending_interaction=_optional_pending_interaction(raw.get("pending_interaction")),
         archived=bool(raw.get("archived")),
         updated_at=str(raw.get("updated_at") or ""),
     )

@@ -15,7 +15,7 @@ import pathlib
 import sys
 
 APP_NAME = "kite"
-ENV_FILE_NAME = "kite.env"
+ENV_FILE_NAME = "env"
 LOG_FILE_NAME = "kite.log"
 
 

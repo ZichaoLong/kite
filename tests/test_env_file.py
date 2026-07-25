@@ -12,11 +12,11 @@ class EnvFileTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
-        self.env_path = Path(self._tmp.name) / "kite.env"
+        self.env_path = Path(self._tmp.name) / "env"
 
     def test_env_file_path_defaults_to_platform_default(self) -> None:
-        with patch("kite.env_file.default_env_file", return_value=Path("/tmp/default/kite.env")):
-            self.assertEqual(env_file_path(), Path("/tmp/default/kite.env"))
+        with patch("kite.env_file.default_env_file", return_value=Path("/tmp/default/env")):
+            self.assertEqual(env_file_path(), Path("/tmp/default/env"))
 
     def test_env_file_path_expands_explicit_path(self) -> None:
         self.assertEqual(env_file_path("~/custom.env"), Path("~/custom.env").expanduser())

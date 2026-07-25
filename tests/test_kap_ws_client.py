@@ -40,7 +40,6 @@ class KapWsClientTests(unittest.TestCase):
             "cursor_store": self.cursors,
             "stale_seconds": 0.3,
             "reconnect_delay_seconds": 0.1,
-            "ping_timeout_seconds": 0.3,
             "on_event": self.events.append,
             "on_resync_required": self.resyncs.append,
         }
@@ -148,19 +147,11 @@ class KapWsClientTests(unittest.TestCase):
         self.assertEqual(self.resyncs, [])
 
     def test_stale_connection_triggers_reconnect(self) -> None:
-        self.state.pong_enabled = False  # dead connection: ping goes unanswered
         self._start_client()
         self.assertTrue(wait_until(lambda: self.state.hello_count >= 1))
-        # No frames and no pong: stale detection must cycle the connection.
+        # No frames flow on an idle connection (kap has no heartbeat and does
+        # not answer app-level pings): stale detection must cycle it.
         self.assertTrue(wait_until(lambda: self.state.hello_count >= 2, timeout=5.0))
-
-    def test_ping_probe_keeps_idle_connection_alive(self) -> None:
-        self._start_client()
-        self.assertTrue(wait_until(lambda: self.state.hello_count >= 1))
-        # kap answers ping: several stale windows pass without a reconnect.
-        time.sleep(1.2)
-        self.assertEqual(self.state.hello_count, 1)
-        self.assertGreaterEqual(self.state.ping_count, 1)
 
     def test_error_frame_fires_callback(self) -> None:
         errors = []

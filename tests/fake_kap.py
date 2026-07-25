@@ -68,8 +68,6 @@ class FakeKapState:
         self.sessions: dict[str, FakeSession] = {}
         self.log: list[str] = []
         self.hello_count = 0
-        self.ping_count = 0
-        self.pong_enabled = True
         self.shutdown_requested = False
         self.last_shutdown_content_type: str | None = None
         self.prompt_submissions: list[dict[str, Any]] = []
@@ -211,7 +209,7 @@ def _session_wire(session: FakeSession) -> dict[str, Any]:
         "created_at": "2026-01-01T00:00:00Z",
         "updated_at": session.updated_at,
         "busy": session.busy,
-        "pending_interaction": session.pending_interaction,
+        "pending_interaction": session.pending_interaction or "none",
         "archived": session.archived,
         "metadata": {"cwd": session.cwd} if session.cwd else {},
         "message_count": 0,
@@ -547,15 +545,6 @@ def _ws_handler(state: FakeKapState, connection: Any) -> None:
                     "type": "ack", "id": frame.get("id", ""), "code": 0, "msg": "success",
                     "payload": ack_payload,
                 }))
-            elif frame_type == "ping":
-                with state.lock:
-                    state.ping_count += 1
-                if state.pong_enabled:
-                    connection.send(json.dumps({
-                        "type": "pong",
-                        "timestamp": "2026-01-01T00:00:00Z",
-                        "payload": {"nonce": payload.get("nonce", "")},
-                    }))
             elif frame_type == "unsubscribe":
                 for sid in payload.get("session_ids") or []:
                     subscribed.discard(sid)

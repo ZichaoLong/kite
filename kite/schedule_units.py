@@ -474,15 +474,20 @@ def _require_plan(spec: ScheduleSpec) -> SchedulePlan:
 
 
 def _quote_unit_arg(arg: str) -> str:
-    """systemd ExecStart quoting (same convention as kite.service_manager)."""
-    escaped = str(arg).replace("\\", "\\\\").replace('"', '\\"')
+    """systemd ExecStart quoting (same convention as kite.service_manager).
+
+    `%` must become `%%`: systemd specifier expansion would otherwise rewrite
+    user text (`%h` → home path) or reject the unit outright (`bad-setting`)
+    (audit H3).
+    """
+    escaped = str(arg).replace("%", "%%").replace("\\", "\\\\").replace('"', '\\"')
     return f'"{escaped}"'
 
 
 def render_service_unit(spec: ScheduleSpec) -> str:
     description = _unit_scalar(
         f"KITE scheduled prompt (chat {spec.chat_id})", "description"
-    )
+    ).replace("%", "%%")
     exec_start = " ".join(
         _quote_unit_arg(part)
         for part in [
@@ -513,7 +518,7 @@ def render_service_unit(spec: ScheduleSpec) -> str:
 def render_timer_unit(spec: ScheduleSpec) -> str:
     description = _unit_scalar(
         f"KITE scheduled prompt (chat {spec.chat_id})", "description"
-    )
+    ).replace("%", "%%")
     on_calendar = _unit_scalar(spec.on_calendar, "on_calendar")
     return "\n".join(
         [

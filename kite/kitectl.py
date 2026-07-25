@@ -73,7 +73,7 @@ from kite.control_plane import (
     ControlRefusedError,
     discover_live_control_metadata,
 )
-from kite.platform_paths import default_data_root
+from kite.platform_paths import default_data_root, default_log_file
 from kite.process_utils import process_exists
 from kite.runtime_status import read_runtime_status
 from kite.stores.binding_store import BindingStore
@@ -435,11 +435,13 @@ def _cmd_service_log(args: argparse.Namespace) -> int:
     lines = args.lines
     if lines <= 0:
         _die("log line count must be a positive integer")
-    path = _service_definition().stdout_log_path
+    # The daemon's own rotating log (all platforms); stdout_log_path only has
+    # content under launchd (audit H4).
+    path = default_log_file(default_data_root())
     try:
         tailed = _tail_lines(path, lines)
     except OSError:
-        _die(f"no service stdout log at {path}; is the service installed and running?")
+        _die(f"no daemon log at {path}; is the service installed and running?")
     _print_lines(tailed)
     return 0
 

@@ -8,7 +8,7 @@ app_secret: "xxx"
 
 # Admins (open_ids). The first admin can also register at runtime via the
 # Feishu `/init <token>` command (token generated at install/first run).
-# admins: []
+# admin_open_ids: []
 
 # Working directory for sessions auto-created on first use.
 # default_working_dir: "~"

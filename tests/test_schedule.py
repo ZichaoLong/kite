@@ -212,6 +212,17 @@ class UnitRenderingTests(unittest.TestCase):
         self.assertIn('"--text" "hello"', rendered)
         self.assertIn('"--display" "announce"', rendered)
 
+    def test_service_unit_escapes_systemd_specifiers(self) -> None:
+        # `%h`/`%z` in user text would otherwise be expanded by systemd
+        # (silently rewritten text) or reject the unit (bad-setting).
+        spec = _spec(text="把 %h 和 %z 写进文本")
+        rendered = schedule_units.render_service_unit(spec)
+        self.assertIn("%%h", rendered)
+        self.assertIn("%%z", rendered)
+        self.assertNotIn("%h ", rendered.replace("%%h", ""))
+        timer_rendered = schedule_units.render_timer_unit(_spec(chat_id="oc_100%x"))
+        self.assertIn("oc_100%%x", timer_rendered)
+
     def test_service_unit_quotes_spaces_and_quotes(self) -> None:
         spec = _spec(text='say "hi" there')
         rendered = schedule_units.render_service_unit(spec)

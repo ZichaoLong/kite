@@ -753,7 +753,7 @@ class ExecutionCardTests(PipelineTestCase):
         )
         busy, pending = self.loop.call(self.pipeline.work_state_of, SESSION_ID)
         self.assertFalse(busy)
-        self.assertEqual(pending, "none")
+        self.assertIsNone(pending)  # wire 'none' normalizes to None at the adapter
 
 
 # ---------------------------------------------------------------------------

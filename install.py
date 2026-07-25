@@ -191,6 +191,9 @@ def main(argv: list[str] | None = None) -> None:
     _run_pip_install(venv_python, "setuptools>=68", "wheel")
     _run_pip_install(venv_python, "--no-build-isolation", str(install_dir))
     _verify_installed_package(venv_python, venv_dir)
+    from kite.env_file import ensure_env_template
+
+    ensure_env_template()  # 0600 provider-env template; a no-op when present
     wrappers = _write_wrappers(venv_dir, default_user_bin_dir())
     service_written = _register_service(venv_dir)
     _print_next_steps(venv_dir, venv_python, wrappers, service_written)

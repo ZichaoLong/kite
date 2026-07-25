@@ -425,7 +425,7 @@ class ServicePreviewGateTests(KitectlTestCase):
         self.assertNotIn("warning:", out)
 
     def test_log_tails_stdout_log(self) -> None:
-        (self.data_dir / "service.stdout.log").write_text(
+        (self.data_dir / "kite.log").write_text(
             "".join(f"line-{i}\n" for i in range(1, 11)), encoding="utf-8"
         )
 
@@ -435,7 +435,7 @@ class ServicePreviewGateTests(KitectlTestCase):
         self.assertEqual(out.splitlines(), ["line-8", "line-9", "line-10"])
 
     def test_log_defaults_to_fifty_lines(self) -> None:
-        (self.data_dir / "service.stdout.log").write_text(
+        (self.data_dir / "kite.log").write_text(
             "".join(f"line-{i}\n" for i in range(1, 101)), encoding="utf-8"
         )
 
@@ -451,7 +451,7 @@ class ServicePreviewGateTests(KitectlTestCase):
         code, _, err = self._run_cli("service", "log")
 
         self.assertEqual(code, 2)
-        self.assertIn("no service stdout log", err)
+        self.assertIn("no daemon log", err)
 
     def test_log_rejects_non_positive_count(self) -> None:
         code, _, err = self._run_cli("service", "log", "-n", "0")
