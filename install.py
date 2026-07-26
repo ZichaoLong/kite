@@ -170,6 +170,7 @@ def _print_next_steps(
     print("  - Start the daemon:   kitectl service start")
     print("  - Inspect:            kitectl service status / log")
     print("  - Start on login:     kitectl service autostart enable")
+    print('  - Shell completion:   eval "$(kitectl completion bash)"  # or zsh / fish')
 
 
 def main(argv: list[str] | None = None) -> None:

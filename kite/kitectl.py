@@ -43,6 +43,11 @@ Implemented slice (docs/contracts/mvp-scope.md §2 kitectl row, §6):
                                 Validation is fail-closed before anything is
                                 written (past --at, unparseable --cron,
                                 unknown chat); remove requires --yes.
+  - `kitectl completion <shell>`
+                              — the static bash/zsh/fish completion script
+                                (kite/shell_completion.py), meant for
+                                `eval "$(kitectl completion bash)"` in the
+                                shell's rc file
 
 Read-only commands talk to kap-server REST directly: the `kap:` section of
 system.yaml provides address/home, the instance registry is the source of
@@ -69,6 +74,7 @@ from kite import config as kite_config
 from kite import preflights
 from kite import schedule_units
 from kite import service_manager
+from kite import shell_completion
 from kite.adapters import kap_server
 from kite.adapters.kap_server import KapRestClient
 from kite.cli_table import render_table
@@ -853,6 +859,12 @@ def _cmd_interaction_sweep(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_completion(args: argparse.Namespace) -> int:
+    """Print the static shell completion script (kite/shell_completion.py)."""
+    sys.stdout.write(shell_completion.render(args.shell))
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="kitectl", description="KITE local admin CLI.")
     parser.add_argument(
@@ -1072,6 +1084,18 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     run_now_parser.add_argument("name", help="schedule name (kite-schedule-<hash> or the hash)")
     run_now_parser.set_defaults(func=_cmd_schedule_run_now)
+
+    completion_parser = subparsers.add_parser(
+        "completion",
+        help="print a shell completion script "
+        '(usage: eval "$(kitectl completion bash)")',
+    )
+    completion_parser.add_argument(
+        "shell",
+        choices=shell_completion.SUPPORTED_SHELLS,
+        help="target shell",
+    )
+    completion_parser.set_defaults(func=_cmd_completion)
     return parser
 
 
