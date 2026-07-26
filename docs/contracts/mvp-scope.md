@@ -37,6 +37,11 @@ If it cannot answer, cut the requirement. No exceptions.
 | `/detach` / `/attach` | pause/resume Feishu push for the current binding; the binding itself is kept |
 | `/mode <auto\|manual\|yolo>` | read/write the binding-level permission mode (kap `permission_mode`); carried explicitly on every prompt |
 | `/plan [on\|off]` | read/toggle the binding-level plan mode (kap `plan_mode`, orthogonal to permission mode); carried explicitly on every prompt |
+| `/effort <off\|low\|medium\|high\|xhigh\|max>` | read/write the binding-level thinking effort (kap `thinking`); persisted like permission mode and carried explicitly on every prompt |
+| `/goal [text\|pause\|resume\|cancel\|off]` | binding-level goal state: with text, the objective (kap `goal_objective`) is persisted and carried on every prompt until cleared with `off`; `pause`/`resume`/`cancel` are one-shot controls (kap `goal_control`) attached to the next prompt from this chat; no arg shows the current goal |
+| `/compact` | compact the bound session's context (kap `:compact` pass-through); reports the upstream result text |
+| `/rename <title>` | rename the bound session's title (kap `:profile` pass-through) |
+| `/archive` / `/restore` | archive / restore the bound session (kap `:archive` / `:restore` pass-through); an archived binding behaves per §4.7 (next message errors and suggests `/sessions`; no implicit recreation) |
 | `/status` | show binding, session, work state, queue status |
 | `/last` | reply with the bound session's most recent terminal result text from the local store (truncated past 15000 chars) |
 | `/abort` | abort the active prompt; only available to that prompt's initiator and admins; aborting an already-finished prompt gets upstream 40402 (not pending) → show "already finished", do not transition the card to failed (spike S2) |
@@ -162,3 +167,13 @@ explicitly; "best-effort" silent degradation is forbidden:
     currently bound session has an active prompt — same reasoning as `/new`
     (aligned item 7): the in-flight execution card, terminal result and
     approval routing would lose visibility (2026-07-25).
+12. `/effort`, `/goal`, `/compact`, `/rename`, `/archive`, `/restore` admitted
+    (2026-07-25): binding-level `effort` (thinking) and `goal_objective`
+    persist in the binding store like permission mode; lifecycle actions are
+    kap pass-throughs. Shell completion for `kitectl`/`kited` ships with the
+    install (bash/zsh/fish generators, FOCUS's `shell_completion.py` shape).
+12. `/effort`, `/goal`, `/compact`, `/rename`, `/archive`, `/restore` admitted
+   (2026-07-25): binding-level `effort` (thinking) and `goal_objective`
+   persist in the binding store like permission mode; lifecycle actions are
+   kap pass-throughs. Shell completion for `kitectl`/`kited` ships with the
+   install (bash/zsh/fish generators, FOCUS's `shell_completion.py` shape).

@@ -32,6 +32,11 @@
 | `/detach` / `/attach` | 暂停/恢复当前 binding 的飞书推送，binding 本身保留 |
 | `/mode <auto\|manual\|yolo>` | 读写 binding 级 permission mode（kap `permission_mode`)；每个 prompt 显式携带 |
 | `/plan [on\|off]` | 查看/切换 binding 级 plan mode（kap `plan_mode`，与 permission mode 正交）；每个 prompt 显式携带 |
+| `/effort <off\|low\|medium\|high\|xhigh\|max>` | 读写 binding 级 thinking effort(kap `thinking`)；与 permission mode 同样持久化，每个 prompt 显式携带 |
+| `/goal [文本\|pause\|resume\|cancel\|off]` | binding 级 goal 状态：带文本时目标（kap `goal_objective`）持久化并随每个 prompt 携带，直到 `off` 清除；`pause`/`resume`/`cancel` 为一次性控制（kap `goal_control`)，附于本 chat 的下一条 prompt；无参显示当前 goal |
+| `/compact` | 压缩绑定 session 的上下文（kap `:compact` 透传）；回显上游结果文本 |
+| `/rename 〈title〉` | 重命名绑定 session 的标题（kap `:profile` 透传） |
+| `/archive` / `/restore` | 归档/恢复绑定 session(kap `:archive` / `:restore` 透传）；已归档绑定按 §4.7 行为（下一条消息报错并提示 `/sessions`，不隐式重建） |
 | `/status` | 展示 binding、session、work state、排队情况 |
 | `/last` | 重发当前会话最近一次终态答复文本（本地终态 store，超过 15000 字符截断） |
 | `/abort` | 中断 active prompt；仅该 prompt 发起者与管理员可用；对已完成 prompt 再 abort 得上游 40402(not pending)→ 提示"已结束"，执行卡不转失败（spike S2) |
@@ -129,3 +134,13 @@
 11. `/switch`（含 `/sessions` 卡片按钮）在有 active prompt 时拒绝（与
    `/new`（对齐项 7）同理由：在途执行卡、终态结果与审批路由会失去可见
    性）(2026-07-25)。
+12. 准入 `/effort`、`/goal`、`/compact`、`/rename`、`/archive`、`/restore`
+   (2026-07-25):binding 级 `effort`(thinking）与 `goal_objective` 与
+   permission mode 同样落 binding store；生命周期动作为 kap 透传。
+   `kitectl`/`kited` 的 shell 补全随安装提供（bash/zsh/fish 生成器，
+   仿 FOCUS 的 `shell_completion.py` 形态）。
+12. 准入 `/effort`、`/goal`、`/compact`、`/rename`、`/archive`、`/restore`
+   (2026-07-25):binding 级 `effort`(thinking）与 `goal_objective` 与
+   permission mode 同样落 binding store；生命周期动作为 kap 透传。
+   `kitectl`/`kited` 的 shell 补全随安装提供（bash/zsh/fish 生成器，
+   仿 FOCUS 的 `shell_completion.py` 形态）。
