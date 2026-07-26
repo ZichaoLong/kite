@@ -78,6 +78,8 @@ Status guidance:
   - why server-side queue semantics + prompt-level ownership; why no interaction owner is implemented; cross-process tearing risk and the single-instance premise
 - [`control-plane.md`](./decisions/control-plane.md)
   - why kitectl mutates daemon state through a loopback control plane; the dual-writer bug it fixed; the outcome-unknown error taxonomy
+- [`multi-instance.md`](./decisions/multi-instance.md)
+  - the multi-tenant shape: instance layout, isolated per-instance kap homes, resolution ladder, daemon instance lease; why interaction owner is still reserved
 
 ### Verification
 

@@ -75,6 +75,8 @@ Status guidance:
   - 为什么采用服务端队列语义 + prompt 级归属；为什么不实现 interaction owner；跨进程撕裂风险与单实例前提
 - [`control-plane.md`](./decisions/control-plane.zh-CN.md)
   - 为什么 kitectl 经 loopback 控制面变更 daemon 状态；它修复的双写者 bug;outcome-unknown 错误分类
+- [`multi-instance.md`](./decisions/multi-instance.zh-CN.md)
+  - 多租户形态：实例布局、每实例隔离 kap home、解析阶梯、daemon 实例租约；interaction owner 为何仍为预留
 
 ### Verification
 
