@@ -154,12 +154,18 @@ class FakeKapRestClient:
         self.calls: list[tuple[str, str, object]] = []
         self.submissions: list[dict] = []
         self.aborts: list[tuple[str, str]] = []
+        # Session-lifecycle scripting (:compact/:archive/:restore, /profile):
+        # (session_id, action, body) and (session_id, body) records.
+        self.session_actions: list[tuple[str, str, object]] = []
+        self.profile_updates: list[tuple[str, object]] = []
         self.prompt_states: dict[str, PromptQueueState] = {}
         self.submit_status = "running"
         self.create_error: Exception | None = None
         self.get_session_error: Exception | None = None
         self.submit_error: Exception | None = None
         self.abort_error: Exception | None = None
+        self.action_error: Exception | None = None
+        self.profile_error: Exception | None = None
         self.list_error: Exception | None = None
         self.prompts_error: Exception | None = None
         self._prompt_counter = 0
@@ -248,6 +254,36 @@ class FakeKapRestClient:
                 raise self.abort_error
             self.aborts.append((match.group(1), match.group(2)))
             return {"aborted": True, "at_seq": 1}
+        match = re.fullmatch(r"/sessions/([^/]+)/profile", path)
+        if method == "POST" and match:
+            if self.profile_error is not None:
+                raise self.profile_error
+            session = self.sessions.get(match.group(1))
+            if session is None:
+                raise KapError(40401, f"session {match.group(1)} does not exist")
+            self.profile_updates.append((match.group(1), body))
+            if isinstance(body, dict) and body.get("title") is not None:
+                session["title"] = str(body["title"])
+            return session
+        match = re.fullmatch(r"/sessions/([^/]+):(compact|archive|restore)", path)
+        if method == "POST" and match:
+            if self.action_error is not None:
+                raise self.action_error
+            session = self.sessions.get(match.group(1))
+            if session is None:
+                raise KapError(40401, f"session {match.group(1)} does not exist")
+            action = match.group(2)
+            self.session_actions.append((match.group(1), action, body))
+            if action == "compact":
+                # compactSessionResponseSchema: an empty object.
+                return {}
+            if action == "archive":
+                # archiveSessionResponseSchema: {archived: true}.
+                session["archived"] = True
+                return {"archived": True}
+            # restore: restoreSessionResponseSchema is a full session.
+            session["archived"] = False
+            return session
         raise AssertionError(f"unexpected kap call: {method} {path}")
 
     def get(self, path: str) -> object:
@@ -441,6 +477,8 @@ class AppHandlerTestCase(unittest.TestCase):
         attached: bool = True,
         permission_mode: str = "auto",
         plan_mode: bool = False,
+        effort: str = "",
+        goal_objective: str = "",
         chat_id: str = CHAT_ID,
     ) -> None:
         self.store.save(
@@ -450,6 +488,8 @@ class AppHandlerTestCase(unittest.TestCase):
                 "attached": attached,
                 "permission_mode": permission_mode,
                 "plan_mode": plan_mode,
+                "effort": effort,
+                "goal_objective": goal_objective,
             },
         )
 
@@ -1234,6 +1274,266 @@ class ModeAndPlanTests(AppHandlerTestCase):
         body = self.rest.submissions[0]["body"]
         self.assertEqual(body["permission_mode"], "yolo")
         self.assertIs(body["plan_mode"], True)
+
+
+class EffortCommandTests(AppHandlerTestCase):
+    def test_effort_without_arg_shows_current_unset(self) -> None:
+        self.bind("s-1")
+        self.send("/effort")
+        self.assertIn("当前思考强度：未设置", self.transport.last_text())
+        self.assertEqual(self.rest.calls, [])
+
+    def test_effort_without_arg_shows_current_value(self) -> None:
+        self.bind("s-1", effort="low")
+        self.send("/effort")
+        self.assertIn("当前思考强度：low", self.transport.last_text())
+
+    def test_effort_set_persists(self) -> None:
+        self.bind("s-1")
+        self.send("/effort xhigh")
+        binding = self.store.load(CHAT_ID)
+        assert binding is not None
+        self.assertEqual(binding["effort"], "xhigh")
+        self.assertIn("已切换为 xhigh", self.transport.last_text())
+
+    def test_effort_invalid_arg_shows_usage(self) -> None:
+        self.bind("s-1")
+        self.send("/effort turbo")
+        self.assertIn("用法", self.transport.last_text())
+        binding = self.store.load(CHAT_ID)
+        assert binding is not None
+        self.assertEqual(binding["effort"], "")
+
+    def test_effort_same_value_is_idempotent(self) -> None:
+        self.bind("s-1", effort="high")
+        self.send("/effort high")
+        self.assertIn("已是 high", self.transport.last_text())
+
+    def test_effort_without_binding_shows_hint(self) -> None:
+        self.send("/effort high")
+        self.assertIn("尚未绑定会话", self.transport.last_text())
+        self.assertEqual(self.rest.calls, [])
+
+    def test_effort_flows_into_next_prompt(self) -> None:
+        self.bind("s-1", effort="max")
+        self.rest.add_session("s-1")
+        self.send("干活")
+        self.assertEqual(self.rest.submissions[0]["body"]["thinking"], "max")
+
+    def test_effort_unset_omits_thinking_on_submit(self) -> None:
+        self.bind("s-1")
+        self.rest.add_session("s-1")
+        self.send("hello")
+        self.assertNotIn("thinking", self.rest.submissions[0]["body"])
+
+
+class GoalCommandTests(AppHandlerTestCase):
+    def test_goal_without_arg_shows_unset(self) -> None:
+        self.bind("s-1")
+        self.send("/goal")
+        self.assertIn("当前目标：未设置", self.transport.last_text())
+
+    def test_goal_set_persists_and_show_displays_it(self) -> None:
+        self.bind("s-1")
+        self.send("/goal 修复登录页的崩溃")
+        binding = self.store.load(CHAT_ID)
+        assert binding is not None
+        self.assertEqual(binding["goal_objective"], "修复登录页的崩溃")
+        self.assertIn("已设置目标", self.transport.last_text())
+        self.send("/goal")
+        self.assertIn("当前目标：修复登录页的崩溃", self.transport.last_text())
+
+    def test_goal_objective_flows_into_every_prompt(self) -> None:
+        self.bind("s-1", goal_objective="保持向后兼容")
+        self.rest.add_session("s-1")
+        self.send("one")
+        self.send("two")
+        self.assertEqual(
+            self.rest.submissions[0]["body"]["goal_objective"], "保持向后兼容"
+        )
+        self.assertEqual(
+            self.rest.submissions[1]["body"]["goal_objective"], "保持向后兼容"
+        )
+
+    def test_goal_off_clears_objective(self) -> None:
+        self.bind("s-1", goal_objective="旧目标")
+        self.rest.add_session("s-1")
+        self.send("/goal off")
+        binding = self.store.load(CHAT_ID)
+        assert binding is not None
+        self.assertEqual(binding["goal_objective"], "")
+        self.assertIn("已清除", self.transport.last_text())
+        self.send("hello")
+        self.assertNotIn("goal_objective", self.rest.submissions[0]["body"])
+
+    def test_goal_off_without_objective(self) -> None:
+        self.bind("s-1")
+        self.send("/goal off")
+        self.assertIn("当前没有设置目标", self.transport.last_text())
+
+    def test_goal_without_binding_shows_hint(self) -> None:
+        self.send("/goal pause")
+        self.assertIn("尚未绑定会话", self.transport.last_text())
+        self.assertEqual(self.rest.calls, [])
+
+    def test_goal_control_consumed_exactly_once(self) -> None:
+        self.bind("s-1")
+        self.rest.add_session("s-1")
+        self.send("/goal pause")
+        self.assertIn("仅生效一次", self.transport.last_text())
+        self.send("first")
+        self.assertEqual(self.rest.submissions[0]["body"]["goal_control"], "pause")
+        # The second prompt must NOT carry the one-shot control.
+        self.send("second")
+        self.assertNotIn("goal_control", self.rest.submissions[1]["body"])
+
+    def test_goal_control_keywords_map_to_wire_values(self) -> None:
+        for keyword in ("pause", "resume", "cancel"):
+            with self.subTest(keyword=keyword):
+                self.bind("s-1")
+                self.rest.add_session("s-1")
+                self.send(f"/goal {keyword}")
+                self.send("go")
+                body = self.rest.submissions[-1]["body"]
+                self.assertEqual(body["goal_control"], keyword)
+
+    def test_goal_control_survives_failed_submit(self) -> None:
+        # A failed submit never reached kap, so the one-shot control stays
+        # pending for the next prompt (consume-once on success).
+        self.bind("s-1")
+        self.rest.add_session("s-1")
+        self.send("/goal cancel")
+        self.rest.submit_error = KapError(40901, "session is busy")
+        self.send("first")
+        self.assertIn("提交失败", self.transport.last_text())
+        self.rest.submit_error = None
+        self.send("second")
+        self.assertEqual(self.rest.submissions[-1]["body"]["goal_control"], "cancel")
+        self.send("third")
+        self.assertNotIn("goal_control", self.rest.submissions[-1]["body"])
+
+    def test_goal_show_mentions_pending_control(self) -> None:
+        self.bind("s-1")
+        self.send("/goal resume")
+        self.send("/goal")
+        self.assertIn("待生效控制：resume", self.transport.last_text())
+
+    def test_submit_body_carries_thinking_goal_and_control_together(self) -> None:
+        self.bind("s-1", effort="high", goal_objective="完成迁移")
+        self.rest.add_session("s-1")
+        self.send("/goal resume")
+        self.send("hello")
+        body = self.rest.submissions[0]["body"]
+        self.assertEqual(body["thinking"], "high")
+        self.assertEqual(body["goal_objective"], "完成迁移")
+        self.assertEqual(body["goal_control"], "resume")
+        self.assertEqual(body["permission_mode"], "auto")
+        self.assertIs(body["plan_mode"], False)
+
+
+class SessionLifecycleCommandTests(AppHandlerTestCase):
+    def test_compact_calls_kap_and_confirms(self) -> None:
+        self.bind("s-1")
+        self.rest.add_session("s-1")
+        self.send("/compact")
+        self.assertEqual(self.rest.session_actions, [("s-1", "compact", None)])
+        self.assertIn("压缩", self.transport.last_text())
+
+    def test_compact_upstream_error_shows_msg(self) -> None:
+        self.bind("s-1")
+        self.rest.add_session("s-1")
+        self.rest.action_error = KapError(40904, "nothing to compact")
+        self.send("/compact")
+        self.assertIn("压缩失败：nothing to compact", self.transport.last_text())
+
+    def test_compact_kap_unreachable(self) -> None:
+        self.bind("s-1")
+        self.rest.add_session("s-1")
+        self.rest.action_error = KapTransportError("timeout")
+        self.send("/compact")
+        self.assertIn("无法连接 kap-server", self.transport.last_text())
+
+    def test_compact_with_arg_shows_usage(self) -> None:
+        self.bind("s-1")
+        self.send("/compact now")
+        self.assertIn("用法", self.transport.last_text())
+        self.assertEqual(self.rest.session_actions, [])
+
+    def test_compact_without_binding_shows_hint(self) -> None:
+        self.send("/compact")
+        self.assertIn("尚未绑定会话", self.transport.last_text())
+
+    def test_rename_posts_profile_with_title(self) -> None:
+        self.bind("s-1")
+        self.rest.add_session("s-1", title="旧标题")
+        self.send("/rename 新标题")
+        self.assertEqual(self.rest.profile_updates, [("s-1", {"title": "新标题"})])
+        self.assertEqual(self.rest.sessions["s-1"]["title"], "新标题")
+        self.assertIn("已将会话重命名为「新标题」", self.transport.last_text())
+
+    def test_rename_without_arg_shows_usage(self) -> None:
+        self.bind("s-1")
+        self.send("/rename")
+        self.assertIn("用法", self.transport.last_text())
+        self.assertEqual(self.rest.profile_updates, [])
+
+    def test_rename_upstream_error_shows_msg(self) -> None:
+        self.bind("s-1")
+        self.rest.add_session("s-1")
+        self.rest.profile_error = KapError(40401, "session not found")
+        self.send("/rename x")
+        self.assertIn("重命名失败：session not found", self.transport.last_text())
+
+    def test_archive_then_next_message_hits_archived_gate(self) -> None:
+        self.bind("s-1")
+        self.rest.add_session("s-1")
+        self.send("/archive")
+        self.assertEqual(self.rest.session_actions, [("s-1", "archive", None)])
+        reply = self.transport.last_text()
+        self.assertIn("已归档", reply)
+        self.assertIn("/restore", reply)
+        # §4.7: the next message errors and suggests /sessions; no submit,
+        # no implicit recreation, and the binding is kept.
+        self.send("hello")
+        reply = self.transport.last_text()
+        self.assertIn("已被归档", reply)
+        self.assertIn("/sessions", reply)
+        self.assertEqual(self.rest.submissions, [])
+        self.assertEqual(
+            [c for c in self.rest.calls if c[0] == "POST" and c[1] == "/sessions"], []
+        )
+        binding = self.store.load(CHAT_ID)
+        assert binding is not None
+        self.assertEqual(binding["session_id"], "s-1")
+
+    def test_restore_recovers_the_binding(self) -> None:
+        self.bind("s-1")
+        self.rest.add_session("s-1", archived=True)
+        self.send("/restore")
+        self.assertEqual(self.rest.session_actions, [("s-1", "restore", None)])
+        self.assertIn("已恢复", self.transport.last_text())
+        self.send("hello")
+        self.assertEqual(len(self.rest.submissions), 1)
+
+    def test_archive_upstream_error_shows_msg(self) -> None:
+        self.bind("s-1")
+        self.rest.add_session("s-1")
+        self.rest.action_error = KapError(40905, "session is busy")
+        self.send("/archive")
+        self.assertIn("归档失败：session is busy", self.transport.last_text())
+
+    def test_restore_upstream_error_shows_msg(self) -> None:
+        self.bind("s-1")
+        self.rest.add_session("s-1", archived=True)
+        self.rest.action_error = KapError(40401, "session not found")
+        self.send("/restore")
+        self.assertIn("恢复失败：session not found", self.transport.last_text())
+
+    def test_archive_restore_without_binding_shows_hint(self) -> None:
+        self.send("/archive")
+        self.assertIn("尚未绑定会话", self.transport.last_text())
+        self.send("/restore")
+        self.assertIn("尚未绑定会话", self.transport.last_text())
 
 
 class StatusTests(AppHandlerTestCase):

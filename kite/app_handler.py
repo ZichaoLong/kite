@@ -7,8 +7,9 @@ Implements the MVP inbound contract (docs/contracts/mvp-scope.md):
   (§5);
 - plain text -> resolve the chat's binding (first use creates a session with
   cwd=default_working_dir and binds it) -> submit the prompt carrying the
-  binding's permission_mode + plan_mode explicitly -> record prompt
-  ownership -> minimal ack;
+  binding's permission_mode + plan_mode + effort (thinking) +
+  goal_objective explicitly, plus any pending one-shot goal_control ->
+  record prompt ownership -> minimal ack;
 - attachment messages (images, docs/contracts/images.md §2): staged into
   the bound session's cwd by AttachmentDomain with a TTL'd pending record;
   the next text prompt from the same (sender, chat) consumes them as native
@@ -49,7 +50,8 @@ Implements the MVP inbound contract (docs/contracts/mvp-scope.md):
   transcript to the group log as context material (never a trigger), and
   all buffers them through the same stash-claim window into a plain prompt;
 - the MVP slash commands (/new /sessions /switch /detach /attach /mode
-  /plan /group /group-mode /status /abort /help /init); in-flight-work-sensitive commands run
+  /plan /effort /goal /compact /rename /archive /restore /group
+  /group-mode /status /abort /help /init); in-flight-work-sensitive commands run
   the reason-coded preflights in kite/preflights.py (/new denies with an
   active prompt, /detach only notes it), and /new /switch rebinds fire the
   on_session_unbound seam so the outbound path can fail-close sweep the old
@@ -103,6 +105,8 @@ from kite.command_surface import (
     SlashCommand,
     build_help_text,
     build_usage_text,
+    parse_effort_arg,
+    parse_goal_keyword_arg,
     parse_group_mode_arg,
     parse_permission_mode_arg,
     parse_plan_mode_arg,
@@ -131,6 +135,8 @@ from kite.prompt_ownership import (
 from kite.runtime_loop import RuntimeLoop, RuntimeLoopClosedError
 from kite.stores.binding_store import (
     DEFAULT_ATTACHED,
+    DEFAULT_EFFORT,
+    DEFAULT_GOAL_OBJECTIVE,
     DEFAULT_PERMISSION_MODE,
     DEFAULT_PLAN_MODE,
     PERMISSION_MODE_YOLO,
@@ -263,12 +269,18 @@ class KapSessionOps:
         *,
         permission_mode: str,
         plan_mode: bool,
+        thinking: str = "",
+        goal_objective: str = "",
+        goal_control: str = "",
     ) -> SubmitPromptResult:
         return self.submit_prompt_content(
             session_id,
             [{"type": "text", "text": text}],
             permission_mode=permission_mode,
             plan_mode=plan_mode,
+            thinking=thinking,
+            goal_objective=goal_objective,
+            goal_control=goal_control,
         )
 
     def submit_prompt_content(
@@ -278,9 +290,15 @@ class KapSessionOps:
         *,
         permission_mode: str,
         plan_mode: bool,
+        thinking: str = "",
+        goal_objective: str = "",
+        goal_control: str = "",
     ) -> SubmitPromptResult:
         # permission_mode / plan_mode / model are carried explicitly on every
-        # prompt (kite-design.md §7; spike-results §0 for the model part).
+        # prompt (kite-design.md §7; spike-results §0 for the model part);
+        # thinking (binding effort), goal_objective and the one-shot
+        # goal_control ride the same per-prompt explicit discipline
+        # (mvp-scope §2 /effort /goal rows) and are omitted when unset.
         # The content-part wire shape is the upstream promptSubmissionSchema:
         # text parts and native image parts with a base64 source
         # (packages/protocol/src/rest/prompt.ts + message.ts
@@ -293,6 +311,12 @@ class KapSessionOps:
         }
         if self._model:
             payload["model"] = self._model
+        if thinking:
+            payload["thinking"] = thinking
+        if goal_objective:
+            payload["goal_objective"] = goal_objective
+        if goal_control:
+            payload["goal_control"] = goal_control
         data = self._rest.call(
             "POST",
             f"/sessions/{_quote(session_id)}/prompts",
@@ -314,6 +338,38 @@ class KapSessionOps:
             "POST",
             f"/sessions/{_quote(session_id)}/prompts/{_quote(prompt_id)}:abort",
         )
+
+    def compact_session(self, session_id: str) -> None:
+        # kap pass-through (mvp-scope §2 /compact row): POST :compact with no
+        # body (compactSessionRequestSchema defaults to {}); the success data
+        # is an empty object (compactSessionResponseSchema).
+        data = self._rest.call("POST", f"/sessions/{_quote(session_id)}:compact")
+        if not isinstance(data, dict):
+            raise KapTransportError("compact session: unexpected data shape")
+
+    def rename_session(self, session_id: str, title: str) -> SessionSummary:
+        # kap pass-through (mvp-scope §2 /rename row): POST /sessions/{id}/profile
+        # with the updateSessionProfileRequestSchema (sessionUpdateSchema)
+        # shape — title is a min(1) optional string; the response is a session.
+        data = self._rest.call(
+            "POST",
+            f"/sessions/{_quote(session_id)}/profile",
+            {"title": title},
+        )
+        return self._parse_session(data, context="rename session")
+
+    def archive_session(self, session_id: str) -> None:
+        # kap pass-through (mvp-scope §2 /archive row): the success data is
+        # {archived: true} (archiveSessionResponseSchema).
+        data = self._rest.call("POST", f"/sessions/{_quote(session_id)}:archive")
+        if not isinstance(data, dict) or data.get("archived") is not True:
+            raise KapTransportError("archive session: unexpected data shape")
+
+    def restore_session(self, session_id: str) -> SessionSummary:
+        # kap pass-through (mvp-scope §2 /restore row): the success data is a
+        # session (restoreSessionResponseSchema = sessionSchema).
+        data = self._rest.call("POST", f"/sessions/{_quote(session_id)}:restore")
+        return self._parse_session(data, context="restore session")
 
     def list_sessions(self) -> list[SessionSummary]:
         return self._rest.list_sessions()
@@ -437,6 +493,13 @@ class AppHandler(TransportHandler):
         )
         self._on_session_bound = on_session_bound
         self._persist_admins = persist_admins or _persist_admins_to_config
+        # One-shot goal controls (/goal pause|resume|cancel): the pending
+        # kap ``goal_control`` per chat, attached to that chat's next prompt
+        # and consumed on a successful submit. In-memory only by design
+        # (mvp-scope §2 /goal row): a restart simply loses a pending one-shot
+        # control, which is acceptable — it is never part of the binding
+        # store's persisted state.
+        self._pending_goal_controls: dict[str, str] = {}
         self._commands: dict[str, Callable[[InboundMessage, str], None]] = {
             "/new": self._cmd_new,
             "/sessions": self._cmd_sessions,
@@ -445,6 +508,12 @@ class AppHandler(TransportHandler):
             "/attach": self._cmd_attach,
             "/mode": self._cmd_mode,
             "/plan": self._cmd_plan,
+            "/effort": self._cmd_effort,
+            "/goal": self._cmd_goal,
+            "/compact": self._cmd_compact,
+            "/rename": self._cmd_rename,
+            "/archive": self._cmd_archive,
+            "/restore": self._cmd_restore,
             "/group": self._cmd_group,
             "/group-mode": self._cmd_group_mode,
             "/status": self._cmd_status,
@@ -1162,12 +1231,21 @@ class AppHandler(TransportHandler):
             }
             for image in prepared.images
         )
+        # The pending one-shot goal control (/goal pause|resume|cancel) rides
+        # this prompt. It is consumed only after a successful submit: a
+        # failed or blocked submit leaves it pending for the next prompt —
+        # the same consume-once + restore-on-failure discipline as the
+        # staged attachments above.
+        goal_control = self._pending_goal_controls.get(chat_id, "")
         try:
             result = self._ops.submit_prompt_content(
                 session_id,
                 content,
                 permission_mode=binding["permission_mode"],
                 plan_mode=binding["plan_mode"],
+                thinking=binding["effort"],
+                goal_objective=binding["goal_objective"],
+                goal_control=goal_control,
             )
         except KapTransportError:
             # Submit failed: restore the consumed records so a retry still
@@ -1186,6 +1264,9 @@ class AppHandler(TransportHandler):
             self._attachment_domain.restore_consumed(prepared.consumed)
             self._reply_to(message, "提交被 kap-server 拒绝（blocked），该 prompt 未执行。")
             return None
+        if goal_control:
+            # The one-shot control reached kap with this prompt: consumed.
+            self._pending_goal_controls.pop(chat_id, None)
         if prepared.consumed:
             # Successful submit: consumption deletes the staged files
             # (contract §2.5); the image bytes live in the kap message.
@@ -1246,6 +1327,8 @@ class AppHandler(TransportHandler):
             "attached": DEFAULT_ATTACHED,
             "permission_mode": DEFAULT_PERMISSION_MODE,
             "plan_mode": DEFAULT_PLAN_MODE,
+            "effort": DEFAULT_EFFORT,
+            "goal_objective": DEFAULT_GOAL_OBJECTIVE,
         }
         self._binding_store.save(chat_id, binding)
         self._notify_session_bound(info.session_id)
@@ -1312,6 +1395,8 @@ class AppHandler(TransportHandler):
             raise ControlError("display=announce requires chat_id", code="invalid_params")
 
         owner_chat_id = ""
+        effort = DEFAULT_EFFORT
+        goal_objective = DEFAULT_GOAL_OBJECTIVE
         if chat_id:
             binding = self._binding_store.load(chat_id)
             if binding is None:
@@ -1333,6 +1418,13 @@ class AppHandler(TransportHandler):
                 permission_mode = binding["permission_mode"]
             if plan_mode is None:
                 plan_mode = binding["plan_mode"]
+            # Effort and the goal objective are binding-level settings too
+            # (mvp-scope §2 /effort /goal rows): carried explicitly like the
+            # modes. The pending one-shot goal_control is NOT consumed here —
+            # it attaches to the next prompt FROM THE CHAT, and a
+            # control-plane prompt is not one.
+            effort = binding["effort"]
+            goal_objective = binding["goal_objective"]
             owner_chat_id = chat_id
         else:
             # No binding to inherit from and no owner to record: approvals
@@ -1366,6 +1458,8 @@ class AppHandler(TransportHandler):
                 text,
                 permission_mode=permission_mode,
                 plan_mode=plan_mode,
+                thinking=effort,
+                goal_objective=goal_objective,
             )
         except KapTransportError as exc:
             raise ControlError(f"cannot reach kap-server: {exc}", code="kap_unreachable") from exc
@@ -1604,6 +1698,7 @@ class AppHandler(TransportHandler):
                 self._reply_to(message, exclusive.reason_text)
                 return
         # Permission/plan modes are chat-level settings: they carry over.
+        # So do the binding-level effort and goal objective (mvp-scope §2).
         binding: StoredBinding = {
             "session_id": info.session_id,
             "attached": DEFAULT_ATTACHED,
@@ -1611,6 +1706,10 @@ class AppHandler(TransportHandler):
                 current["permission_mode"] if current else DEFAULT_PERMISSION_MODE
             ),
             "plan_mode": current["plan_mode"] if current else DEFAULT_PLAN_MODE,
+            "effort": current["effort"] if current else DEFAULT_EFFORT,
+            "goal_objective": (
+                current["goal_objective"] if current else DEFAULT_GOAL_OBJECTIVE
+            ),
         }
         self._binding_store.save(chat_id, binding)
         self._notify_session_bound(info.session_id)
@@ -1787,6 +1886,205 @@ class AppHandler(TransportHandler):
         self._binding_store.save(message.chat_id, binding)
         state = "开启" if new_plan_mode else "关闭"
         self._reply_to(message, f"计划模式已{state}。")
+
+    def _cmd_effort(self, message: InboundMessage, arg: str) -> None:
+        """/effort 〈off|low|medium|high|xhigh|max〉: read/write the binding's
+        thinking effort (kap ``thinking``), persisted like permission mode
+        and carried explicitly on every prompt (mvp-scope §2)."""
+        binding = self._load_binding_or_reply(message)
+        if binding is None:
+            return
+        if not arg.strip():
+            current = binding["effort"] or "未设置（跟随模型默认）"
+            self._reply_to(
+                message,
+                f"当前思考强度：{current}。可选：off / low / medium / high / xhigh / max。",
+            )
+            return
+        effort = parse_effort_arg(arg)
+        if effort is None:
+            self._reply_to(message, build_usage_text("/effort"))
+            return
+        if effort == binding["effort"]:
+            self._reply_to(message, f"思考强度已是 {effort}。")
+            return
+        binding["effort"] = effort
+        self._binding_store.save(message.chat_id, binding)
+        logger.info(
+            "effort set chat_id=%s effort=%s operator=%s",
+            message.chat_id,
+            effort,
+            message.sender_open_id,
+        )
+        self._reply_to(message, f"思考强度已切换为 {effort}，后续每条 prompt 都会携带。")
+
+    def _cmd_goal(self, message: InboundMessage, arg: str) -> None:
+        """/goal [text|pause|resume|cancel|off]: binding-level goal state.
+
+        No arg shows the current objective; text persists it on the binding
+        (kap ``goal_objective``, carried on every prompt until ``off``
+        clears it); pause/resume/cancel stage a one-shot kap
+        ``goal_control`` attached to this chat's next prompt.
+        """
+        binding = self._load_binding_or_reply(message)
+        if binding is None:
+            return
+        text = arg.strip()
+        if not text:
+            objective = binding["goal_objective"] or "未设置"
+            shown = f"当前目标：{objective}"
+            pending = self._pending_goal_controls.get(message.chat_id)
+            if pending:
+                shown += f"\n待生效控制：{pending}（将随下一条 prompt 发送一次）。"
+            self._reply_to(message, shown)
+            return
+        keyword = parse_goal_keyword_arg(text)
+        if keyword == "off":
+            if not binding["goal_objective"]:
+                self._reply_to(message, "当前没有设置目标。")
+                return
+            binding["goal_objective"] = ""
+            self._binding_store.save(message.chat_id, binding)
+            logger.info(
+                "goal objective cleared chat_id=%s operator=%s",
+                message.chat_id,
+                message.sender_open_id,
+            )
+            self._reply_to(message, "已清除当前目标，后续 prompt 不再携带。")
+            return
+        if keyword is not None:
+            # One-shot control (kap goal_control pause/resume/cancel):
+            # staged in the in-memory per-chat slot and consumed by the next
+            # successful submit from this chat (latest keyword wins).
+            self._pending_goal_controls[message.chat_id] = keyword
+            logger.info(
+                "goal control staged chat_id=%s control=%s operator=%s",
+                message.chat_id,
+                keyword,
+                message.sender_open_id,
+            )
+            self._reply_to(
+                message,
+                f"已记录目标控制 {keyword}，将随本聊天的下一条 prompt 发送（仅生效一次）。",
+            )
+            return
+        binding["goal_objective"] = text
+        self._binding_store.save(message.chat_id, binding)
+        logger.info(
+            "goal objective set chat_id=%s operator=%s",
+            message.chat_id,
+            message.sender_open_id,
+        )
+        self._reply_to(
+            message,
+            "已设置目标，后续每条 prompt 都会携带；发送 /goal off 清除。",
+        )
+
+    def _cmd_compact(self, message: InboundMessage, arg: str) -> None:
+        """/compact: kap :compact pass-through (mvp-scope §2)."""
+        if arg.strip():
+            self._reply_to(message, build_usage_text("/compact"))
+            return
+        binding = self._load_binding_or_reply(message)
+        if binding is None:
+            return
+        try:
+            self._ops.compact_session(binding["session_id"])
+        except KapTransportError:
+            self._reply_to(message, _KAP_UNREACHABLE_TEXT)
+            return
+        except KapError as exc:
+            # Fail-closed: the upstream error text is reported verbatim.
+            self._reply_to(message, f"压缩失败：{exc.msg}")
+            return
+        logger.info(
+            "session compact requested chat_id=%s session_id=%s operator=%s",
+            message.chat_id,
+            binding["session_id"],
+            message.sender_open_id,
+        )
+        self._reply_to(message, "已请求压缩当前会话的上下文（compact）。")
+
+    def _cmd_rename(self, message: InboundMessage, arg: str) -> None:
+        """/rename 〈title〉: kap /sessions/{id}/profile pass-through."""
+        title = arg.strip()
+        if not title:
+            self._reply_to(message, build_usage_text("/rename"))
+            return
+        binding = self._load_binding_or_reply(message)
+        if binding is None:
+            return
+        try:
+            info = self._ops.rename_session(binding["session_id"], title)
+        except KapTransportError:
+            self._reply_to(message, _KAP_UNREACHABLE_TEXT)
+            return
+        except KapError as exc:
+            self._reply_to(message, f"重命名失败：{exc.msg}")
+            return
+        logger.info(
+            "session renamed chat_id=%s session_id=%s operator=%s",
+            message.chat_id,
+            binding["session_id"],
+            message.sender_open_id,
+        )
+        self._reply_to(message, f"已将会话重命名为「{info.title or title}」。")
+
+    def _cmd_archive(self, message: InboundMessage, arg: str) -> None:
+        """/archive: kap :archive pass-through; the binding is kept, so the
+        next message hits the §4.7 archived-session error path."""
+        if arg.strip():
+            self._reply_to(message, build_usage_text("/archive"))
+            return
+        binding = self._load_binding_or_reply(message)
+        if binding is None:
+            return
+        session_id = binding["session_id"]
+        try:
+            self._ops.archive_session(session_id)
+        except KapTransportError:
+            self._reply_to(message, _KAP_UNREACHABLE_TEXT)
+            return
+        except KapError as exc:
+            self._reply_to(message, f"归档失败：{exc.msg}")
+            return
+        logger.info(
+            "session archived chat_id=%s session_id=%s operator=%s",
+            message.chat_id,
+            session_id,
+            message.sender_open_id,
+        )
+        self._reply_to(
+            message,
+            f"已归档当前会话 `{session_id}`；绑定保留。"
+            "此后发送消息将提示通过 /sessions 切换；发送 /restore 可恢复。",
+        )
+
+    def _cmd_restore(self, message: InboundMessage, arg: str) -> None:
+        """/restore: kap :restore pass-through; clears the §4.7 archived
+        state so the next message submits normally again."""
+        if arg.strip():
+            self._reply_to(message, build_usage_text("/restore"))
+            return
+        binding = self._load_binding_or_reply(message)
+        if binding is None:
+            return
+        session_id = binding["session_id"]
+        try:
+            self._ops.restore_session(session_id)
+        except KapTransportError:
+            self._reply_to(message, _KAP_UNREACHABLE_TEXT)
+            return
+        except KapError as exc:
+            self._reply_to(message, f"恢复失败：{exc.msg}")
+            return
+        logger.info(
+            "session restored chat_id=%s session_id=%s operator=%s",
+            message.chat_id,
+            session_id,
+            message.sender_open_id,
+        )
+        self._reply_to(message, f"已恢复会话 `{session_id}`，可以正常发送消息。")
 
     def _cmd_group(self, message: InboundMessage, arg: str) -> None:
         if message.chat_type != "group":
@@ -2219,6 +2517,10 @@ class AppHandler(TransportHandler):
                 current["permission_mode"] if current else DEFAULT_PERMISSION_MODE
             ),
             "plan_mode": current["plan_mode"] if current else DEFAULT_PLAN_MODE,
+            "effort": current["effort"] if current else DEFAULT_EFFORT,
+            "goal_objective": (
+                current["goal_objective"] if current else DEFAULT_GOAL_OBJECTIVE
+            ),
         }
         self._binding_store.save(chat_id, binding)
         self._notify_session_bound(session_id)

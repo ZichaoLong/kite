@@ -15,11 +15,23 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from kite.stores.binding_store import VALID_PERMISSION_MODES
+from kite.stores.binding_store import VALID_EFFORTS, VALID_PERMISSION_MODES
 from kite.stores.group_config_store import VALID_GROUP_MODES
 
 _PLAN_ON = "on"
 _PLAN_OFF = "off"
+
+# /goal keywords that are NOT objective text (mvp-scope §2 /goal row):
+# pause/resume/cancel are the kap one-shot ``goal_control`` values; ``off``
+# clears the persisted objective (never sent upstream).
+GOAL_CONTROL_PAUSE = "pause"
+GOAL_CONTROL_RESUME = "resume"
+GOAL_CONTROL_CANCEL = "cancel"
+VALID_GOAL_CONTROLS = frozenset(
+    {GOAL_CONTROL_PAUSE, GOAL_CONTROL_RESUME, GOAL_CONTROL_CANCEL}
+)
+_GOAL_OFF = "off"
+_GOAL_KEYWORDS = VALID_GOAL_CONTROLS | {_GOAL_OFF}
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +88,36 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
         "/plan",
         "/plan [on|off]",
         "切换计划模式（plan mode）；不带参数时取反。",
+    ),
+    CommandSpec(
+        "/effort",
+        "/effort 〈off|low|medium|high|xhigh|max〉",
+        "查看或设置思考强度（thinking effort）；随每条 prompt 显式携带。",
+    ),
+    CommandSpec(
+        "/goal",
+        "/goal [text|pause|resume|cancel|off]",
+        "查看或设置目标；文本目标随每条 prompt 携带直到 off 清除，pause/resume/cancel 仅作用于下一条 prompt。",
+    ),
+    CommandSpec(
+        "/compact",
+        "/compact",
+        "压缩当前会话的上下文（kap compact 透传）。",
+    ),
+    CommandSpec(
+        "/rename",
+        "/rename 〈title〉",
+        "重命名当前会话的标题。",
+    ),
+    CommandSpec(
+        "/archive",
+        "/archive",
+        "归档当前会话；绑定保留，归档后发送消息会提示切换会话。",
+    ),
+    CommandSpec(
+        "/restore",
+        "/restore",
+        "恢复已归档的当前会话。",
     ),
     CommandSpec(
         "/group",
@@ -182,6 +224,23 @@ def parse_plan_mode_arg(arg: str) -> bool | None:
         return True
     if normalized == _PLAN_OFF:
         return False
+    return None
+
+
+def parse_effort_arg(arg: str) -> str | None:
+    """Normalize a /effort argument; None when not a valid effort level."""
+    normalized = str(arg or "").strip().lower()
+    if normalized in VALID_EFFORTS:
+        return normalized
+    return None
+
+
+def parse_goal_keyword_arg(arg: str) -> str | None:
+    """Normalize a /goal keyword (pause/resume/cancel/off); None when the
+    argument is objective text instead of a keyword."""
+    normalized = str(arg or "").strip().lower()
+    if normalized in _GOAL_KEYWORDS:
+        return normalized
     return None
 
 

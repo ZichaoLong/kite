@@ -5,6 +5,8 @@ from kite.command_surface import (
     build_help_text,
     build_usage_text,
     get_command_spec,
+    parse_effort_arg,
+    parse_goal_keyword_arg,
     parse_group_mode_arg,
     parse_permission_mode_arg,
     parse_plan_mode_arg,
@@ -85,6 +87,12 @@ class CommandSpecTests(unittest.TestCase):
                 "/attach",
                 "/mode",
                 "/plan",
+                "/effort",
+                "/goal",
+                "/compact",
+                "/rename",
+                "/archive",
+                "/restore",
                 "/group",
                 "/group-mode",
                 "/status",
@@ -151,6 +159,30 @@ class ArgParserTests(unittest.TestCase):
         self.assertIsNone(parse_plan_mode_arg(""))
         self.assertIsNone(parse_plan_mode_arg("1"))
         self.assertIsNone(parse_plan_mode_arg("toggle"))
+
+    def test_effort_accepts_valid_values(self) -> None:
+        for value in ("off", "low", "medium", "high", "xhigh", "max"):
+            self.assertEqual(parse_effort_arg(value), value)
+        self.assertEqual(parse_effort_arg(" HIGH "), "high")
+        self.assertEqual(parse_effort_arg("Max"), "max")
+
+    def test_effort_rejects_invalid_values(self) -> None:
+        self.assertIsNone(parse_effort_arg(""))
+        self.assertIsNone(parse_effort_arg("turbo"))
+        self.assertIsNone(parse_effort_arg("max2"))
+        self.assertIsNone(parse_effort_arg(None))  # type: ignore[arg-type]
+
+    def test_goal_keyword_accepts_controls_and_off(self) -> None:
+        self.assertEqual(parse_goal_keyword_arg("pause"), "pause")
+        self.assertEqual(parse_goal_keyword_arg(" resume "), "resume")
+        self.assertEqual(parse_goal_keyword_arg("CANCEL"), "cancel")
+        self.assertEqual(parse_goal_keyword_arg("off"), "off")
+
+    def test_goal_keyword_returns_none_for_objective_text(self) -> None:
+        self.assertIsNone(parse_goal_keyword_arg(""))
+        self.assertIsNone(parse_goal_keyword_arg("修复登录页的崩溃"))
+        self.assertIsNone(parse_goal_keyword_arg("pause please"))
+        self.assertIsNone(parse_goal_keyword_arg(None))  # type: ignore[arg-type]
 
     def test_group_mode_accepts_valid_values(self) -> None:
         self.assertEqual(parse_group_mode_arg("mention_only"), "mention_only")
