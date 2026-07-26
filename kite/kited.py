@@ -17,6 +17,15 @@ stores; after the startup (re)subscribe, prompt ownership is rebuilt
 best-effort and every bound session goes through a snapshot rebuild so
 in-flight execution cards are re-anchored and unrebuildable approvals are
 explicitly expired.
+
+Multi-instance (docs/decisions/multi-instance.md): `--instance <name>` (or
+KITE_INSTANCE) runs the daemon as a named instance — config/data under
+`<root>/instances/<name>/`, the provider env file next to its system.yaml,
+and an isolated kap home at `<data>/kap-home` (the default instance keeps
+`~/.kimi-code`; an explicit `kap.home` always wins). At startup kited takes
+an exclusive advisory lease on `<instance config>/kited.lock`; a second
+kited on the same instance exits 2 naming the holder pid, and a stale
+(dead) holder never blocks a restart.
 """
 
 from __future__ import annotations
@@ -26,6 +35,7 @@ import logging
 import os
 import pathlib
 import signal
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -34,6 +44,9 @@ from typing import Any, Callable, Mapping, Optional
 from kite import cards
 from kite import config as kite_config
 from kite import env_file
+from kite import file_lock
+from kite import instance_layout
+from kite import instance_resolution
 from kite.adapters import kap_server
 from kite.adapters.kap_server import (
     BackoffPolicy,
@@ -54,7 +67,7 @@ from kite.feishu_ws_proxy import DEFAULT_FEISHU_WS_PROXY
 from kite.group_history import GroupHistoryRecovery
 from kite.identity_names import IdentityNames
 from kite.logging_setup import configure_logging
-from kite.platform_paths import default_data_root
+from kite.platform_paths import ENV_FILE_NAME, default_data_root
 from kite.prompt_ownership import PromptOwnership
 from kite.runtime_loop import RuntimeLoop
 from kite.runtime_status import RuntimeStatusWriter
@@ -66,6 +79,60 @@ from kite.stores.pending_attachment_store import PendingAttachmentStore
 from kite.stores.terminal_result_store import TerminalResultStore
 
 logger = logging.getLogger("kite.kited")
+
+KITED_LOCK_FILE_NAME = "kited.lock"
+
+
+class InstanceLeaseError(RuntimeError):
+    """Another kited already holds this instance's lease (decision §4)."""
+
+
+def _lock_holder_pid(lock_path: pathlib.Path) -> int | None:
+    """The pid recorded in the lock file (best-effort; None when unreadable)."""
+    try:
+        raw = lock_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    try:
+        pid = int(raw)
+    except ValueError:
+        return None
+    return pid if pid > 0 else None
+
+
+def acquire_instance_lease(
+    config_dir: pathlib.Path | str, *, instance_name: str | None = None
+):
+    """Take the exclusive advisory lease on `<config>/kited.lock` (decision §4).
+
+    Two kited processes must never drive the same instance (Feishu would
+    load-balance bot events between them). Returns the open lock handle —
+    the caller MUST keep it open for the process lifetime; the OS releases
+    the flock at exit, so a stale (dead) holder never blocks a restart. On
+    conflict raises InstanceLeaseError naming the recorded holder pid.
+    """
+    config_dir = pathlib.Path(config_dir)
+    config_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = config_dir / KITED_LOCK_FILE_NAME
+    # Text mode: file_lock._ensure_lock_file writes a str placeholder byte.
+    handle = open(lock_path, "a+", encoding="utf-8")
+    try:
+        file_lock.acquire_file_lock(handle, blocking=False)
+    except file_lock.FileLockBusyError as exc:
+        holder_pid = _lock_holder_pid(lock_path)
+        handle.close()
+        label = instance_name or instance_layout.DEFAULT_INSTANCE_NAME
+        holder = f" (holder pid {holder_pid})" if holder_pid else ""
+        raise InstanceLeaseError(
+            f"another kited is already running for instance '{label}'{holder}: "
+            f"{lock_path}"
+        ) from exc
+    # Record the holder pid for conflict messages (best-effort).
+    handle.seek(0)
+    handle.truncate()
+    handle.write(f"{os.getpid()}\n")
+    handle.flush()
+    return handle
 
 
 class _TransportHandlerProxy(TransportHandler):
@@ -134,8 +201,14 @@ def build_outbound_runtime(
     config: Mapping[str, Any],
     data_dir: pathlib.Path,
     init_token: str,
+    kap_home: pathlib.Path | None = None,
 ) -> OutboundRuntime:
-    """Assemble transport + handler + pipeline + stores (main()'s job)."""
+    """Assemble transport + handler + pipeline + stores (main()'s job).
+
+    ``kap_home`` is the effective KIMI_CODE_HOME of the managed kap child
+    (main resolves it via instance_layout.resolve_effective_kap_home); it is
+    only used here to resolve the prompt model from the right config.toml.
+    """
     loop = RuntimeLoop(name="kite-runtime")
     rest_proxy = SwappableKapRest()
     ws_hook = WsSubscriptionHook()
@@ -152,7 +225,8 @@ def build_outbound_runtime(
     )
     kap = kite_config.kap_settings(config)
     prompt_model = kap_server.resolve_prompt_model(
-        kap.model, kap_server.resolve_kap_home(kap.home)
+        kap.model,
+        pathlib.Path(kap_home) if kap_home is not None else kap_server.resolve_kap_home(kap.home),
     )
     if prompt_model:
         logger.info("prompt model carried per prompt: %s", prompt_model)
@@ -527,6 +601,13 @@ def _build_parser() -> argparse.ArgumentParser:
         description="KITE daemon: supervise kap-server and the WS event stream.",
     )
     parser.add_argument(
+        "--instance",
+        metavar="NAME",
+        help="run as the named instance (default: KITE_INSTANCE, then the "
+        "default instance); named instances get isolated config/data dirs "
+        "and an isolated kap home (docs/decisions/multi-instance.md)",
+    )
+    parser.add_argument(
         "--config-dir",
         help="instance config directory (default: KITE_CONFIG_DIR or platform default)",
     )
@@ -537,17 +618,59 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = _build_parser().parse_args(argv)
+def _apply_instance_environment(instance_name: str | None, args: argparse.Namespace) -> None:
+    """Publish the instance's directories via env (kitectl does the same).
+
+    Explicit directories win over the instance layout per axis:
+    --config-dir/--data-dir (or pre-set KITE_CONFIG_DIR / KITE_DATA_ROOT)
+    are never overwritten by the layout.
+    """
     if args.config_dir:
         os.environ["KITE_CONFIG_DIR"] = args.config_dir
+    elif instance_name is not None and not os.environ.get("KITE_CONFIG_DIR", "").strip():
+        os.environ["KITE_CONFIG_DIR"] = str(instance_layout.resolve(instance_name).config_dir)
     if args.data_dir:
         os.environ["KITE_DATA_ROOT"] = args.data_dir
+    elif instance_name is not None and not os.environ.get("KITE_DATA_ROOT", "").strip():
+        os.environ["KITE_DATA_ROOT"] = str(instance_layout.resolve(instance_name).data_dir)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+    try:
+        instance_name = instance_resolution.daemon_instance_name(args.instance)
+    except ValueError as exc:
+        # Fail-closed on a bad instance name (decision §1) — before logging
+        # is configured, so this goes straight to stderr.
+        print(f"kited: error: {exc}", file=sys.stderr)
+        return 2
+    _apply_instance_environment(instance_name, args)
 
     log_path = configure_logging()
-    logger.info("kited starting; log file: %s", log_path)
+    logger.info(
+        "kited starting (instance: %s); log file: %s",
+        instance_name or instance_layout.DEFAULT_INSTANCE_NAME,
+        log_path,
+    )
 
-    env_overlay = env_file.load_env_file()
+    try:
+        # The daemon instance lease (decision §4): the ONLY cross-process
+        # coordination multi-instance needs. The handle must stay open for
+        # the whole process lifetime — the flock is released at exit, so a
+        # stale holder never blocks a restart.
+        _lease_handle = acquire_instance_lease(
+            kite_config.config_dir(), instance_name=instance_name
+        )
+    except InstanceLeaseError as exc:
+        logger.error("%s", exc)
+        return 2
+
+    if instance_name is not None and not os.environ.get("KITE_ENV_FILE", "").strip():
+        # The instance's provider env lives next to its system.yaml
+        # (decision §1); KITE_ENV_FILE still overrides explicitly.
+        env_overlay = env_file.load_env_file(kite_config.config_dir() / ENV_FILE_NAME)
+    else:
+        env_overlay = env_file.load_env_file()
     try:
         config = kite_config.load_config()
         kap = kite_config.kap_settings(config)
@@ -571,13 +694,17 @@ def main(argv: list[str] | None = None) -> int:
             kap_server.VERIFIED_KIMI_VERSION,
         )
 
-    home = kap_server.resolve_kap_home(kap.home)
+    # Decision §2: a named instance's kap child gets the isolated
+    # <data>/kap-home; the default instance keeps ~/.kimi-code (its live
+    # state); an explicit kap.home always wins.
+    home = instance_layout.resolve_effective_kap_home(kap.home, instance_name)
     data_dir = default_data_root()
 
     outbound = build_outbound_runtime(
         config=config,
         data_dir=data_dir,
         init_token=kite_config.ensure_init_token(),
+        kap_home=home,
     )
 
     stop_event = threading.Event()

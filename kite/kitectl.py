@@ -1,6 +1,15 @@
 """
 kitectl — the KITE local admin CLI.
 
+Multi-instance (docs/decisions/multi-instance.md §3): the global
+`--instance <name>` flag (or the KITE_INSTANCE env var) targets a named
+instance living under `<root>/instances/<name>/`; without either, the single
+running instance wins when exactly one is live (per-instance
+control_plane.json discovery, stale pids filtered; ambiguity exits 2 with
+the candidate list), otherwise the default instance. `service` commands
+resolve explicit-or-default only. Explicit --config-dir/--data-dir always
+win over the instance layout.
+
 Implemented slice (docs/contracts/mvp-scope.md §2 kitectl row, §6):
   - `kitectl config show`     — the effective config with secrets redacted
   - `kitectl config init-token`
@@ -85,6 +94,8 @@ from kite.control_plane import (
     ControlRefusedError,
     discover_live_control_metadata,
 )
+from kite import instance_layout
+from kite import instance_resolution
 from kite.platform_paths import default_data_root, default_log_file
 from kite.process_utils import process_exists
 from kite.runtime_status import read_runtime_status
@@ -113,7 +124,11 @@ def _connect() -> KapRestClient:
     """Build a REST client for the running kap-server (fail-closed)."""
     config = kite_config.load_config_file("system")
     kap = kite_config.kap_settings(config)
-    home = kap_server.resolve_kap_home(kap.home)
+    # The instance's kap home: kap.home wins, a named instance gets its
+    # isolated <data>/kap-home, the default keeps ~/.kimi-code (decision §2).
+    home = instance_layout.resolve_effective_kap_home(
+        kap.home, instance_resolution.explicit_instance_name()
+    )
     try:
         token = kap_server.read_server_token(home)
     except OSError:
@@ -318,14 +333,18 @@ def _cmd_config_init_token(_args: argparse.Namespace) -> int:
 
 
 def _service_definition() -> service_manager.ServiceDefinition:
-    """The single-instance service definition, honoring --config-dir/--data-dir.
+    """The instance's service definition, honoring --config-dir/--data-dir.
 
     The unit's ExecStart carries the instance directories explicitly: the
     service runs without this shell's environment (KITE_CONFIG_DIR /
     KITE_DATA_ROOT), so a definition written under custom
     --config-dir/--data-dir but lacking the flags would start kited with
-    the DEFAULT directories — a self-contradictory unit (audit L26).
+    the DEFAULT directories — a self-contradictory unit (audit L26). A named
+    instance additionally carries --instance (kited derives its isolated kap
+    home from the instance name, decision §2) and gets its own unit name
+    (`kite-<name>`) so units never clobber each other.
     """
+    instance_name = instance_resolution.explicit_instance_name()
     config_dir = kite_config.config_dir()
     data_dir = default_data_root()
     command = [
@@ -335,10 +354,13 @@ def _service_definition() -> service_manager.ServiceDefinition:
         "--data-dir",
         str(data_dir),
     ]
+    if instance_name is not None:
+        command += ["--instance", instance_name]
     return service_manager.build_service_definition(
         config_dir=config_dir,
         data_dir=data_dir,
         daemon_command=command,
+        identifier=service_manager.service_identifier(instance_name),
     )
 
 
@@ -868,6 +890,13 @@ def _cmd_completion(args: argparse.Namespace) -> int:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="kitectl", description="KITE local admin CLI.")
     parser.add_argument(
+        "--instance",
+        metavar="NAME",
+        help="target instance (default: KITE_INSTANCE, then the single "
+        "running instance, then the default instance; `service` commands "
+        "skip the single-running rung)",
+    )
+    parser.add_argument(
         "--config-dir",
         help="instance config directory (default: KITE_CONFIG_DIR or platform default)",
     )
@@ -1099,13 +1128,48 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = _build_parser().parse_args(argv)
+def _apply_instance_environment(args: argparse.Namespace) -> None:
+    """Resolve the target instance and publish its directories via env.
+
+    Resolution ladder (docs/decisions/multi-instance.md §3): --instance >
+    KITE_INSTANCE > the single running instance (skipped for `service`
+    commands) > the default instance. Explicit directories win over the
+    instance layout per axis: --config-dir/--data-dir (or pre-set
+    KITE_CONFIG_DIR / KITE_DATA_ROOT) are never overwritten by the layout.
+    Downstream code keeps reading kite_config.config_dir() /
+    default_data_root(), which now point at the resolved instance.
+    """
+    instance_name = instance_resolution.resolve_instance_name(
+        args.instance,
+        allow_single_running=args.command != "service",
+    )
+    if instance_name is None:
+        paths = None
+    else:
+        paths = instance_layout.resolve(instance_name)
+        # Publish the resolved name so downstream helpers (_connect's kap
+        # home, _service_definition's unit name) see the same instance.
+        os.environ[instance_resolution.INSTANCE_ENV_VAR] = instance_name
     if args.config_dir:
         os.environ["KITE_CONFIG_DIR"] = args.config_dir
+    elif (
+        paths is not None
+        and not os.environ.get("KITE_CONFIG_DIR", "").strip()
+    ):
+        os.environ["KITE_CONFIG_DIR"] = str(paths.config_dir)
     if args.data_dir:
         os.environ["KITE_DATA_ROOT"] = args.data_dir
+    elif (
+        paths is not None
+        and not os.environ.get("KITE_DATA_ROOT", "").strip()
+    ):
+        os.environ["KITE_DATA_ROOT"] = str(paths.data_dir)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
     try:
+        _apply_instance_environment(args)
         return int(args.func(args))
     except CliError as exc:
         print(f"kitectl: error: {exc}", file=sys.stderr)

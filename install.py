@@ -6,6 +6,8 @@ The script prepares the managed virtualenv, installs the `kite` package into
 it, writes the user-bin wrapper(s), and registers the OS service definition
 WITHOUT starting it (docs/architecture/kite-design.md §9). Starting the
 daemon and enabling autostart are explicit later steps (`kitectl service`).
+With `--instance <name>` it only creates that named instance's directories
+(docs/decisions/multi-instance.md) and leaves venv/wrappers/service alone.
 """
 
 from __future__ import annotations
@@ -173,10 +175,55 @@ def _print_next_steps(
     print('  - Shell completion:   eval "$(kitectl completion bash)"  # or zsh / fish')
 
 
+def _install_instance(name: str) -> None:
+    """Create a named instance's directories (docs/decisions/multi-instance.md).
+
+    The managed venv / wrappers / service flow is instance-independent and
+    stays on the default path; `--instance <name>` only lays out the new
+    instance's config/data/kap-home directories. Fail-closed on a bad name.
+    """
+    from kite.instance_layout import resolve, validate_instance_name
+
+    try:
+        instance_name = validate_instance_name(name)
+    except ValueError as exc:
+        raise SystemExit(f"invalid instance name: {exc}") from exc
+    paths = resolve(instance_name)
+    for directory in (paths.config_dir, paths.data_dir, paths.kap_home):
+        directory.mkdir(parents=True, exist_ok=True)
+    print(f"instance '{instance_name}' directories ready:")
+    print(f"  config  : {paths.config_dir}")
+    print(f"  data    : {paths.data_dir}")
+    print(f"  kap home: {paths.kap_home}")
+    print()
+    print("Next steps:")
+    print(f"  - Fill in {paths.config_dir}/system.yaml and the env file next to it.")
+    print(f"  - Write the service definition: kitectl --instance {instance_name} service install")
+    print(f"  - Start the daemon:             kitectl --instance {instance_name} service start")
+
+
 def main(argv: list[str] | None = None) -> None:
     args = [] if argv is None else list(argv)
-    if args:
-        raise SystemExit(f"install.py 不接受任何参数：{' '.join(args)}")
+    instance_name: str | None = None
+    rest: list[str] = []
+    index = 0
+    while index < len(args):
+        item = args[index]
+        if item == "--instance" and index + 1 < len(args):
+            instance_name = args[index + 1]
+            index += 2
+        elif item.startswith("--instance="):
+            instance_name = item.split("=", 1)[1]
+            index += 1
+        else:
+            rest.append(item)
+            index += 1
+    if rest:
+        raise SystemExit(f"install.py 不接受任何参数：{' '.join(rest)}")
+    if instance_name is not None:
+        _ensure_supported_python()
+        _install_instance(instance_name)
+        return
     _ensure_supported_python()
     install_dir = pathlib.Path(__file__).resolve().parent
     from kite.platform_paths import default_user_bin_dir

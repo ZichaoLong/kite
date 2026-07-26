@@ -1,11 +1,11 @@
 """
 User-service management across supported desktop platforms.
 
-Single instance is the premise (docs/architecture/kite-design.md §9): one
-config/data directory pair per machine, one `kited` daemon, and one OS-level
-service unit named `kite`. The service layer only renders and drives that
-unit; the managed `kimi web --no-open` child process is supervised by kited
-itself, never by the OS service definitions here.
+One OS-level service unit per instance (docs/decisions/multi-instance.md):
+the default instance's unit is named `kite`; a named instance gets
+`kite-<name>` (see service_identifier). The service layer only renders and
+drives those units; the managed `kimi web --no-open` child process is
+supervised by kited itself, never by the OS service definitions here.
 """
 
 from __future__ import annotations
@@ -66,6 +66,16 @@ def managed_venv_dir() -> pathlib.Path:
     return default_data_root() / MANAGED_VENV_DIR_NAME
 
 
+def service_identifier(instance_name: str | None) -> str:
+    """One OS unit per instance (FOCUS's shape): `kite` for the default
+    instance, `kite-<name>` for named ones, so per-instance units never
+    clobber each other (docs/decisions/multi-instance.md)."""
+    normalized = str(instance_name or "").strip()
+    if not normalized:
+        return SERVICE_NAME
+    return f"{SERVICE_NAME}-{normalized}"
+
+
 def default_daemon_command() -> tuple[str, ...]:
     """Single source of truth for the command the OS service runs.
 
@@ -83,6 +93,7 @@ def build_service_definition(
     daemon_command: list[str] | tuple[str, ...] | None = None,
     config_dir: pathlib.Path | str | None = None,
     data_dir: pathlib.Path | str | None = None,
+    identifier: str | None = None,
 ) -> ServiceDefinition:
     resolved_config_dir = (
         pathlib.Path(config_dir).expanduser() if config_dir is not None else default_config_root()
@@ -96,7 +107,7 @@ def build_service_definition(
         else default_daemon_command()
     )
     return ServiceDefinition(
-        identifier=SERVICE_NAME,
+        identifier=str(identifier or "").strip() or SERVICE_NAME,
         config_dir=resolved_config_dir,
         data_dir=resolved_data_dir,
         daemon_command=command,
@@ -278,7 +289,10 @@ class LaunchdUserServiceManager(ServiceManager):
         return f"gui/{os.getuid()}"
 
     def _label(self, definition: ServiceDefinition) -> str:
-        return LAUNCHD_LABEL
+        # One LaunchAgent label per instance: io.kite for the default
+        # instance, io.kite.<name> for a named one (identifier kite-<name>).
+        suffix = definition.identifier.removeprefix(SERVICE_NAME).lstrip("-")
+        return f"{LAUNCHD_LABEL}.{suffix}" if suffix else LAUNCHD_LABEL
 
     def _autostart_status_source(self, definition: ServiceDefinition) -> str:
         return f"LaunchAgent {self._label(definition)}"

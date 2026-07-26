@@ -181,8 +181,10 @@ gate。登记在 `docs/decisions/concurrency-model.md`，等产品证明需要�
 - 服务环境凭证：daemon 不继承用户 shell 环境，provider 密钥从 env 文件
   读取（默认 `~/.config/kite/env`,0600;`KITE_ENV_FILE` 可覆盖）——绝不
   写进 unit 定义。
-- 单实例为前提：配置/数据目录一份；多实例（多飞书应用）登记为 Phase 3
-  候选，届时需先补跨实例并发合同。
+- 多实例（每个飞书租户一个 bot）已定案：默认实例保持单一配置/数据目
+  录逐字节不变；命名实例位于 `instances/<name>/`，拥有隔离的 kap
+  home(`<data>/kap-home`)、每实例 daemon 租约（`kited.lock`）与
+  kitectl `--instance` 解析阶梯——见 `docs/decisions/multi-instance.md`。
 
 ## 10. 上游依赖管理（2026-07-21 对齐：跟随，不钉死）
 

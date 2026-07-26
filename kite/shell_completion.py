@@ -44,8 +44,8 @@ _PATH_VALUE_FLAGS = ("--config-dir", "--data-dir", "--path", "--ctl-path")
 #   "choices":      fixed candidates for the positional (offered as words)
 #   "subcommands":  {name: node}
 KITECTL_SPEC: dict = {
-    "flags": ("--config-dir", "--data-dir"),
-    "value_flags": ("--config-dir", "--data-dir"),
+    "flags": ("--instance", "--config-dir", "--data-dir"),
+    "value_flags": ("--instance", "--config-dir", "--data-dir"),
     "subcommands": {
         "config": {
             "subcommands": {
@@ -142,8 +142,8 @@ KITECTL_SPEC: dict = {
 
 # kited has no user-facing subcommands (top-level flags only).
 KITED_SPEC: dict = {
-    "flags": ("--config-dir", "--data-dir"),
-    "value_flags": ("--config-dir", "--data-dir"),
+    "flags": ("--instance", "--config-dir", "--data-dir"),
+    "value_flags": ("--instance", "--config-dir", "--data-dir"),
 }
 
 COMMANDS = {

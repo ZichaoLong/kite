@@ -216,9 +216,12 @@ FOCUS's wrapper design; the command names `kite` (local entrypoint) and `kcode`
   env, so provider keys are read from the env file (default
   `~/.config/kite/env`, mode 0600; `KITE_ENV_FILE` overrides) — never from
   the unit definition.
-- Single instance is the premise: one config/data directory; multi-instance
-  (multiple Feishu apps) is registered as a Phase 3 candidate, and requires a
-  cross-instance concurrency contract first.
+- Multi-instance (one bot per Feishu tenant) is decided: the default
+  instance keeps the single config/data directory byte-identically; named
+  instances live under `instances/<name>/` with isolated kap homes
+  (`<data>/kap-home`), a per-instance daemon lease (`kited.lock`), and the
+  kitectl `--instance` resolution ladder — see
+  `docs/decisions/multi-instance.md`.
 
 ## 10. Upstream Dependency Management (aligned 2026-07-21: follow, don't pin)
 

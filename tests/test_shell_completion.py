@@ -272,7 +272,7 @@ class RendererTests(unittest.TestCase):
         self.assertEqual(completion_words, ["bash", "zsh", "fish"])
         # The walker's value-flag skip keeps the top-level context.
         self.assertIn("schedule", after_global_value_flag)
-        self.assertEqual(kited_flags, ["--config-dir", "--data-dir", "--help"])
+        self.assertEqual(kited_flags, ["--instance", "--config-dir", "--data-dir", "--help"])
 
 
 class CliTests(unittest.TestCase):
