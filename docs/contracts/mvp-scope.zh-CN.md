@@ -153,6 +153,13 @@
    本 chat，审批路由不变。不排队、不打断主 turn。本刀边界：btw prompt
    不支持 `/abort`；重启后 btw agent 按需重建，旧 agent 交由上游卫生
    机制处理（2026-07-27 登记）。
+   **生命周期边界(2026-07-27 登记，复审 R3/R4)**：发起 chat 无法归因时
+   （归属丢失，如 kited 重启后，或 prompt 来自他端），旁路答复兜底广播
+   到本 session 全部 attached chat；无跟踪的 `turn.ended`（重启跨越在飞
+   旁路 turn）发降级通知（"已结束，内容无法取回"）而非静默，同一旁路
+   通道在短窗口内去重；快照重建对本 session 的在飞 btw 跟踪做
+   fail-closed 清理并显式通知；他端 abort 的 btw prompt 退役其归因
+   条目。
 14. `/goal` 重接线（2026-07-27，复审 N2-HIGH-1):prompt 提交路由解析但
    静默丢弃 `goal_*` 字段——上游真实 goal 路径为
    `POST .../profile {agent_config.goal_objective|goal_control}` 与

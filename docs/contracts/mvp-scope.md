@@ -190,6 +190,16 @@ explicitly; "best-effort" silent degradation is forbidden:
     btw prompts cannot be `/abort`ed; after a restart the btw agent is
     re-created on demand and old ones are left to upstream hygiene
     (registered 2026-07-27).
+    **Lifecycle edges (registered 2026-07-27, audits R3/R4)**: when the
+    initiating chat cannot be attributed (ownership lost, e.g. across a
+    kited restart, or the prompt came from another client), the btw answer
+    falls back to broadcasting to every attached chat of the session; an
+    untracked `turn.ended` (a restart crossing the in-flight side turn)
+    delivers a degraded notice ("ended, content unrecoverable") instead of
+    silence, deduped per side channel within a short window; a snapshot
+    rebuild fail-closes the session's in-flight btw tracking with an
+    explicit notice; a btw prompt aborted from another client retires its
+    attribution entry.
 14. `/goal` rewired (2026-07-27, audit N2-HIGH-1): the prompt-submit route
     parses but silently drops `goal_*` fields — the real upstream goal path
     is `POST .../profile {agent_config.goal_objective|goal_control}` plus

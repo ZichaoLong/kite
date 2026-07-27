@@ -273,9 +273,13 @@ class StreamIntoCardTests(StreamingPipelineTestCase):
                  "display": {"kind": "command", "command": "ls"}},
             )
         )
+        # The running-card patch flows through the dispatcher (audit R-4);
+        # the flush applies the pending stream render and the tool patch —
+        # the latest render carries both.
+        self.dispatcher.flush()
         patches = self.transport.patches_to(message_id)
-        self.assertEqual(len(patches), 1)
-        rendered = json.dumps(patches[0], ensure_ascii=False)
+        self.assertTrue(patches)
+        rendered = json.dumps(patches[-1], ensure_ascii=False)
         self.assertIn("流式正文", rendered)
         self.assertIn("Bash", rendered)
 
@@ -420,13 +424,18 @@ class GapRebuildTests(StreamingPipelineTestCase):
         self.assertEqual(self.rest.snapshot_calls, 1)
 
         # The rebuild reseeded the transcript from the snapshot's in-flight
-        # text; the wholesale refresh already rendered it synchronously.
+        # text; the wholesale refresh renders it (through the dispatcher,
+        # audit R-4).
+        self.dispatcher.flush()
         patches = self.transport.patches_to(message_id)
         self.assertTrue(any("abcdefghij" in json.dumps(p, ensure_ascii=False) for p in patches))
         # Streaming resumes at the re-baselined offset with no further rebuilds.
         self.delta(10, "k")
         self.delta(11, "!")
         self.assertEqual(self.rest.snapshot_calls, 1)
+        # The throttled trailing patch converges to the latest content.
+        self.timers.live[-1].fire()
+        self.flush()
         self.dispatcher.flush()
         applied = self.dispatcher.applied_to(message_id)
         self.assertTrue(applied)

@@ -151,6 +151,12 @@ _TOOL_LINES_TRUNCATION_NOTICE = "**[工具调用已截断，仅保留最近部�
 _TERMINAL_DELIVERED_CAP = 1024
 _LATEST_ASSISTANT_PAGE_SIZE = 20
 
+# How long a side channel's just-ended marker stays fresh (audit R4-HIGH-1):
+# upstream emits turn.ended(failed) and the trailing error frame for one
+# failure in the same tick (loopService.ts), so the window only needs to
+# outlive reconnect/replay churn — it never spans two real prompts.
+_BTW_ENDED_MARK_SECONDS = 60.0
+
 _KAP_UNREACHABLE_TOAST = "无法连接 kap-server，操作未完成，请稍后再试。"
 
 
@@ -328,6 +334,10 @@ class _ExecutionCardState:
     # One-shot guard for the frozen-card minimal retry (230099 → stripped
     # re-render through the dispatcher, audit R-3).
     frozen_minimal_submitted: bool = False
+    # Freeze sequence (audit R-4): bumped on every freeze submit; a result
+    # callback carrying an older sequence must not fire its minimal retry —
+    # it would clobber the newer freeze's card face.
+    frozen_seq: int = 0
 
 
 @dataclass(slots=True)
@@ -497,6 +507,13 @@ class EventPipeline:
         # turn attribution (fed by the AppHandler's note_btw_prompt seam).
         self._btw_turns: dict[tuple[str, str], _BtwTurnState] = {}
         self._btw_prompts: dict[tuple[str, str], deque[str]] = {}
+        # Just-ended marker per (session, agent) side channel (monotonic
+        # timestamp): an error frame landing inside the window is the
+        # just-ended turn's own trailing frame (upstream emits both for one
+        # failure in the same tick), never a fresh corpse (audit R4-HIGH-1);
+        # the window also dedups the degraded untracked-turn.ended notice
+        # (audit R4 LOW). Entries prune lazily on read.
+        self._btw_ended_marks: dict[tuple[str, str], float] = {}
         self._shutdown = False
 
     # ------------------------------------------------------------------
@@ -640,7 +657,12 @@ class EventPipeline:
     def _btw_turn_started(self, event: TurnStarted) -> None:
         key = (event.session_id, event.agent_id)
         queue = self._btw_prompts.get(key)
-        prompt_id = queue[0] if queue else ""
+        # POP, not peek (audit R4-HIGH-1): an attributed turn's submission
+        # leaves the FIFO at start, so "no tracked turn + a FIFO head"
+        # genuinely means that head never reached a turn (dead-on-arrival).
+        prompt_id = queue.popleft() if queue else ""
+        if queue is not None and not queue:
+            self._btw_prompts.pop(key, None)
         if not prompt_id:
             logger.warning(
                 "btw turn.started without a tracked submission session=%s agent=%s turn=%s; "
@@ -678,9 +700,21 @@ class EventPipeline:
         if turn is None:
             # Never tracked: a kited restart crossed the in-flight side turn
             # (the snapshot's in-flight projection is main-only, so nothing
-            # rebuilds it) or a rebuild already swept it. The answer text is
-            # unrecoverable, but the end of the turn is never silent
-            # (audit R3-MED-3) — attached chats get a degraded notice.
+            # rebuilds it), a reconnect replayed an already-closed end, or a
+            # rebuild already swept it. The answer text is unrecoverable,
+            # but the end of the turn is never silent (audit R3-MED-3) —
+            # attached chats get ONE degraded notice per just-ended window;
+            # a late duplicate or the post-sweep end does not re-notify
+            # (audit R4 LOW).
+            if self._btw_ended_recently(key):
+                logger.debug(
+                    "btw degraded notice suppressed (window) session=%s agent=%s turn=%s",
+                    event.session_id,
+                    event.agent_id,
+                    event.turn_id,
+                )
+                return
+            self._btw_ended_marks[key] = self._monotonic()
             logger.info(
                 "btw turn.ended for an untracked turn session=%s agent=%s turn=%s; "
                 "delivering the degraded notice",
@@ -690,7 +724,7 @@ class EventPipeline:
             )
             for chat_id, _binding in self._attached_chats(event.session_id):
                 self._send_text(
-                    chat_id, "旁路 prompt 已结束（KITE 重启，答复内容无法取回）。"
+                    chat_id, "旁路 prompt 已结束（KITE 重启或事件重连，答复内容无法取回）。"
                 )
             return
         # Delivery targets BEFORE retiring the turn (audit R3-HIGH-1):
@@ -718,24 +752,43 @@ class EventPipeline:
             turn.prompt_id or "-",
         )
 
-    def _end_btw_turn(self, key: tuple[str, str]) -> None:
+    def _end_btw_turn(self, key: tuple[str, str], *, retire_queue_head: bool = False) -> None:
         """Close the side turn's own tracking (turn.ended / error frame):
-        pop the turn, retire its FIFO-attributed submission, and forget its
-        ownership entry (the main prompt's state is never touched)."""
+        pop the turn, forget its ownership entry, and stamp the just-ended
+        marker so the trailing error frame upstream emits for the same
+        failure stays silent (audit R4-HIGH-1).
+
+        The FIFO is otherwise untouched: an attributed submission left it at
+        turn.started (pop-on-start), and an UNATTRIBUTED turn (e.g. another
+        client's submission) must never retire the head — that head is a
+        live queued submission, not this turn's corpse (audit R4-MED-1).
+        Only the error frame's dead-before-start path may retire the head
+        (``retire_queue_head``): that prompt never reached turn.started, so
+        it was never popped.
+        """
         turn = self._btw_turns.pop(key, None)
-        queue = self._btw_prompts.get(key)
+        self._btw_ended_marks[key] = self._monotonic()
         prompt_id = turn.prompt_id if turn is not None else ""
-        if not prompt_id and queue:
-            # The turn died before it could be attributed (e.g. an error
-            # frame ahead of turn.started): the head submission is the one
-            # that died — retire it too, or the next turn would mis-attribute.
+        queue = self._btw_prompts.get(key)
+        if not prompt_id and retire_queue_head and queue:
             prompt_id = queue[0]
-        if queue and prompt_id and queue[0] == prompt_id:
+        if prompt_id and queue and queue[0] == prompt_id:
             queue.popleft()
             if not queue:
                 self._btw_prompts.pop(key, None)
         if prompt_id:
             self._ownership.forget(prompt_id)
+
+    def _btw_ended_recently(self, key: tuple[str, str]) -> bool:
+        """True while the side channel's just-ended marker is fresh (audit
+        R4-HIGH-1). Stale markers are pruned on read."""
+        mark = self._btw_ended_marks.get(key)
+        if mark is None:
+            return False
+        if self._monotonic() - mark >= _BTW_ENDED_MARK_SECONDS:
+            self._btw_ended_marks.pop(key, None)
+            return False
+        return True
 
     def _btw_target_chats(self, session_id: str, prompt_id: str) -> list[str]:
         """The side answer's audience: the initiating chat when attribution
@@ -761,11 +814,17 @@ class EventPipeline:
         (audit N3-HIGH-1); the main prompt is untouched.
 
         Upstream emits turn.ended(failed) for the same failure
-        (loopService.ts), so a tracked turn is left alone here — turn.ended
-        delivers the single failure notice (audit R3-MED-1). Only a prompt
-        that died BEFORE its turn.started was tracked (no tracked turn, but
-        a FIFO-head submission exists) is closed out with an explicit note;
-        anything else is a stray frame and only logged.
+        (loopService.ts) in the same tick, so:
+        - a tracked turn is left alone here — turn.ended delivers the
+          single failure notice (audit R3-MED-1);
+        - inside the just-ended window the frame is that turn's own
+          trailing frame (the KapErrorFrame carries no prompt id) — silent,
+          or the NEXT queued submission would be misread as a fresh corpse
+          and retired (audit R4-HIGH-1);
+        - only a prompt that died BEFORE its turn.started was tracked (no
+          tracked turn, no fresh marker, but a FIFO-head submission exists)
+          is closed out with an explicit note; anything else is a stray
+          frame and only logged.
         """
         session_id = error.session_id
         if not session_id:
@@ -778,6 +837,15 @@ class EventPipeline:
                 "leaving the failure to turn.ended",
                 session_id,
                 error.agent_id,
+            )
+            return
+        if self._btw_ended_recently(key):
+            logger.info(
+                "btw error frame suppressed by the just-ended marker session=%s agent=%s: %s %s",
+                session_id,
+                error.agent_id,
+                error.code,
+                error.message,
             )
             return
         queue = self._btw_prompts.get(key)
@@ -795,7 +863,7 @@ class EventPipeline:
         # _btw_turn_ended): the retire forgets the ownership the targeting
         # read depends on.
         targets = self._btw_target_chats(session_id, prompt_id)
-        self._end_btw_turn(key)
+        self._end_btw_turn(key, retire_queue_head=True)
         text = f"上游错误 {error.code}: {error.message}" if error.code else error.message
         for chat_id in targets:
             self._send_text(chat_id, f"⚠️ 旁路 prompt 失败：{text}")
@@ -853,18 +921,27 @@ class EventPipeline:
         FIFO head would mis-attribute the next submission to the previous
         owner. Retire everything for the session and say so; never guess.
         (Startup recovery sweeps too, but a fresh process has empty maps,
-        so it is a no-op there.)
+        so it is a no-op there.) The just-ended marker is stamped for the
+        swept channels, so a late untracked turn.ended does not deliver a
+        second degraded notice on top of this one (audit R4 LOW).
         """
         retired: list[str] = []
+        swept_keys: list[tuple[str, str]] = []
         for key in [key for key in self._btw_turns if key[0] == session_id]:
             turn = self._btw_turns.pop(key)
-            if turn.prompt_id:
+            swept_keys.append(key)
+            if turn.prompt_id and turn.prompt_id not in retired:
                 retired.append(turn.prompt_id)
         for key in [key for key in self._btw_prompts if key[0] == session_id]:
             queue = self._btw_prompts.pop(key)
-            retired.extend(queue)
+            swept_keys.append(key)
+            for prompt_id in queue:
+                if prompt_id not in retired:
+                    retired.append(prompt_id)
         if not retired:
             return
+        for key in swept_keys:
+            self._btw_ended_marks[key] = self._monotonic()
         for prompt_id in retired:
             self._ownership.forget(prompt_id)
         for chat_id, _binding in self._attached_chats(session_id):
@@ -1393,6 +1470,8 @@ class EventPipeline:
         card is dropped (the terminal card still carries the result).
         """
         message_id = state.anchor.card_message_id
+        state.frozen_seq += 1
+        frozen_seq = state.frozen_seq
         reply_text = self._stream_projection(state)
         card = cards.build_execution_card(
             session_title=state.session_title,
@@ -1412,6 +1491,11 @@ class EventPipeline:
 
         def _on_full_result(result: MessagePatchResult) -> None:
             # Fired on the RuntimeLoop via the dispatcher's render invoker.
+            if frozen_seq != state.frozen_seq:
+                # A newer freeze of this card was scheduled after this one:
+                # its own callback owns the minimal decision — a stale
+                # minimal would clobber the newer freeze's face (audit R-4).
+                return
             if not result.content_rejected or not strippable:
                 return
             if state.frozen_minimal_submitted:
@@ -1575,9 +1659,9 @@ class EventPipeline:
         message_id = state.anchor.card_message_id
         if not message_id:
             return
-        self._dispatcher.submit(message_id, lambda: self._render_stream_card(state))
+        self._dispatcher.submit(message_id, lambda: self._render_running_card(state))
 
-    def _render_stream_card(self, state: _ExecutionCardState) -> Optional[str]:
+    def _render_running_card(self, state: _ExecutionCardState) -> Optional[str]:
         """Full-snapshot render of the running card (§3.1), invoked by the
         dispatcher on the RuntimeLoop at patch time.
 
@@ -2872,18 +2956,18 @@ class EventPipeline:
         return max(int(self._monotonic() - state.started_at), 0)
 
     def _patch_execution_card(self, state: _ExecutionCardState) -> None:
-        card = cards.build_execution_card(
-            session_title=state.session_title,
-            session_id=state.anchor.session_id,
-            prompt_text=state.prompt_text,
-            state=cards.EXECUTION_STATE_RUNNING,
-            elapsed_seconds=self._elapsed(state),
-            queue_length=state.queue_length,
-            tool_lines=self._tool_lines_for_card(state),
-            reply_text=self._stream_projection(state),
-            prompt_id=state.anchor.prompt_id,
-        )
-        self._patch_card(state.anchor.card_message_id, card)
+        """Patch the running card (tool lines / queue depth / wholesale
+        refresh).
+
+        Through the dispatcher (audit R-4, same discipline as the stream and
+        freeze paths): a Feishu 230020 on a tool-line patch is requeued
+        after ``retry_after`` instead of silently dropped. The render stays
+        full-snapshot at patch time (§3.1); a stale anchor renders None.
+        """
+        message_id = state.anchor.card_message_id
+        if not message_id:
+            return
+        self._dispatcher.submit(message_id, lambda: self._render_running_card(state))
 
     def _send_card(self, chat_id: str, card: dict) -> str:
         """Send a card; returns its message id ("" on failure)."""

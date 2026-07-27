@@ -523,7 +523,6 @@ class AppHandlerTestCase(unittest.TestCase):
         permission_mode: str = "auto",
         plan_mode: bool = False,
         effort: str = "",
-        goal_objective: str = "",
         chat_id: str = CHAT_ID,
     ) -> None:
         self.store.save(
@@ -534,7 +533,6 @@ class AppHandlerTestCase(unittest.TestCase):
                 "permission_mode": permission_mode,
                 "plan_mode": plan_mode,
                 "effort": effort,
-                "goal_objective": goal_objective,
             },
         )
 

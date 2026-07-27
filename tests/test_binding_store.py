@@ -87,7 +87,7 @@ class BindingStoreTests(unittest.TestCase):
         raw = json.loads(state_path.read_text(encoding="utf-8"))
         self.assertEqual(raw["bindings"]["oc_chat"]["effort"], "xhigh")
 
-        # Rewriting only the goal fields keeps the rest of the binding.
+        # Rewriting only the effort field keeps the rest of the binding.
         store.save("oc_chat", _binding("session-1", effort="off"))
         reloaded = store.load("oc_chat")
         assert reloaded is not None

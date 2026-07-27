@@ -330,12 +330,16 @@ class FakeWsClient:
 class ImmediateDispatcher:
     """Synchronous CardPatchDispatcher stand-in (PipelineTestCase).
 
-    The frozen-card patch path routes through the dispatcher API (audit
-    R-3); this fake applies render+patch inline on submit and fires
-    ``on_result`` with the outcome, so existing synchronous patch
-    assertions keep working while tests can assert what flowed through the
-    dispatcher. The real dispatcher's coalescing/retry semantics live in
-    test_patch_dispatcher.
+    The frozen-card and running-card patch paths route through the
+    dispatcher API (audit R-3/R-4); this fake applies render+patch inline
+    on submit and fires ``on_result`` with the outcome, so existing
+    synchronous patch assertions keep working while tests can assert what
+    flowed through the dispatcher. A stale render (content None) never
+    fires the callback, matching the real dispatcher. With
+    ``hold_result_callbacks`` set, submits carrying a callback are captured
+    into ``held`` unpatched, so tests can drive the patch-vs-callback
+    interleave by hand. The real dispatcher's coalescing/retry semantics
+    live in test_patch_dispatcher.
     """
 
     def __init__(self, patch) -> None:
@@ -344,12 +348,16 @@ class ImmediateDispatcher:
         self.applied: list[tuple[str, str]] = []
         self.cancelled: list[str] = []
         self.shutdown_called = False
+        self.hold_result_callbacks = False
+        # Captured on_result callbacks while holding, in submit order.
+        self.held: list = []
 
     def submit(self, message_id: str, render, on_result=None) -> None:
+        if self.hold_result_callbacks and on_result is not None:
+            self.held.append(on_result)
+            return
         content = render()
         if content is None:
-            if on_result is not None:
-                on_result(MessagePatchResult.success())
             return
         result = self._patch(message_id, content)
         self.applied.append((message_id, content))
@@ -2352,6 +2360,80 @@ class BtwRoutingTests(PipelineTestCase):
             self.transport.texts_to(CHAT_ID), ["旁路 prompt 执行失败：Model not set"]
         )
 
+    def test_error_frame_after_failed_end_does_not_kill_the_queued_prompt(self) -> None:
+        # Audit R4-HIGH-1 (two chats, one queued behind the failure): the
+        # trailing error frame of the failed turn must NOT retire the next
+        # queued submission, notify its owner, or break its targeting.
+        self.bind(CHAT_ID)
+        self.bind(CHAT_ID_2)
+        self._submit_btw("p-b1", CHAT_ID)  # turn 7 (fails)
+        self._submit_btw("p-b2", CHAT_ID_2)  # queued behind it
+        self.feed(self._btw_turn_started())  # turn 7 pops p-b1
+
+        # Upstream's same-tick failure pair (loopService.ts): turn.ended
+        # notifies chat1 and stamps the just-ended marker...
+        self.feed(self._btw_turn_ended(reason="failed", error="Model not set"))
+        self.assertEqual(
+            self.transport.texts_to(CHAT_ID), ["旁路 prompt 执行失败：Model not set"]
+        )
+        self.assertEqual(self.transport.texts_to(CHAT_ID_2), [])
+
+        # ...and the trailing error frame (no prompt id on the frame) is
+        # silent inside the window: no fake failure to chat2, no retire.
+        self.pipeline.handle_error_frame(
+            KapErrorFrame(
+                code="model.not_configured",
+                message="Model not set",
+                session_id=SESSION_ID,
+                agent_id=self.BTW_AGENT,
+                retryable=False,
+            )
+        )
+        self.flush()
+        self.assertEqual(self.transport.texts_to(CHAT_ID_2), [])
+        self.assertEqual(self.ownership.owner_of("p-b2"), CHAT_ID_2)
+
+        # The queued submission's own turn starts and its real answer still
+        # targets ONLY its initiating chat (never a broadcast leak).
+        self.feed(self._btw_turn_started(turn_id=8))
+        self._btw_delta("第二笔答案")
+        self.feed(self._btw_turn_ended(turn_id=8))
+        self.assertEqual(
+            self.transport.texts_to(CHAT_ID), ["旁路 prompt 执行失败：Model not set"]
+        )
+        self.assertEqual(self.transport.texts_to(CHAT_ID_2), ["旁路回复：第二笔答案"])
+
+    def test_foreign_turn_end_does_not_retire_the_queued_submission(self) -> None:
+        # Audit R4-MED-1 (multi-client): an unattributed (foreign) turn's
+        # end must not retire a live KITE submission waiting behind it.
+        self.bind(CHAT_ID)
+        self.bind(CHAT_ID_2)
+        # Another client submitted to the same btw agent: turn 7 starts
+        # with an EMPTY KITE FIFO (prompt attribution unknown).
+        self.feed(self._btw_turn_started())
+        # The KITE user then queues a submission behind the foreign turn.
+        self._submit_btw("p-b1", CHAT_ID)
+
+        # The foreign turn ends: its fallback note broadcasts (registered
+        # fallback for unattributed answers), but p-b1 survives intact.
+        self.feed(self._btw_turn_ended())
+        self.assertEqual(
+            self.transport.texts_to(CHAT_ID), ["旁路 prompt 已完成（没有文本输出）。"]
+        )
+        self.assertEqual(self.ownership.owner_of("p-b1"), CHAT_ID)
+
+        # The KITE submission's own turn attributes and targets correctly.
+        self.feed(self._btw_turn_started(turn_id=8))
+        self._btw_delta("答案")
+        self.feed(self._btw_turn_ended(turn_id=8))
+        self.assertEqual(
+            self.transport.texts_to(CHAT_ID),
+            ["旁路 prompt 已完成（没有文本输出）。", "旁路回复：答案"],
+        )
+        self.assertEqual(
+            self.transport.texts_to(CHAT_ID_2), ["旁路 prompt 已完成（没有文本输出）。"]
+        )
+
     def test_btw_error_frame_before_turn_start_retires_the_submission(self) -> None:
         self.bind(CHAT_ID)
         self._submit_btw("p-b1")
@@ -2422,15 +2504,64 @@ class BtwRoutingTests(PipelineTestCase):
 
     def test_untracked_btw_turn_ended_delivers_degraded_notice(self) -> None:
         # Audit R3-MED-3: a kited restart crossed the in-flight side turn —
-        # the answer is unrecoverable, but the end is never silent.
+        # the answer is unrecoverable, but the end is never silent. The
+        # wording is honest for restart AND reconnect origins (R4 LOW).
         self.bind(CHAT_ID)
         self.bind(CHAT_ID_2)
 
         self.feed(self._btw_turn_ended())
 
-        notice = "旁路 prompt 已结束（KITE 重启，答复内容无法取回）。"
+        notice = "旁路 prompt 已结束（KITE 重启或事件重连，答复内容无法取回）。"
         self.assertEqual(self.transport.texts_to(CHAT_ID), [notice])
         self.assertEqual(self.transport.texts_to(CHAT_ID_2), [notice])
+
+    def test_degraded_notice_deduped_within_the_window(self) -> None:
+        # R4 LOW: a late duplicate untracked turn.ended does not re-notify.
+        self.bind(CHAT_ID)
+
+        self.feed(self._btw_turn_ended())
+        self.feed(self._btw_turn_ended())
+
+        notice = "旁路 prompt 已结束（KITE 重启或事件重连，答复内容无法取回）。"
+        self.assertEqual(self.transport.texts_to(CHAT_ID), [notice])
+
+    def test_sweep_notice_suppresses_the_late_turn_ended_notice(self) -> None:
+        # R4 LOW: after the rebuild sweep's notice, the swept turn's late
+        # untracked turn.ended must not deliver a second degraded notice.
+        self.bind(CHAT_ID)
+        self.rest.snapshots[SESSION_ID] = make_snapshot(busy=False)
+        self._submit_btw("p-b1", CHAT_ID)
+        self.feed(self._btw_turn_started())
+        self.pipeline.handle_resync_required(
+            ResyncRequest(session_id=SESSION_ID, reason=None, current_seq=None, epoch=None)
+        )
+        self.flush()
+
+        notice = "⚠️ 事件流重建，在飞的旁路 prompt 状态已丢失；若答复未送达，请重新发送 /btw。"
+        self.assertEqual(self.transport.texts_to(CHAT_ID), [notice])
+
+        self.feed(self._btw_turn_ended())
+        self.assertEqual(self.transport.texts_to(CHAT_ID), [notice])
+
+    def test_sweep_log_dedupes_retired_prompt_ids(self) -> None:
+        # R4 LOW: the same prompt id counted from both the tracked turn and
+        # the queue is reported once in the sweep log (defensive hygiene).
+        self.bind(CHAT_ID)
+        self.rest.snapshots[SESSION_ID] = make_snapshot(busy=False)
+        self._submit_btw("p-b1", CHAT_ID)
+        # A duplicate seam entry (never produced by _cmd_btw; exercises the
+        # dedup directly): one copy is popped at turn.started, one stays.
+        self.pipeline.note_btw_prompt(SESSION_ID, self.BTW_AGENT, "p-b1")
+        self.feed(self._btw_turn_started())
+        with self.assertLogs("kite.outbound", level="WARNING") as captured:
+            self.pipeline.handle_resync_required(
+                ResyncRequest(session_id=SESSION_ID, reason=None, current_seq=None, epoch=None)
+            )
+            self.flush()
+        self.assertTrue(
+            any("retired=['p-b1']" in line for line in captured.output),
+            captured.output,
+        )
 
     def test_btw_delivery_with_zero_attached_chats_is_log_only(self) -> None:
         # The documented drop case (_btw_target_chats): no binding means no
@@ -2628,12 +2759,14 @@ class FrozenDispatcherTests(PipelineTestCase):
         self.feed(kap_event("turn.ended", {"turnId": 1, "reason": "completed"}))
 
         applied = self.dispatcher.applied_to(message_id)
-        # Two attempts through the dispatcher: the full frozen card (with
-        # the tool line, rejected 230099-style), then the minimal one.
-        self.assertEqual(len(applied), 2)
+        # Three attempts through the dispatcher: the running-card tool
+        # patch (rejected), the full frozen card (with the tool line,
+        # rejected 230099-style), then the minimal one.
+        self.assertEqual(len(applied), 3)
         self.assertIn("SENSITIVE_MARKER", applied[0])
-        self.assertNotIn("SENSITIVE_MARKER", applied[1])
-        # The minimal frozen card landed (one-shot: no third attempt).
+        self.assertIn("SENSITIVE_MARKER", applied[1])
+        self.assertNotIn("SENSITIVE_MARKER", applied[2])
+        # The minimal frozen card landed (one-shot: no fourth attempt).
         patches = self.transport.patches_to(message_id)
         self.assertEqual(len(patches), 1)
         rendered = json.dumps(patches[0], ensure_ascii=False)
@@ -2651,6 +2784,62 @@ class FrozenDispatcherTests(PipelineTestCase):
         # one rejected attempt, no retry (unchanged FOCUS discipline).
         self.assertEqual(len(self.dispatcher.applied_to(message_id)), 1)
         self.assertEqual(self.transport.patches_to(message_id), [])
+
+    def test_tool_line_patch_flows_through_the_dispatcher(self) -> None:
+        # Audit R-4: the running-card patch path (tool lines / queue depth)
+        # takes the dispatcher too, inheriting its 230020 reschedule.
+        self.bind(CHAT_ID)
+        message_id = self.start_prompt()
+
+        self.feed(
+            kap_event(
+                "tool.call.started",
+                {
+                    "turnId": 1,
+                    "toolCallId": "tc-1",
+                    "name": "Bash",
+                    "display": {"kind": "command", "command": "ls -la"},
+                },
+            )
+        )
+
+        applied = self.dispatcher.applied_to(message_id)
+        self.assertEqual(len(applied), 1)
+        self.assertIn("Bash", applied[0])
+        self.assertIn("ls -la", applied[0])
+        self.assertEqual(len(self.transport.patches_to(message_id)), 1)
+
+    def test_freeze_seq_guard_blocks_a_stale_minimal_retry(self) -> None:
+        # Audit R-4 (window: kap unreachable + 230099 racing a newer
+        # freeze): a stale freeze's 230099 callback must not submit its
+        # minimal — it would clobber the newer freeze's card face.
+        self.bind(CHAT_ID)
+        message_id = self.start_prompt()
+        self.feed(
+            kap_event(
+                "tool.call.started",
+                {"turnId": 1, "toolCallId": "tc-1", "name": "Bash"},
+            )
+        )
+        state = self.pipeline._cards[CHAT_ID]
+        self.dispatcher.hold_result_callbacks = True
+
+        # Two racing freezes of the same card (e.g. a failed rebuild's
+        # FROZEN_UNKNOWN and the turn's own FROZEN_DONE).
+        self.pipeline._patch_frozen_execution_card(state, cards.EXECUTION_STATE_FROZEN_UNKNOWN)
+        self.pipeline._patch_frozen_execution_card(state, cards.EXECUTION_STATE_FROZEN_DONE)
+        self.assertEqual(len(self.dispatcher.held), 2)
+
+        # The older freeze's 230099: minimal suppressed by the seq guard —
+        # nothing new is patched (only the running-card tool patch landed).
+        before = self.dispatcher.applied_to(message_id)
+        self.dispatcher.held[0](MessagePatchResult.invalid_content())
+        self.assertEqual(self.dispatcher.applied_to(message_id), before)
+        # The newer freeze's 230099: its minimal goes out (one-shot).
+        self.dispatcher.held[1](MessagePatchResult.invalid_content())
+        applied = self.dispatcher.applied_to(message_id)
+        self.assertEqual(len(applied), len(before) + 1)
+        self.assertIn("已结束", json.dumps(json.loads(applied[-1]), ensure_ascii=False))
 
 
 # ---------------------------------------------------------------------------
