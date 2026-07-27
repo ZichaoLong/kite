@@ -7,10 +7,10 @@ instance living under `<root>/instances/<name>/`; without either, the single
 running instance wins when exactly one is live (per-instance
 control_plane.json discovery, stale pids filtered; ambiguity exits 2 with
 the candidate list), otherwise the default instance. `service` commands,
-`completion` (instance-agnostic), and any invocation with explicit
---config-dir/--data-dir (or KITE_CONFIG_DIR/KITE_DATA_ROOT set) skip the
-single-running rung. Explicit --config-dir/--data-dir always win over the
-instance layout.
+`completion` and `instance` (instance-agnostic), and any invocation with
+explicit --config-dir/--data-dir (or KITE_CONFIG_DIR/KITE_DATA_ROOT set)
+skip the single-running rung. Explicit --config-dir/--data-dir always win
+over the instance layout.
 
 Implemented slice (docs/contracts/mvp-scope.md §2 kitectl row, §6):
   - `kitectl config show`     — the effective config with secrets redacted
@@ -58,6 +58,13 @@ Implemented slice (docs/contracts/mvp-scope.md §2 kitectl row, §6):
                                 instance's units are `kite-schedule-<instance>-<hash>`
                                 and fire with `--instance <name>`; list/show/
                                 remove only see the current instance.
+  - `kitectl instance create <name>`
+                              — scaffold an instance's config/data/kap-home
+                                directories and write the system.yaml/env
+                                templates from the installed package data
+                                (kite/instance_scaffold.py); idempotent,
+                                existing user files are never overwritten.
+                                `default` scaffolds the root instance.
   - `kitectl completion <shell>`
                               — the static bash/zsh/fish completion script
                                 (kite/shell_completion.py), meant for
@@ -102,6 +109,7 @@ from kite.control_plane import (
 )
 from kite import instance_layout
 from kite import instance_resolution
+from kite import instance_scaffold
 from kite.platform_paths import default_data_root, default_log_file
 from kite.process_utils import process_exists
 from kite.runtime_status import read_runtime_status
@@ -928,6 +936,37 @@ def _cmd_interaction_sweep(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_instance_create(args: argparse.Namespace) -> int:
+    """Scaffold an instance (kite/instance_scaffold.py; FOCUS's instance create).
+
+    Idempotent: existing user files are kept, the *.example reference copy is
+    refreshed. The service definition stays an explicit follow-up step, same
+    as install.sh --instance (design §9).
+    """
+    report = instance_scaffold.scaffold_instance(args.name)
+    named = report.instance_name != instance_layout.DEFAULT_INSTANCE_NAME
+    flag = f"--instance {report.instance_name} " if named else ""
+    print(f"instance '{report.instance_name}' scaffold ready:")
+    print(f"  config  : {report.config_dir}")
+    print(f"  data    : {report.data_dir}")
+    print(f"  kap home: {report.kap_home}")
+    print(
+        f"  config  : {report.system_yaml} "
+        f"({'created from template — fill in real values' if report.system_yaml_created else 'kept existing'})"
+    )
+    print(f"  example : {report.example_path} (reference copy, refreshed)")
+    print(
+        f"  env     : {report.env_path} "
+        f"({'0600 template; fill in provider credentials' if report.env_created else 'kept existing'})"
+    )
+    print()
+    print("Next steps:")
+    print(f"  - Fill in {report.system_yaml} and the env file next to it.")
+    print(f"  - Write the service definition: kitectl {flag}service install")
+    print(f"  - Start the daemon:             kitectl {flag}service start")
+    return 0
+
+
 def _cmd_completion(args: argparse.Namespace) -> int:
     """Print the static shell completion script (kite/shell_completion.py)."""
     sys.stdout.write(shell_completion.render(args.shell))
@@ -1174,6 +1213,18 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     run_now_parser.set_defaults(func=_cmd_schedule_run_now)
 
+    instance_parser = subparsers.add_parser("instance", help="instance scaffolding")
+    instance_sub = instance_parser.add_subparsers(
+        dest="instance_command", required=True
+    )
+    instance_create_parser = instance_sub.add_parser(
+        "create",
+        help="scaffold an instance's directories and config templates "
+        "(idempotent; 'default' scaffolds the root instance)",
+    )
+    instance_create_parser.add_argument("name", help="instance name")
+    instance_create_parser.set_defaults(func=_cmd_instance_create)
+
     completion_parser = subparsers.add_parser(
         "completion",
         help="print a shell completion script "
@@ -1196,8 +1247,9 @@ def _apply_instance_environment(args: argparse.Namespace) -> None:
     single-running rung is skipped when it cannot be meant:
     - `service` commands (explicit-or-default only, no convenience for
       destructive ops),
-    - instance-agnostic commands (`completion` prints a static script; an
-      ambiguity error there would be pure collateral, audit N1),
+    - instance-agnostic commands (`completion` prints a static script;
+      `instance create` scaffolds a name given positionally — an ambiguity
+      error there would be pure collateral, audit N1),
     - any explicit directory axis (--config-dir/--data-dir or pre-set
       KITE_CONFIG_DIR/KITE_DATA_ROOT): the user already said WHICH
       directories; resolving a running instance would mix its name (kap
@@ -1216,7 +1268,7 @@ def _apply_instance_environment(args: argparse.Namespace) -> None:
         or os.environ.get("KITE_DATA_ROOT", "").strip()
     )
     allow_single_running = (
-        args.command not in ("service", "completion") and not explicit_dirs
+        args.command not in ("service", "completion", "instance") and not explicit_dirs
     )
     instance_name = instance_resolution.resolve_instance_name(
         args.instance,

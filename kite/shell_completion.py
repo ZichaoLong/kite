@@ -110,6 +110,11 @@ KITECTL_SPEC: dict = {
                 },
             },
         },
+        "instance": {
+            "subcommands": {
+                "create": {"positionals": ("name",)},
+            },
+        },
         "schedule": {
             "subcommands": {
                 "create": {

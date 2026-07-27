@@ -126,8 +126,9 @@ def load_config() -> dict:
     if not path.exists():
         raise FileNotFoundError(
             f"instance config file does not exist: {path}\n"
-            "Run the repository install script to initialize the config, "
-            "or copy config/system.yaml.example and fill in real values."
+            "Run `kitectl instance create` to scaffold the instance (it "
+            "copies system.yaml.example next to this file), then fill in "
+            "real values."
         )
 
     config = _load_yaml_file(path)

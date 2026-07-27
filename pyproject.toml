@@ -21,6 +21,11 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["kite*"]
 
+[tool.setuptools.package-data]
+# Install-time templates ship inside the package so installed deployments
+# scaffold instances without the source tree (kite/install_templates.py).
+"kite.install_template_data" = ["*.example"]
+
 [tool.setuptools.dynamic]
 version = {attr = "kite.version.__version__"}
 

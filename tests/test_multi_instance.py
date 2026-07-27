@@ -2,7 +2,8 @@
 
 Covers: kitectl --instance targeting (incl. the single-running rung and the
 ambiguity error), per-instance service definitions, the kited daemon lease,
-kited's named-instance kap-home isolation, and install.py --instance.
+kited's named-instance kap-home isolation, install.py --instance, and
+`kitectl instance create` scaffolding.
 """
 
 from __future__ import annotations
@@ -467,6 +468,94 @@ class InstallInstanceTests(MultiInstanceTestCase):
     def test_install_still_rejects_unknown_args(self) -> None:
         with self.assertRaises(SystemExit):
             install.main(["bogus"])
+
+    def test_install_instance_writes_system_yaml_from_bundled_template(self) -> None:
+        # install.sh --instance delegates to the same scaffold as
+        # `kitectl instance create` (FOCUS parity): system.yaml comes from
+        # the installed template with private permissions.
+        with _saved_env(), patch.dict(os.environ, self._roots_env()):
+            install.main(["--instance", "acme"])
+            paths = instance_layout.resolve("acme")
+        system_yaml = paths.config_dir / "system.yaml"
+        example = paths.config_dir / "system.yaml.example"
+        self.assertTrue(system_yaml.is_file())
+        self.assertTrue(example.is_file())
+        self.assertIn('app_id: "cli_xxx"', system_yaml.read_text(encoding="utf-8"))
+        self.assertEqual(stat.S_IMODE(system_yaml.stat().st_mode), 0o600)
+        self.assertEqual(
+            example.read_text(encoding="utf-8"), system_yaml.read_text(encoding="utf-8")
+        )
+
+
+class InstanceCreateTests(MultiInstanceTestCase):
+    """`kitectl instance create` (FOCUS's `focusctl instance create` parity)."""
+
+    def test_create_named_instance_scaffolds_dirs_and_templates(self) -> None:
+        code, out, err = self._run_cli("instance", "create", "acme")
+
+        self.assertEqual(code, 0, err)
+        config_dir = self.config_root / "instances" / "acme"
+        data_dir = self.data_root / "instances" / "acme"
+        self.assertTrue(config_dir.is_dir())
+        self.assertTrue(data_dir.is_dir())
+        self.assertTrue((data_dir / "kap-home").is_dir())
+        system_yaml = config_dir / "system.yaml"
+        env_path = config_dir / ENV_FILE_NAME
+        self.assertIn('app_id: "cli_xxx"', system_yaml.read_text(encoding="utf-8"))
+        self.assertEqual(stat.S_IMODE(system_yaml.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(env_path.stat().st_mode), 0o600)
+        self.assertTrue((config_dir / "system.yaml.example").is_file())
+        self.assertIn("created from template", out)
+        self.assertIn(f"kitectl --instance acme service install", out)
+
+    def test_create_is_idempotent_and_never_clobbers_user_files(self) -> None:
+        code, _, err = self._run_cli("instance", "create", "acme")
+        self.assertEqual(code, 0, err)
+        config_dir = self.config_root / "instances" / "acme"
+        system_yaml = config_dir / "system.yaml"
+        system_yaml.write_text('app_id: "cli_real"\napp_secret: "s"\n', encoding="utf-8")
+        (config_dir / "system.yaml.example").write_text("stale\n", encoding="utf-8")
+        (config_dir / ENV_FILE_NAME).write_text("KIMI_API_KEY=real\n", encoding="utf-8")
+
+        code, out, err = self._run_cli("instance", "create", "acme")
+
+        self.assertEqual(code, 0, err)
+        # User files kept; only the *.example reference copy is refreshed.
+        self.assertIn("cli_real", system_yaml.read_text(encoding="utf-8"))
+        self.assertIn("app_id", (config_dir / "system.yaml.example").read_text(encoding="utf-8"))
+        self.assertEqual(
+            (config_dir / ENV_FILE_NAME).read_text(encoding="utf-8"), "KIMI_API_KEY=real\n"
+        )
+        self.assertIn("kept existing", out)
+
+    def test_create_default_scaffolds_the_root_instance(self) -> None:
+        code, out, err = self._run_cli("instance", "create", "default")
+
+        self.assertEqual(code, 0, err)
+        self.assertTrue((self.config_root / "system.yaml").is_file())
+        self.assertTrue((self.config_root / "system.yaml.example").is_file())
+        self.assertTrue((self.config_root / ENV_FILE_NAME).is_file())
+        # The default instance's next steps carry no --instance flag.
+        self.assertIn("kitectl service install", out)
+        self.assertNotIn("--instance", out)
+
+    def test_create_rejects_a_bad_name(self) -> None:
+        code, _, err = self._run_cli("instance", "create", "..")
+
+        self.assertEqual(code, 2)
+        self.assertIn("instance name", err)
+
+    def test_create_skips_the_single_running_rung(self) -> None:
+        # Two live instances would make rung-2 resolution fail ambiguous;
+        # `instance create` is instance-agnostic and must not consult it.
+        self._publish_live_control_plane(self.data_root)
+        _, acme_data = self._instance_dirs("acme")
+        self._publish_live_control_plane(acme_data)
+
+        code, out, err = self._run_cli("instance", "create", "corp-b")
+
+        self.assertEqual(code, 0, err)
+        self.assertIn("corp-b", out)
 
 
 if __name__ == "__main__":

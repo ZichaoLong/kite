@@ -167,7 +167,9 @@ def _print_next_steps(
         print("  service      : NOT written (see warning above)")
     print()
     print("Next steps:")
-    print("  - Fill in ~/.config/kite/system.yaml (see config/system.yaml.example).")
+    print("  - Fill in ~/.config/kite/system.yaml (scaffolded from the bundled")
+    print("    template; the refreshed reference copy sits next to it as")
+    print("    system.yaml.example).")
     print("  - Provider credentials for the service environment go into the")
     print("    env file (default ~/.config/kite/env, KITE_ENV_FILE to override).")
     print("  - Start the daemon:   kitectl service start")
@@ -179,34 +181,28 @@ def _print_next_steps(
 def _install_instance(name: str) -> None:
     """Create a named instance's directories (docs/decisions/multi-instance.md).
 
-    The managed venv / wrappers / service flow is instance-independent and
-    stays on the default path; `--instance <name>` only lays out the new
-    instance's config/data/kap-home directories plus the 0600 provider-env
-    template next to its future system.yaml (same as the default install).
-    Fail-closed on a bad name.
+    Delegates to kite.instance_scaffold.scaffold_instance — the same body as
+    `kitectl instance create`, so both entry points produce identical
+    layouts (config/data/kap-home directories, system.yaml + example, and
+    the 0600 provider-env template). Fail-closed on a bad name.
     """
-    from kite.env_file import ensure_env_template
-    from kite.instance_layout import resolve, validate_instance_name
-    from kite.platform_paths import ENV_FILE_NAME
+    from kite.instance_scaffold import scaffold_instance
 
     try:
-        instance_name = validate_instance_name(name)
+        report = scaffold_instance(name)
     except ValueError as exc:
         raise SystemExit(f"invalid instance name: {exc}") from exc
-    paths = resolve(instance_name)
-    for directory in (paths.config_dir, paths.data_dir, paths.kap_home):
-        directory.mkdir(parents=True, exist_ok=True)
-    env_path = ensure_env_template(paths.config_dir / ENV_FILE_NAME)
-    print(f"instance '{instance_name}' directories ready:")
-    print(f"  config  : {paths.config_dir}")
-    print(f"  data    : {paths.data_dir}")
-    print(f"  kap home: {paths.kap_home}")
-    print(f"  env     : {env_path} (0600 template; fill in provider credentials)")
+    print(f"instance '{report.instance_name}' directories ready:")
+    print(f"  config  : {report.config_dir}")
+    print(f"  data    : {report.data_dir}")
+    print(f"  kap home: {report.kap_home}")
+    print(f"  config  : {report.system_yaml}")
+    print(f"  env     : {report.env_path} (0600 template; fill in provider credentials)")
     print()
     print("Next steps:")
-    print(f"  - Fill in {paths.config_dir}/system.yaml and the env file next to it.")
-    print(f"  - Write the service definition: kitectl --instance {instance_name} service install")
-    print(f"  - Start the daemon:             kitectl --instance {instance_name} service start")
+    print(f"  - Fill in {report.system_yaml} and the env file next to it.")
+    print(f"  - Write the service definition: kitectl --instance {report.instance_name} service install")
+    print(f"  - Start the daemon:             kitectl --instance {report.instance_name} service start")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -246,9 +242,13 @@ def main(argv: list[str] | None = None) -> None:
     _run_pip_install(venv_python, "setuptools>=68", "wheel")
     _run_pip_install(venv_python, "--no-build-isolation", str(install_dir))
     _verify_installed_package(venv_python, venv_dir)
-    from kite.env_file import ensure_env_template
+    from kite.instance_scaffold import scaffold_instance
 
-    ensure_env_template()  # 0600 provider-env template; a no-op when present
+    # Default-instance scaffold (same body as `kitectl instance create
+    # default`): config/data dirs, system.yaml written from the bundled
+    # template when absent, the example reference copy refreshed, and the
+    # 0600 provider-env template — existing user files are always kept.
+    scaffold_instance("default")
     wrappers = _write_wrappers(venv_dir, default_user_bin_dir())
     service_written = _register_service(venv_dir)
     _print_next_steps(venv_dir, venv_python, wrappers, service_written)
