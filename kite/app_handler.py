@@ -272,6 +272,7 @@ class KapSessionOps:
         thinking: str = "",
         goal_objective: str = "",
         goal_control: str = "",
+        agent_id: str = "",
     ) -> SubmitPromptResult:
         return self.submit_prompt_content(
             session_id,
@@ -281,6 +282,7 @@ class KapSessionOps:
             thinking=thinking,
             goal_objective=goal_objective,
             goal_control=goal_control,
+            agent_id=agent_id,
         )
 
     def submit_prompt_content(
@@ -293,6 +295,7 @@ class KapSessionOps:
         thinking: str = "",
         goal_objective: str = "",
         goal_control: str = "",
+        agent_id: str = "",
     ) -> SubmitPromptResult:
         # permission_mode / plan_mode / model are carried explicitly on every
         # prompt (kite-design.md §7; spike-results §0 for the model part);
@@ -317,6 +320,8 @@ class KapSessionOps:
             payload["goal_objective"] = goal_objective
         if goal_control:
             payload["goal_control"] = goal_control
+        if agent_id:
+            payload["agent_id"] = agent_id
         data = self._rest.call(
             "POST",
             f"/sessions/{_quote(session_id)}/prompts",
@@ -331,6 +336,17 @@ class KapSessionOps:
         if not isinstance(status, str) or not status:
             raise KapTransportError("submit prompt: unexpected data shape")
         return SubmitPromptResult(prompt_id=prompt_id, status=status)
+
+    def start_btw(self, session_id: str) -> str:
+        # kap pass-through (mvp-scope §2 /btw row): POST :btw starts the
+        # session's side-channel agent; the success data is {agent_id}.
+        data = self._rest.call("POST", f"/sessions/{_quote(session_id)}:btw")
+        if not isinstance(data, dict):
+            raise KapTransportError("start btw: unexpected data shape")
+        agent_id = data.get("agent_id")
+        if not isinstance(agent_id, str) or not agent_id:
+            raise KapTransportError("start btw: unexpected data shape")
+        return agent_id
 
     def abort_prompt(self, session_id: str, prompt_id: str) -> None:
         # A re-abort of a finished prompt surfaces as KapError(40402).
@@ -500,6 +516,9 @@ class AppHandler(TransportHandler):
         # control, which is acceptable — it is never part of the binding
         # store's persisted state.
         self._pending_goal_controls: dict[str, str] = {}
+        # Side-channel agent per session for /btw (in-memory; a restart just
+        # starts a fresh one — mvp-scope aligned item 13).
+        self._btw_agents: dict[str, str] = {}
         self._commands: dict[str, Callable[[InboundMessage, str], None]] = {
             "/new": self._cmd_new,
             "/sessions": self._cmd_sessions,
@@ -519,6 +538,7 @@ class AppHandler(TransportHandler):
             "/status": self._cmd_status,
             "/last": self._cmd_last,
             "/abort": self._cmd_abort,
+            "/btw": self._cmd_btw,
             "/help": self._cmd_help,
             "/init": self._cmd_init,
             "/whoami": self._cmd_whoami,
@@ -2366,6 +2386,63 @@ class AppHandler(TransportHandler):
                 continue
             return projection.final_reply_text
         return ""
+
+    def _cmd_btw(self, message: InboundMessage, arg: str) -> None:
+        """/btw 〈text〉: side-channel to the session's `:btw` agent.
+
+        The agent is started on demand and cached per session in memory
+        (a restart simply starts a fresh one — mvp-scope aligned item 13).
+        No queue, no interrupt of the main turn.
+        """
+        text = arg.strip()
+        if not text:
+            self._reply_to(message, build_usage_text("/btw"))
+            return
+        binding = self._load_binding_or_reply(message)
+        if binding is None:
+            return
+        session_id = binding["session_id"]
+        agent_id = self._btw_agents.get(session_id)
+        if not agent_id:
+            try:
+                agent_id = self._ops.start_btw(session_id)
+            except KapTransportError:
+                self._reply_to(message, _KAP_UNREACHABLE_TEXT)
+                return
+            except KapError as exc:
+                self._reply_to(message, f"启动旁路 agent 失败：{exc.msg}")
+                return
+            self._btw_agents[session_id] = agent_id
+        try:
+            result = self._ops.submit_prompt(
+                session_id,
+                text,
+                permission_mode=binding["permission_mode"],
+                plan_mode=binding["plan_mode"],
+                thinking=binding["effort"],
+                goal_objective=binding["goal_objective"],
+                agent_id=agent_id,
+            )
+        except KapTransportError:
+            self._reply_to(message, _KAP_UNREACHABLE_TEXT)
+            return
+        except KapError as exc:
+            self._reply_to(message, f"提交失败：{exc.msg}")
+            return
+        if result.status == "blocked":
+            self._reply_to(message, "提交被 kap-server 拒绝（blocked），该旁路 prompt 未执行。")
+            return
+        self._ownership.record(
+            result.prompt_id, message.chat_id, sender_open_id=message.sender_open_id
+        )
+        logger.info(
+            "btw submitted chat_id=%s session_id=%s prompt_id=%s agent=%s",
+            message.chat_id,
+            session_id,
+            result.prompt_id,
+            agent_id,
+        )
+        self._reply_to(message, "已发给旁路 agent（不打断当前执行）。")
 
     def _cmd_abort(self, message: InboundMessage, arg: str) -> None:
         if arg.strip():

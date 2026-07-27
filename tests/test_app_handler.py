@@ -265,6 +265,15 @@ class FakeKapRestClient:
             if isinstance(body, dict) and body.get("title") is not None:
                 session["title"] = str(body["title"])
             return session
+        match = re.fullmatch(r"/sessions/([^/]+):btw", path)
+        if method == "POST" and match:
+            if self.action_error is not None:
+                raise self.action_error
+            session = self.sessions.get(match.group(1))
+            if session is None:
+                raise KapError(40401, f"session {match.group(1)} does not exist")
+            self.session_actions.append((match.group(1), "btw", body))
+            return {"agent_id": f"btw-{match.group(1)}"}
         match = re.fullmatch(r"/sessions/([^/]+):(compact|archive|restore)", path)
         if method == "POST" and match:
             if self.action_error is not None:
@@ -1570,6 +1579,50 @@ class StatusTests(AppHandlerTestCase):
         self.rest.add_session("s-1", archived=True)
         self.send("/status")
         self.assertIn("已归档", self.transport.last_text())
+
+
+class BtwTests(AppHandlerTestCase):
+    def test_btw_starts_agent_once_and_submits_with_agent_id(self) -> None:
+        self.bind("s-1")
+        self.rest.add_session("s-1")
+
+        self.send("/btw 顺带说一句")
+        self.send("/btw 再来一句")
+
+        btw_starts = [a for a in self.rest.session_actions if a[1] == "btw"]
+        self.assertEqual(len(btw_starts), 1)  # cached per session
+        bodies = [s["body"] for s in self.rest.submissions]
+        self.assertEqual(len(bodies), 2)
+        for body in bodies:
+            self.assertEqual(body["agent_id"], "btw-s-1")
+            self.assertEqual(body["permission_mode"], "auto")
+            self.assertEqual(body["plan_mode"], False)
+        self.assertIn("已发给旁路 agent", self.transport.last_text())
+        # Ownership recorded for approval routing, with the sender's identity.
+        entry = self.handler.prompt_ownership.entry_of("p-2")
+        assert entry is not None
+        self.assertEqual(entry.chat_id, CHAT_ID)
+        self.assertEqual(entry.sender_open_id, ADMIN_OPEN_ID)
+
+    def test_btw_without_text_shows_usage(self) -> None:
+        self.bind("s-1")
+        self.send("/btw")
+        self.assertIn("/btw", self.transport.last_text())
+        self.assertEqual(self.rest.submissions, [])
+
+    def test_btw_unbound_replies_with_binding_guidance(self) -> None:
+        self.send("/btw 你好")
+        self.assertEqual(self.rest.submissions, [])
+
+    def test_btw_kap_error_surfaces(self) -> None:
+        self.bind("s-1")
+        self.rest.add_session("s-1")
+        self.rest.action_error = KapError(50001, "upstream exploded")
+
+        self.send("/btw 顺带说一句")
+
+        self.assertIn("启动旁路 agent 失败", self.transport.last_text())
+        self.assertEqual(self.rest.submissions, [])
 
 
 class AbortTests(AppHandlerTestCase):

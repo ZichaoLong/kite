@@ -98,6 +98,7 @@ class CommandSpecTests(unittest.TestCase):
                 "/status",
                 "/last",
                 "/abort",
+                "/btw",
                 "/init",
                 "/help",
                 "/whoami",

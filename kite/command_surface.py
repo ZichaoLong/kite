@@ -145,6 +145,11 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
         "中止当前执行中的 prompt；仅发起者或管理员可用。",
     ),
     CommandSpec(
+        "/btw",
+        "/btw 〈text〉",
+        "把 text 发给旁路 agent（不排队、不打断当前执行）。",
+    ),
+    CommandSpec(
         "/init",
         "/init 〈token〉",
         "注册管理员；token 由 kited 首次启动时生成（见 `kitectl config init-token`）。",
