@@ -325,6 +325,9 @@ class _ExecutionCardState:
     # stale timer flushes and stale queued renders (§3.8).
     last_stream_patch_at: float = 0.0
     stream_timer: Optional[TimerHandle] = None
+    # One-shot guard for the frozen-card minimal retry (230099 → stripped
+    # re-render through the dispatcher, audit R-3).
+    frozen_minimal_submitted: bool = False
 
 
 @dataclass(slots=True)
@@ -596,17 +599,20 @@ class EventPipeline:
     def _dispatch_btw(self, event: DurableEvent) -> None:
         """Route a side-channel agent's durable event.
 
-        Only turn.started/turn.ended carry meaning here: the side answer is
-        delivered on turn.ended. Everything else is inert by construction —
-        the upstream btw agent has every tool call vetoed
+        Only the turn lifecycle and prompt.aborted carry meaning here: the
+        side answer is delivered on turn.ended, and a remote abort retires
+        the submission's FIFO entry. Everything else is inert by
+        construction — the upstream btw agent has every tool call vetoed
         (agent-core-v2 SessionBtwService), so it can never raise approvals,
         questions, or tool events, and KITE exposes no abort/steer surface
-        for side prompts. work_changed tracks the main agent only.
+        for side prompts itself. work_changed tracks the main agent only.
         """
         if isinstance(event, TurnStarted):
             self._btw_turn_started(event)
         elif isinstance(event, TurnEnded):
             self._btw_turn_ended(event)
+        elif isinstance(event, PromptAborted):
+            self._btw_prompt_aborted(event)
         else:
             logger.debug(
                 "btw event %s ignored session=%s agent=%s",
@@ -670,15 +676,28 @@ class EventPipeline:
         key = (event.session_id, event.agent_id)
         turn = self._btw_turns.get(key)
         if turn is None:
-            # Already ended (an error frame closed it) or never tracked —
-            # the error frame's notice was the terminal surface; no repeat.
-            logger.debug(
-                "btw turn.ended for an untracked turn session=%s agent=%s turn=%s",
+            # Never tracked: a kited restart crossed the in-flight side turn
+            # (the snapshot's in-flight projection is main-only, so nothing
+            # rebuilds it) or a rebuild already swept it. The answer text is
+            # unrecoverable, but the end of the turn is never silent
+            # (audit R3-MED-3) — attached chats get a degraded notice.
+            logger.info(
+                "btw turn.ended for an untracked turn session=%s agent=%s turn=%s; "
+                "delivering the degraded notice",
                 event.session_id,
                 event.agent_id,
                 event.turn_id,
             )
+            for chat_id, _binding in self._attached_chats(event.session_id):
+                self._send_text(
+                    chat_id, "旁路 prompt 已结束（KITE 重启，答复内容无法取回）。"
+                )
             return
+        # Delivery targets BEFORE retiring the turn (audit R3-HIGH-1):
+        # _end_btw_turn forgets the prompt's ownership, which is exactly what
+        # the targeting read needs — computing targets after the retire used
+        # to degrade every answer to a broadcast.
+        targets = self._btw_target_chats(event.session_id, turn.prompt_id)
         self._end_btw_turn(key)
         text = turn.transcript.full_text()
         if event.reason == "completed":
@@ -688,7 +707,7 @@ class EventPipeline:
         else:
             detail = f"：{event.error_message}" if event.error_message else "。"
             body = f"旁路 prompt 执行失败{detail}"
-        for chat_id in self._btw_target_chats(event.session_id, turn.prompt_id):
+        for chat_id in targets:
             self._send_text(chat_id, body)
         logger.info(
             "btw turn ended session=%s agent=%s turn=%s reason=%s prompt=%s",
@@ -721,40 +740,140 @@ class EventPipeline:
     def _btw_target_chats(self, session_id: str, prompt_id: str) -> list[str]:
         """The side answer's audience: the initiating chat when attribution
         is certain (ownership recorded at /btw submit time); every attached
-        chat otherwise — a side answer is never dropped silently."""
+        chat otherwise. With zero attached chats there is no delivery surface
+        at all — the answer is dropped there with a log warning (the only
+        possible behavior; the binding itself is the surface)."""
         attached = [chat_id for chat_id, _binding in self._attached_chats(session_id)]
         if prompt_id:
             entry = self._ownership.entry_of(prompt_id)
             if entry is not None and entry.chat_id in attached:
                 return [entry.chat_id]
+        if not attached:
+            logger.warning(
+                "btw delivery has no attached chat session=%s prompt=%s; answer dropped",
+                session_id,
+                prompt_id or "-",
+            )
         return attached
 
     def _btw_error_frame(self, error: KapErrorFrame) -> None:
-        """A side-channel agent's error frame ends only the side turn's own
-        tracking (audit N3-HIGH-1): the main prompt is untouched, and the
-        initiating chat gets an explicit failure note (never silent)."""
+        """A side-channel agent's error frame applies only to the side turn
+        (audit N3-HIGH-1); the main prompt is untouched.
+
+        Upstream emits turn.ended(failed) for the same failure
+        (loopService.ts), so a tracked turn is left alone here — turn.ended
+        delivers the single failure notice (audit R3-MED-1). Only a prompt
+        that died BEFORE its turn.started was tracked (no tracked turn, but
+        a FIFO-head submission exists) is closed out with an explicit note;
+        anything else is a stray frame and only logged.
+        """
         session_id = error.session_id
         if not session_id:
             logger.error("btw error frame without session: %s %s", error.code, error.message)
             return
         key = (session_id, error.agent_id or "")
-        turn = self._btw_turns.get(key)
-        prompt_id = turn.prompt_id if turn is not None else ""
+        if key in self._btw_turns:
+            logger.debug(
+                "btw error frame on a tracked turn session=%s agent=%s; "
+                "leaving the failure to turn.ended",
+                session_id,
+                error.agent_id,
+            )
+            return
+        queue = self._btw_prompts.get(key)
+        prompt_id = queue[0] if queue else ""
         if not prompt_id:
-            # The turn died before turn.started was tracked: the FIFO head
-            # submission is the one that died (mirrors _end_btw_turn).
-            queue = self._btw_prompts.get(key)
-            prompt_id = queue[0] if queue else ""
+            logger.info(
+                "btw error frame with nothing in flight session=%s agent=%s: %s %s",
+                session_id,
+                error.agent_id,
+                error.code,
+                error.message,
+            )
+            return
+        # Targets before retiring (audit R3-HIGH-1, same ordering as
+        # _btw_turn_ended): the retire forgets the ownership the targeting
+        # read depends on.
+        targets = self._btw_target_chats(session_id, prompt_id)
         self._end_btw_turn(key)
         text = f"上游错误 {error.code}: {error.message}" if error.code else error.message
-        for chat_id in self._btw_target_chats(session_id, prompt_id):
+        for chat_id in targets:
             self._send_text(chat_id, f"⚠️ 旁路 prompt 失败：{text}")
         logger.info(
             "btw error frame closed the side turn session=%s agent=%s prompt=%s: %s",
             session_id,
             error.agent_id,
-            prompt_id or "-",
+            prompt_id,
             text,
+        )
+
+    def _btw_prompt_aborted(self, event: PromptAborted) -> None:
+        """A remotely-aborted side prompt retires its FIFO entry (audit
+        R3-MED-2): left in place it would mis-attribute the NEXT submission
+        to the aborted prompt's owner. When its turn is already tracked,
+        turn.ended (cancelled) closes it out and retires instead."""
+        key = (event.session_id, event.agent_id)
+        turn = self._btw_turns.get(key)
+        if turn is not None and turn.prompt_id == event.prompt_id:
+            logger.debug(
+                "btw prompt.aborted for the tracked turn session=%s agent=%s prompt=%s; "
+                "turn.ended closes it",
+                event.session_id,
+                event.agent_id,
+                event.prompt_id,
+            )
+            return
+        queue = self._btw_prompts.get(key)
+        if queue and event.prompt_id in queue:
+            queue.remove(event.prompt_id)
+            if not queue:
+                self._btw_prompts.pop(key, None)
+            self._ownership.forget(event.prompt_id)
+            logger.info(
+                "btw prompt aborted before its turn session=%s agent=%s prompt=%s; "
+                "FIFO entry retired",
+                event.session_id,
+                event.agent_id,
+                event.prompt_id,
+            )
+            return
+        logger.debug(
+            "btw prompt.aborted for an unknown prompt session=%s agent=%s prompt=%s",
+            event.session_id,
+            event.agent_id,
+            event.prompt_id,
+        )
+
+    def _sweep_btw_tracking(self, session_id: str) -> None:
+        """Fail-closed sweep of the session's btw tracking on a snapshot
+        rebuild (audit R3-MED-2).
+
+        A rebuild means durable events may have been lost — including a btw
+        turn.ended — so in-flight side state is unverifiable and a stale
+        FIFO head would mis-attribute the next submission to the previous
+        owner. Retire everything for the session and say so; never guess.
+        (Startup recovery sweeps too, but a fresh process has empty maps,
+        so it is a no-op there.)
+        """
+        retired: list[str] = []
+        for key in [key for key in self._btw_turns if key[0] == session_id]:
+            turn = self._btw_turns.pop(key)
+            if turn.prompt_id:
+                retired.append(turn.prompt_id)
+        for key in [key for key in self._btw_prompts if key[0] == session_id]:
+            queue = self._btw_prompts.pop(key)
+            retired.extend(queue)
+        if not retired:
+            return
+        for prompt_id in retired:
+            self._ownership.forget(prompt_id)
+        for chat_id, _binding in self._attached_chats(session_id):
+            self._send_text(
+                chat_id,
+                "⚠️ 事件流重建，在飞的旁路 prompt 状态已丢失；若答复未送达，请重新发送 /btw。",
+            )
+        logger.warning(
+            "btw tracking swept on rebuild session=%s retired=%s", session_id, retired
         )
 
     def _session(self, session_id: str) -> _SessionState:
@@ -1263,15 +1382,18 @@ class EventPipeline:
     def _patch_frozen_execution_card(self, state: _ExecutionCardState, execution_state: str) -> None:
         """Freeze a non-running execution card, with a one-shot minimal retry.
 
-        Ported from FOCUS 5787d4c (``runtime_card_publisher.py``): when
-        Feishu rejects the full frozen card content (230099 →
-        ``content_rejected``), retry once with a minimal frozen card (no
-        tool lines, no reply projection) so the card never stays "执行中"
-        with a live cancel button. The retry is one-shot: a rejected
-        minimal card is dropped (the terminal card still carries the
-        result).
+        The patches go through the CardPatchDispatcher (audit R-3): a Feishu
+        230020 rate limit on a freeze is requeued after ``retry_after``
+        instead of leaving the card "执行中" forever, and the blocking IO
+        moves off the RuntimeLoop. The frozen content is computed eagerly —
+        the card is terminal, so there is no later state to coalesce. The
+        minimal retry (230099 ``content_rejected`` → strip tool lines and
+        the reply projection, ported from FOCUS 5787d4c) fires from the
+        dispatcher's result callback and stays one-shot: a rejected minimal
+        card is dropped (the terminal card still carries the result).
         """
         message_id = state.anchor.card_message_id
+        reply_text = self._stream_projection(state)
         card = cards.build_execution_card(
             session_title=state.session_title,
             session_id=state.anchor.session_id,
@@ -1280,29 +1402,39 @@ class EventPipeline:
             elapsed_seconds=self._elapsed(state),
             queue_length=0,
             tool_lines=self._tool_lines_for_card(state),
-            reply_text=self._stream_projection(state),
+            reply_text=reply_text,
         )
-        result = self._patch_card_result(message_id, card)
-        if not result.content_rejected:
-            return
-        if not state.tool_lines and not self._stream_projection(state):
-            # Nothing strippable: the minimal card would be identical.
-            return
-        logger.warning(
-            "frozen execution card content rejected by Feishu, retrying minimal: message_id=%s",
-            message_id,
-        )
-        minimal_card = cards.build_execution_card(
-            session_title=state.session_title,
-            session_id=state.anchor.session_id,
-            prompt_text=state.prompt_text,
-            state=execution_state,
-            elapsed_seconds=self._elapsed(state),
-            queue_length=0,
-            tool_lines=[],
-            reply_text="",
-        )
-        self._patch_card(message_id, minimal_card)
+        content = json.dumps(card)
+        # Capture the strippability now: by the time the result callback
+        # runs, the transcript may already be popped (the read must match
+        # what the full card actually carried).
+        strippable = bool(state.tool_lines) or bool(reply_text)
+
+        def _on_full_result(result: MessagePatchResult) -> None:
+            # Fired on the RuntimeLoop via the dispatcher's render invoker.
+            if not result.content_rejected or not strippable:
+                return
+            if state.frozen_minimal_submitted:
+                return  # one-shot
+            state.frozen_minimal_submitted = True
+            logger.warning(
+                "frozen execution card content rejected by Feishu, retrying minimal: message_id=%s",
+                message_id,
+            )
+            minimal_card = cards.build_execution_card(
+                session_title=state.session_title,
+                session_id=state.anchor.session_id,
+                prompt_text=state.prompt_text,
+                state=execution_state,
+                elapsed_seconds=self._elapsed(state),
+                queue_length=0,
+                tool_lines=[],
+                reply_text="",
+            )
+            minimal_content = json.dumps(minimal_card)
+            self._dispatcher.submit(message_id, lambda: minimal_content)
+
+        self._dispatcher.submit(message_id, lambda: content, on_result=_on_full_result)
 
     def _fetch_terminal_text(self, session_id: str) -> str:
         try:
@@ -2502,6 +2634,11 @@ class EventPipeline:
     def _rebuild_session(self, session_id: str, origin: str) -> None:
         if not session_id or self._shutdown:
             return
+        # Fail-closed btw sweep (audit R3-MED-2): a rebuild means durable
+        # events may have been lost, so the side-channel tracking is
+        # unverifiable — retire it explicitly, on the success AND the
+        # failure path below alike (never guess).
+        self._sweep_btw_tracking(session_id)
         try:
             snapshot = self._rest.get_snapshot(session_id)
             queue = self._session_ops.get_prompts(session_id)

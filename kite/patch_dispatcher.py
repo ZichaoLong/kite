@@ -39,6 +39,11 @@ RenderThunk = Callable[[], Optional[str]]
 RenderInvoker = Callable[[RenderThunk], Optional[str]]
 # The blocking Feishu patch IO (runs on dispatcher worker threads).
 PatchCallable = Callable[[str, str], MessagePatchResult]
+# Per-attempt outcome callback (audit R-3): fired through the render invoker
+# (i.e. back on the RuntimeLoop in kited) after the render's content was
+# actually patched — never for a coalesced-away or stale render. Used by the
+# frozen-card minimal retry, which must see a 230099 content rejection.
+ResultCallback = Callable[[MessagePatchResult], None]
 
 
 class TimerHandle(Protocol):
@@ -90,14 +95,25 @@ class CardPatchDispatcher:
         self._worker_count = max(int(worker_count), 1)
         self._queue: queue.Queue[str | object] = queue.Queue()
         self._lock = threading.Lock()
-        self._pending: dict[str, RenderThunk] = {}
+        self._pending: dict[str, tuple[RenderThunk, Optional[ResultCallback]]] = {}
         self._slots: dict[str, _PatchSlot] = {}
         self._retry_timers: dict[str, TimerHandle] = {}
         self._workers: list[threading.Thread] = []
         self._closed = False
 
-    def submit(self, message_id: str, render: RenderThunk) -> None:
-        """Queue a render for a card message (latest-wins per message)."""
+    def submit(
+        self,
+        message_id: str,
+        render: RenderThunk,
+        on_result: Optional[ResultCallback] = None,
+    ) -> None:
+        """Queue a render for a card message (latest-wins per message).
+
+        ``on_result`` (optional) fires once per completed patch of THIS
+        render — through the render invoker, so it runs wherever rendering
+        runs (kited: the RuntimeLoop); a render superseded before its patch
+        never fires it.
+        """
         normalized = str(message_id or "").strip()
         if not normalized:
             return
@@ -105,7 +121,7 @@ class CardPatchDispatcher:
             if self._closed:
                 return
             # Latest-wins: a newer render replaces any still-queued render.
-            self._pending[normalized] = render
+            self._pending[normalized] = (render, on_result)
             slot = self._slots.setdefault(normalized, _PatchSlot())
             if slot.queued or slot.inflight or slot.retry_scheduled:
                 return
@@ -166,12 +182,13 @@ class CardPatchDispatcher:
             with self._lock:
                 slot = self._slots.setdefault(message_id, _PatchSlot())
                 slot.queued = False
-                render = self._pending.pop(message_id, None)
-                if render is None:
+                pending = self._pending.pop(message_id, None)
+                if pending is None:
                     if not slot.inflight:
                         self._slots.pop(message_id, None)
                     continue
                 slot.inflight = True
+            render, on_result = pending
             result = MessagePatchResult.failure()
             try:
                 content = self._render_invoker(render)
@@ -181,6 +198,8 @@ class CardPatchDispatcher:
                     result = MessagePatchResult.success()
                 else:
                     result = self._patch(message_id, content)
+                    if on_result is not None:
+                        self._fire_result(on_result, result)
             except Exception:
                 # A worker must never die with work still queued behind it.
                 logger.exception("card patch raised message=%s", message_id)
@@ -193,7 +212,7 @@ class CardPatchDispatcher:
                         # Retryable (230020 / timeout): requeue after
                         # retry_after; a render submitted meanwhile wins.
                         if message_id not in self._pending:
-                            self._pending[message_id] = render
+                            self._pending[message_id] = (render, on_result)
                         self._schedule_retry_locked(message_id, result.retry_after_seconds)
                     if (
                         self._pending.get(message_id) is not None
@@ -211,6 +230,22 @@ class CardPatchDispatcher:
                         and not slot.retry_scheduled
                     ):
                         self._slots.pop(message_id, None)
+
+    def _fire_result(self, on_result: ResultCallback, result: MessagePatchResult) -> None:
+        """Deliver a patch outcome through the render invoker (loop hop).
+
+        A callback failure must never kill the worker or corrupt the slot
+        bookkeeping — it is logged and dropped.
+        """
+
+        def _invoke() -> Optional[str]:
+            on_result(result)
+            return None
+
+        try:
+            self._render_invoker(_invoke)
+        except Exception:
+            logger.exception("card patch result callback failed")
 
     def _schedule_retry_locked(self, message_id: str, delay_seconds: float) -> None:
         slot = self._slots.setdefault(message_id, _PatchSlot())

@@ -1498,6 +1498,15 @@ class GoalCommandTests(AppHandlerTestCase):
 
         self.assertIn("goal 操作失败：a goal is already active", self.transport.last_text())
 
+    def test_goal_archived_session_gets_preflight_error(self) -> None:
+        self.bind("s-1")
+        self.rest.add_session("s-1", archived=True)
+
+        self.send("/goal 文本")
+
+        self.assertIn("已被归档", self.transport.last_text())
+        self.assertEqual(self.rest.profile_updates, [])
+
     def test_goal_unbound_replies_with_binding_guidance(self) -> None:
         self.send("/goal 文本")
 
@@ -1564,6 +1573,15 @@ class SessionLifecycleCommandTests(AppHandlerTestCase):
         self.assertEqual(self.rest.profile_updates, [("s-1", {"title": "新标题"})])
         self.assertEqual(self.rest.sessions["s-1"]["title"], "新标题")
         self.assertIn("已将会话重命名为「新标题」", self.transport.last_text())
+
+    def test_rename_archived_session_gets_preflight_error(self) -> None:
+        self.bind("s-1")
+        self.rest.add_session("s-1", archived=True)
+
+        self.send("/rename 新标题")
+
+        self.assertIn("已被归档", self.transport.last_text())
+        self.assertEqual(self.rest.profile_updates, [])
 
     def test_rename_without_arg_shows_usage(self) -> None:
         self.bind("s-1")

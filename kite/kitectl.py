@@ -773,18 +773,27 @@ def _cmd_schedule_list(_args: argparse.Namespace) -> int:
     except (schedule_units.ScheduleError, schedule_units.ScheduleBackendError) as exc:
         _schedule_error(exc)
     # The OS timer store is shared across instances; only the current
-    # instance's namespace is visible here (contract §3.1).
-    entries = [
+    # instance's namespace is visible here (contract §3.1). Legacy units
+    # (created before namespacing) parse as the default instance and are
+    # managed there.
+    scoped = [
         entry
         for entry in entries
         if (parsed := schedule_units.parse_schedule_name(entry.name)) is not None
         and parsed[0] == instance
     ]
-    if not entries:
+    foreign = len(entries) - len(scoped)
+    if not scoped:
         print("(no schedules)")
-        return 0
-    rows = [[entry.name, entry.on_calendar, entry.next_elapse] for entry in entries]
-    _print_lines(render_table(["NAME", "ON_CALENDAR", "NEXT"], rows))
+    else:
+        rows = [[entry.name, entry.on_calendar, entry.next_elapse] for entry in scoped]
+        _print_lines(render_table(["NAME", "ON_CALENDAR", "NEXT"], rows))
+    if foreign:
+        print(
+            f"note: {foreign} timer(s) outside this instance's namespace are "
+            "not shown (inspect/remove them from the default instance or "
+            "their own instance)"
+        )
     return 0
 
 

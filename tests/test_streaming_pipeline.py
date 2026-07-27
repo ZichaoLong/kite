@@ -78,28 +78,35 @@ class FakeDispatcher:
     """Synchronous stand-in for CardPatchDispatcher.
 
     Submits are recorded; ``flush()`` invokes the queued render-thunks (the
-    same full-snapshot renders the real dispatcher would produce) so tests
-    control patch timing exactly.
+    same full-snapshot renders the real dispatcher would produce), applies
+    the patch to the fake transport, and fires ``on_result`` — so tests
+    control patch timing exactly. (The real dispatcher is covered by
+    test_patch_dispatcher.)
     """
 
-    def __init__(self) -> None:
-        self.submitted: list[tuple[str, object]] = []
+    def __init__(self, transport) -> None:
+        self.transport = transport
+        self.submitted: list[tuple[str, object, object]] = []
         self.applied: list[tuple[str, str]] = []
         self.cancelled: list[str] = []
         self.shutdown_called = False
 
-    def submit(self, message_id: str, render) -> None:
-        self.submitted.append((message_id, render))
+    def submit(self, message_id: str, render, on_result=None) -> None:
+        self.submitted.append((message_id, render, on_result))
 
     def cancel(self, message_id: str) -> None:
         self.cancelled.append(message_id)
 
     def flush(self) -> None:
         while self.submitted:
-            message_id, render = self.submitted.pop(0)
+            message_id, render, on_result = self.submitted.pop(0)
             content = render()
-            if content is not None:
-                self.applied.append((message_id, content))
+            if content is None:
+                continue
+            self.applied.append((message_id, content))
+            result = self.transport.patch_message_result(message_id, content)
+            if on_result is not None:
+                on_result(result)
 
     def shutdown(self) -> None:
         self.shutdown_called = True
@@ -160,7 +167,7 @@ class StreamingPipelineTestCase(unittest.TestCase):
         self.addCleanup(self.loop.stop)
         self.timers = ManualTimerFactory()
         self.ownership = PromptOwnership()
-        self.dispatcher = FakeDispatcher()
+        self.dispatcher = FakeDispatcher(self.transport)
         self.pipeline = EventPipeline(
             transport=self.transport,
             rest=self.rest,
@@ -220,7 +227,7 @@ class StreamIntoCardTests(StreamingPipelineTestCase):
 
         self.delta(0, "你好")
         # Idle card: the first delta patches immediately (throttle §3.3).
-        self.assertEqual([mid for mid, _ in self.dispatcher.submitted], [message_id])
+        self.assertEqual([mid for mid, *_ in self.dispatcher.submitted], [message_id])
         self.assertEqual(self.timers.created, [])
         self.delta(2, "，世界")
 
@@ -301,7 +308,7 @@ class StreamIntoCardTests(StreamingPipelineTestCase):
         self.assertEqual(self.dispatcher.submitted, [])
 
         self.delta(0, "本会话")
-        self.assertEqual([mid for mid, _ in self.dispatcher.submitted], [message_id])
+        self.assertEqual([mid for mid, *_ in self.dispatcher.submitted], [message_id])
 
     def test_fan_out_two_attached_chats_each_get_their_own_stream(self) -> None:
         self.bind(CHAT_ID)
@@ -314,7 +321,7 @@ class StreamIntoCardTests(StreamingPipelineTestCase):
 
         self.delta(0, "广播正文")
         self.assertEqual(
-            sorted(mid for mid, _ in self.dispatcher.submitted), sorted([first, second])
+            sorted(mid for mid, *_ in self.dispatcher.submitted), sorted([first, second])
         )
         self.dispatcher.flush()
         for message_id in (first, second):
@@ -432,6 +439,7 @@ class GapRebuildTests(StreamingPipelineTestCase):
 
         self.delta(0, "ab")
         self.delta(10, "zzz")
+        self.dispatcher.flush()
 
         self.assertEqual(self.rest.snapshot_calls, 1)
         patches = self.transport.patches_to(message_id)
@@ -449,6 +457,8 @@ class TerminalReconcileTests(StreamingPipelineTestCase):
         self.rest.assistant_text = "abcdef"
 
         self.feed(kap_event("turn.ended", {"turnId": 1, "reason": "completed"}))
+        # The freeze flows through the dispatcher (audit R-3): flush applies it.
+        self.dispatcher.flush()
 
         patches = self.transport.patches_to(message_id)
         self.assertTrue(patches)
@@ -463,6 +473,7 @@ class TerminalReconcileTests(StreamingPipelineTestCase):
         self.rest.assistant_text = "abc"  # stale shorter read
 
         self.feed(kap_event("turn.ended", {"turnId": 1, "reason": "completed"}))
+        self.dispatcher.flush()
 
         # The frozen execution card keeps the longer streamed content (§3.5
         # never-shrink); the terminal card carries the authoritative text.
@@ -486,9 +497,13 @@ class TerminalReconcileTests(StreamingPipelineTestCase):
 
         self.assertTrue(trailing.cancelled)
         self.assertIn(message_id, self.dispatcher.cancelled)
-        # The queued render is a no-op after the terminal transition (§3.8).
         self.dispatcher.flush()
-        self.assertEqual(self.dispatcher.applied_to(message_id), [])
+        # The cancelled stream render is a no-op after the terminal
+        # transition (§3.8); the only applied content is the freeze, which
+        # now flows through the dispatcher itself (audit R-3).
+        applied = self.dispatcher.applied_to(message_id)
+        self.assertEqual(len(applied), 1)
+        self.assertIn("已结束", rendered(applied[0]))
         # The freeze patch is the last patch the card ever gets.
         freeze = json.dumps(self.transport.patches_to(message_id)[-1], ensure_ascii=False)
         self.assertIn("已结束", freeze)
@@ -500,6 +515,7 @@ class TerminalReconcileTests(StreamingPipelineTestCase):
         self.transport.fail_sends = True
 
         self.feed(kap_event("turn.ended", {"turnId": 1, "reason": "completed"}))
+        self.dispatcher.flush()
 
         self.assertEqual(len(self.transport.text_sends), 1)
         self.assertIn("最终答复文本", self.transport.text_sends[0]["text"])

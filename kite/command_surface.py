@@ -97,7 +97,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec(
         "/goal",
         "/goal [text|pause|resume|cancel|off]",
-        "查看或设置目标；文本目标随每条 prompt 携带直到 off 清除，pause/resume/cancel 仅作用于下一条 prompt。",
+        "查看、设置或控制目标（goal）；目标保存在上游会话侧，pause/resume/cancel/off 为控制操作。",
     ),
     CommandSpec(
         "/compact",

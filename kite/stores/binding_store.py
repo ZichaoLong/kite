@@ -9,10 +9,10 @@ Only local binding facts that must survive a kited restart live here:
 - the binding-level thinking effort (kap ``thinking``; "" = unset → omitted
   on submit)
 
-One-shot goal controls (kap ``goal_control`` pause/resume/cancel) are
-deliberately NOT persisted: they attach to the next prompt only, so they
-live in AppHandler's in-memory per-chat slot and a restart simply drops a
-pending one (docs/contracts/mvp-scope.md §2 /goal row).
+Goal state is deliberately NOT persisted here: the objective and its
+pause/resume/cancel controls live upstream in the session (profile/goal
+routes; audit N2-HIGH-1), so a restart loses nothing (mvp-scope §2 /goal
+row).
 
 Session metadata (title, cwd, history) has ``~/.kimi-code`` as its single
 source of truth and is never mirrored here. Transient runtime state (active
@@ -54,7 +54,6 @@ VALID_EFFORTS = frozenset(
 )
 # "" = unset: no explicit thinking level is carried on prompts.
 DEFAULT_EFFORT = ""
-# "" = no goal objective carried on prompts.
 
 
 class StoredBinding(TypedDict):

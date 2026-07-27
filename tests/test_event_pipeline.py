@@ -327,6 +327,45 @@ class FakeWsClient:
         return True
 
 
+class ImmediateDispatcher:
+    """Synchronous CardPatchDispatcher stand-in (PipelineTestCase).
+
+    The frozen-card patch path routes through the dispatcher API (audit
+    R-3); this fake applies render+patch inline on submit and fires
+    ``on_result`` with the outcome, so existing synchronous patch
+    assertions keep working while tests can assert what flowed through the
+    dispatcher. The real dispatcher's coalescing/retry semantics live in
+    test_patch_dispatcher.
+    """
+
+    def __init__(self, patch) -> None:
+        self._patch = patch
+        # (message_id, content) actually patched, in order.
+        self.applied: list[tuple[str, str]] = []
+        self.cancelled: list[str] = []
+        self.shutdown_called = False
+
+    def submit(self, message_id: str, render, on_result=None) -> None:
+        content = render()
+        if content is None:
+            if on_result is not None:
+                on_result(MessagePatchResult.success())
+            return
+        result = self._patch(message_id, content)
+        self.applied.append((message_id, content))
+        if on_result is not None:
+            on_result(result)
+
+    def cancel(self, message_id: str) -> None:
+        self.cancelled.append(message_id)
+
+    def shutdown(self) -> None:
+        self.shutdown_called = True
+
+    def applied_to(self, message_id: str) -> list[str]:
+        return [content for mid, content in self.applied if mid == message_id]
+
+
 # ---------------------------------------------------------------------------
 # Harness
 # ---------------------------------------------------------------------------
@@ -505,6 +544,7 @@ class PipelineTestCase(unittest.TestCase):
         self.timers = ManualTimerFactory()
         self.ownership = PromptOwnership()
         self.group_config_store = GroupConfigStore(self.data_dir)
+        self.dispatcher = ImmediateDispatcher(self.transport.patch_message_result)
         self.pipeline = EventPipeline(
             transport=self.transport,
             rest=self.rest,
@@ -516,6 +556,7 @@ class PipelineTestCase(unittest.TestCase):
             approval_timeout_seconds=300,
             question_timeout_seconds=300,
             timer_factory=self.timers,
+            patch_dispatcher=self.dispatcher,
         )
         self.handler = OutboundAppHandler(
             event_pipeline=self.pipeline,
@@ -2250,10 +2291,47 @@ class BtwRoutingTests(PipelineTestCase):
         self.assertEqual(len(patches), 1)  # the freeze patch, exactly once
         self.assertNotIn("旁路答复", json.dumps(patches[-1], ensure_ascii=False))
 
-    def test_btw_error_frame_leaves_main_prompt_untouched(self) -> None:
+    def test_btw_failure_notifies_once_in_upstream_order(self) -> None:
+        # Upstream emits turn.ended(failed) THEN the error frame for the
+        # same failure (loopService.ts): exactly one failure notice, and the
+        # main prompt is untouched throughout (audit R3-MED-1 + N3-HIGH-1).
         self.bind(CHAT_ID)
         self.ownership.record("p-1", CHAT_ID, sender_open_id=ADMIN_OPEN_ID)
         message_id = self.start_prompt()  # main busy
+        self._submit_btw("p-b1")
+        self.feed(self._btw_turn_started())
+
+        self.feed(self._btw_turn_ended(reason="failed", error="Model not set"))
+        self.assertEqual(
+            self.transport.texts_to(CHAT_ID), ["旁路 prompt 执行失败：Model not set"]
+        )
+
+        self.pipeline.handle_error_frame(
+            KapErrorFrame(
+                code="model.not_configured",
+                message="Model not set",
+                session_id=SESSION_ID,
+                agent_id=self.BTW_AGENT,
+                retryable=False,
+            )
+        )
+        self.flush()
+        # Still exactly one notice (the error frame does not repeat it).
+        self.assertEqual(len(self.transport.texts_to(CHAT_ID)), 1)
+
+        # Main: no failed terminal, no freeze, ownership intact.
+        self.assertEqual(len(self.transport.cards_to(CHAT_ID)), 1)
+        self.assertEqual(self.transport.patches_to(message_id), [])
+        self.assertEqual(self.ownership.owner_of("p-1"), CHAT_ID)
+        self.assertIsNone(self.ownership.owner_of("p-b1"))
+        # And the main prompt still finishes normally afterwards.
+        self.feed(kap_event("turn.ended", {"turnId": 1, "reason": "completed"}))
+        self.assertEqual(len(self.transport.cards_to(CHAT_ID)), 2)
+
+    def test_btw_error_frame_on_a_tracked_turn_stays_silent(self) -> None:
+        # Defensive order (error frame BEFORE turn.ended): the tracked turn
+        # is left alone — turn.ended delivers the single failure text.
+        self.bind(CHAT_ID)
         self._submit_btw("p-b1")
         self.feed(self._btw_turn_started())
 
@@ -2267,24 +2345,12 @@ class BtwRoutingTests(PipelineTestCase):
             )
         )
         self.flush()
+        self.assertEqual(self.transport.texts_to(CHAT_ID), [])
 
-        # Main: no failed terminal, no freeze, ownership intact.
-        self.assertEqual(len(self.transport.cards_to(CHAT_ID)), 1)
-        self.assertEqual(self.transport.patches_to(message_id), [])
-        self.assertEqual(self.ownership.owner_of("p-1"), CHAT_ID)
-        # btw: the initiating chat gets an explicit failure note, and the
-        # side turn's own tracking (incl. its ownership) is closed.
-        self.assertEqual(
-            self.transport.texts_to(CHAT_ID),
-            ["⚠️ 旁路 prompt 失败：上游错误 model.not_configured: Model not set"],
-        )
-        self.assertIsNone(self.ownership.owner_of("p-b1"))
-        # A later btw turn.ended is a no-op (no double notice).
         self.feed(self._btw_turn_ended(reason="failed", error="Model not set"))
-        self.assertEqual(len(self.transport.texts_to(CHAT_ID)), 1)
-        # And the main prompt still finishes normally afterwards.
-        self.feed(kap_event("turn.ended", {"turnId": 1, "reason": "completed"}))
-        self.assertEqual(len(self.transport.cards_to(CHAT_ID)), 2)
+        self.assertEqual(
+            self.transport.texts_to(CHAT_ID), ["旁路 prompt 执行失败：Model not set"]
+        )
 
     def test_btw_error_frame_before_turn_start_retires_the_submission(self) -> None:
         self.bind(CHAT_ID)
@@ -2316,6 +2382,126 @@ class BtwRoutingTests(PipelineTestCase):
         self._btw_delta("新答案")
         self.feed(self._btw_turn_ended(turn_id=8))
         self.assertEqual(self.transport.texts_to(CHAT_ID)[-1], "旁路回复：新答案")
+
+    def test_btw_answer_targets_only_the_initiating_chat(self) -> None:
+        # Audit R3-HIGH-1: ownership must be read BEFORE it is retired, or
+        # every answer degrades to a broadcast.
+        self.bind(CHAT_ID)
+        self.bind(CHAT_ID_2)
+        self._submit_btw("p-b1", CHAT_ID)
+        self.feed(self._btw_turn_started())
+        self._btw_delta("机密答案")
+
+        self.feed(self._btw_turn_ended())
+
+        self.assertEqual(self.transport.texts_to(CHAT_ID), ["旁路回复：机密答案"])
+        self.assertEqual(self.transport.texts_to(CHAT_ID_2), [])
+
+    def test_btw_error_frame_targets_only_the_initiating_chat(self) -> None:
+        # R3-HIGH-1 on the dead-before-start path (two chats bound).
+        self.bind(CHAT_ID)
+        self.bind(CHAT_ID_2)
+        self._submit_btw("p-b1", CHAT_ID)  # dies before turn.started
+
+        self.pipeline.handle_error_frame(
+            KapErrorFrame(
+                code="model.not_configured",
+                message="Model not set",
+                session_id=SESSION_ID,
+                agent_id=self.BTW_AGENT,
+                retryable=False,
+            )
+        )
+        self.flush()
+
+        self.assertEqual(
+            self.transport.texts_to(CHAT_ID),
+            ["⚠️ 旁路 prompt 失败：上游错误 model.not_configured: Model not set"],
+        )
+        self.assertEqual(self.transport.texts_to(CHAT_ID_2), [])
+
+    def test_untracked_btw_turn_ended_delivers_degraded_notice(self) -> None:
+        # Audit R3-MED-3: a kited restart crossed the in-flight side turn —
+        # the answer is unrecoverable, but the end is never silent.
+        self.bind(CHAT_ID)
+        self.bind(CHAT_ID_2)
+
+        self.feed(self._btw_turn_ended())
+
+        notice = "旁路 prompt 已结束（KITE 重启，答复内容无法取回）。"
+        self.assertEqual(self.transport.texts_to(CHAT_ID), [notice])
+        self.assertEqual(self.transport.texts_to(CHAT_ID_2), [notice])
+
+    def test_btw_delivery_with_zero_attached_chats_is_log_only(self) -> None:
+        # The documented drop case (_btw_target_chats): no binding means no
+        # delivery surface at all — dropped with a log warning, never raised.
+        self._submit_btw("p-b1", CHAT_ID)
+        self.feed(self._btw_turn_started())
+        self._btw_delta("答案")
+        with self.assertLogs("kite.outbound", level="WARNING"):
+            self.feed(self._btw_turn_ended())
+        self.assertEqual(self.transport.texts_to(CHAT_ID), [])
+
+    def test_rebuild_sweeps_btw_tracking_and_realigns_attribution(self) -> None:
+        # Audit R3-MED-2: the btw turn.ended is LOST (resync gap); without a
+        # sweep the stale FIFO head mis-attributes the next prompt to the
+        # previous owner.
+        self.bind(CHAT_ID)
+        self.bind(CHAT_ID_2)
+        self.rest.snapshots[SESSION_ID] = make_snapshot(busy=False)
+        self._submit_btw("p-b1", CHAT_ID)
+        self.feed(self._btw_turn_started())
+
+        self.pipeline.handle_resync_required(
+            ResyncRequest(session_id=SESSION_ID, reason=None, current_seq=None, epoch=None)
+        )
+        self.flush()
+
+        notice = "⚠️ 事件流重建，在飞的旁路 prompt 状态已丢失；若答复未送达，请重新发送 /btw。"
+        self.assertEqual(self.transport.texts_to(CHAT_ID), [notice])
+        self.assertEqual(self.transport.texts_to(CHAT_ID_2), [notice])
+        self.assertIsNone(self.ownership.owner_of("p-b1"))
+
+        # The next /btw turn attributes to ITS OWN owner only.
+        self._submit_btw("p-b2", CHAT_ID_2)
+        self.feed(self._btw_turn_started(turn_id=8))
+        self._btw_delta("答案")
+        self.feed(self._btw_turn_ended(turn_id=8))
+        self.assertEqual(self.transport.texts_to(CHAT_ID), [notice])
+        self.assertEqual(self.transport.texts_to(CHAT_ID_2)[-1], "旁路回复：答案")
+
+    def test_btw_prompt_aborted_retires_the_fifo_entry(self) -> None:
+        # Audit R3-MED-2: a remotely-aborted side prompt must not wedge the
+        # attribution FIFO (turn never started).
+        self.bind(CHAT_ID)
+        self.bind(CHAT_ID_2)
+        self._submit_btw("p-b1", CHAT_ID)
+
+        self.feed(self._btw_event("prompt.aborted", {"promptId": "p-b1"}))
+
+        self.assertIsNone(self.ownership.owner_of("p-b1"))
+        # The next submission attributes to ITS owner, not the aborted one's.
+        self._submit_btw("p-b2", CHAT_ID_2)
+        self.feed(self._btw_turn_started(turn_id=8))
+        self._btw_delta("答案")
+        self.feed(self._btw_turn_ended(turn_id=8))
+        self.assertEqual(self.transport.texts_to(CHAT_ID), [])
+        self.assertEqual(self.transport.texts_to(CHAT_ID_2), ["旁路回复：答案"])
+
+    def test_btw_prompt_aborted_for_tracked_turn_closes_via_turn_ended(self) -> None:
+        self.bind(CHAT_ID)
+        self.bind(CHAT_ID_2)
+        self._submit_btw("p-b1", CHAT_ID)
+        self.feed(self._btw_turn_started())
+
+        self.feed(self._btw_event("prompt.aborted", {"promptId": "p-b1"}))
+        # Nothing delivered or retired yet — turn.ended closes the live turn.
+        self.assertEqual(self.transport.texts_to(CHAT_ID), [])
+        self.assertEqual(self.ownership.owner_of("p-b1"), CHAT_ID)
+
+        self.feed(self._btw_turn_ended(reason="cancelled"))
+        self.assertEqual(self.transport.texts_to(CHAT_ID), ["旁路 prompt 已取消。"])
+        self.assertEqual(self.transport.texts_to(CHAT_ID_2), [])
 
     def test_error_frame_without_agent_id_takes_main_path(self) -> None:
         self.bind(CHAT_ID)
@@ -2396,6 +2582,75 @@ class BtwRoutingTests(PipelineTestCase):
         texts = self.transport.texts_to(CHAT_ID)
         self.assertIn("旁路回复：旁路答案", texts)
         self.assertIsNone(self.ownership.owner_of(prompt_id))
+
+
+# ---------------------------------------------------------------------------
+# Frozen-card patches through the dispatcher (audit R-3)
+# ---------------------------------------------------------------------------
+
+
+class FrozenDispatcherTests(PipelineTestCase):
+    """The freeze / minimal-retry patches route through the CardPatchDispatcher
+    (audit R-3): a Feishu 230020 on them is rescheduled instead of leaving a
+    card "执行中" forever. (The dispatcher's own coalescing/retry semantics
+    are locked in test_patch_dispatcher.)"""
+
+    def test_freeze_patch_flows_through_the_dispatcher(self) -> None:
+        self.bind(CHAT_ID)
+        message_id = self.start_prompt()
+
+        self.feed(kap_event("turn.ended", {"turnId": 1, "reason": "completed"}))
+
+        applied = self.dispatcher.applied_to(message_id)
+        self.assertEqual(len(applied), 1)
+        self.assertIn("已结束", json.dumps(json.loads(applied[0]), ensure_ascii=False))
+        # And the transport received exactly that one freeze patch.
+        self.assertEqual(len(self.transport.patches_to(message_id)), 1)
+
+    def test_frozen_card_minimal_retry_goes_through_the_dispatcher(self) -> None:
+        self.bind(CHAT_ID)
+        message_id = self.start_prompt()
+        # Armed before the tool line exists, so the running-card patch with
+        # the marker is rejected too and only the freeze sequence lands.
+        self.transport.reject_patch_containing = "SENSITIVE_MARKER"
+        self.feed(
+            kap_event(
+                "tool.call.started",
+                {
+                    "turnId": 1,
+                    "toolCallId": "tc-1",
+                    "name": "Bash",
+                    "display": {"kind": "command", "command": "rm -rf SENSITIVE_MARKER"},
+                },
+            )
+        )
+
+        self.feed(kap_event("turn.ended", {"turnId": 1, "reason": "completed"}))
+
+        applied = self.dispatcher.applied_to(message_id)
+        # Two attempts through the dispatcher: the full frozen card (with
+        # the tool line, rejected 230099-style), then the minimal one.
+        self.assertEqual(len(applied), 2)
+        self.assertIn("SENSITIVE_MARKER", applied[0])
+        self.assertNotIn("SENSITIVE_MARKER", applied[1])
+        # The minimal frozen card landed (one-shot: no third attempt).
+        patches = self.transport.patches_to(message_id)
+        self.assertEqual(len(patches), 1)
+        rendered = json.dumps(patches[0], ensure_ascii=False)
+        self.assertIn("已结束", rendered)
+        self.assertNotIn("SENSITIVE_MARKER", rendered)
+
+    def test_frozen_card_without_strippable_content_does_not_retry(self) -> None:
+        self.bind(CHAT_ID)
+        message_id = self.start_prompt()  # no tool lines, no streamed body
+        self.transport.reject_patch_containing = "做点事"  # in full AND minimal
+
+        self.feed(kap_event("turn.ended", {"turnId": 1, "reason": "completed"}))
+
+        # The minimal card would be identical (nothing strippable): exactly
+        # one rejected attempt, no retry (unchanged FOCUS discipline).
+        self.assertEqual(len(self.dispatcher.applied_to(message_id)), 1)
+        self.assertEqual(self.transport.patches_to(message_id), [])
 
 
 # ---------------------------------------------------------------------------

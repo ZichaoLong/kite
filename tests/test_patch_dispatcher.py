@@ -192,6 +192,57 @@ class RetryAfterTests(DispatcherTestCase):
         self.assertTrue(wait_until(lambda: len(self.patch.calls) == 1))
 
 
+class OnResultTests(DispatcherTestCase):
+    """The per-submit outcome callback (audit R-3): fires through the render
+    invoker after the render's content was actually patched."""
+
+    def test_on_result_fires_with_the_patch_outcome(self) -> None:
+        outcomes: list[MessagePatchResult] = []
+        self.dispatcher.submit("om_1", lambda: "v1", on_result=outcomes.append)
+        self.assertTrue(wait_until(lambda: len(outcomes) == 1))
+        self.assertTrue(outcomes[0].ok)
+
+    def test_on_result_reports_content_rejection(self) -> None:
+        outcomes: list[MessagePatchResult] = []
+        self.patch.results = [MessagePatchResult.invalid_content()]
+        self.dispatcher.submit("om_1", lambda: "v1", on_result=outcomes.append)
+        self.assertTrue(wait_until(lambda: len(outcomes) == 1))
+        self.assertTrue(outcomes[0].content_rejected)
+        # Non-retryable: no requeue (the pipeline submits its own minimal).
+        self.assertEqual(self.timers.created, [])
+
+    def test_on_result_not_fired_for_a_stale_render(self) -> None:
+        outcomes: list[MessagePatchResult] = []
+        self.dispatcher.submit("om_1", lambda: None, on_result=outcomes.append)
+        # The follow-up patch proves the worker processed the stale render.
+        self.dispatcher.submit("om_2", lambda: "x")
+        self.assertTrue(wait_until(lambda: len(self.patch.calls) == 1))
+        time.sleep(0.05)
+        self.assertEqual(outcomes, [])
+
+    def test_on_result_fires_per_attempt_including_retries(self) -> None:
+        outcomes: list[MessagePatchResult] = []
+        self.patch.results = [MessagePatchResult.retry_later(2.0)]
+        self.dispatcher.submit("om_1", lambda: "v1", on_result=outcomes.append)
+        self.assertTrue(wait_until(lambda: len(outcomes) == 1))
+        self.assertTrue(outcomes[0].retryable)
+
+        self.timers.created[0].fire()
+        self.assertTrue(wait_until(lambda: len(outcomes) == 2))
+        self.assertTrue(outcomes[1].ok)
+
+    def test_on_result_exception_does_not_kill_the_worker(self) -> None:
+        def boom(_result: MessagePatchResult) -> None:
+            raise RuntimeError("callback exploded")
+
+        self.dispatcher.submit("om_1", lambda: "v1", on_result=boom)
+        self.assertTrue(wait_until(lambda: len(self.patch.calls) == 1))
+        time.sleep(0.05)
+        # The worker survives and keeps serving later submits.
+        self.dispatcher.submit("om_2", lambda: "v2")
+        self.assertTrue(wait_until(lambda: len(self.patch.calls) == 2))
+
+
 class ShutdownCancelTests(DispatcherTestCase):
     def test_shutdown_cancels_retry_timers_and_ignores_new_submits(self) -> None:
         self.patch.results = [MessagePatchResult.retry_later(2.0)]

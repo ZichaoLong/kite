@@ -1492,6 +1492,23 @@ class ScheduleInstanceCliTests(ScheduleCliTests):
         self.assertEqual(code, 0, err)
         self.assertIn("kite-schedule-acme-", out)
 
+    def test_list_notes_foreign_namespace_units(self) -> None:
+        # Legacy (pre-namespace, hash-form) units are default-instance units;
+        # on a named instance they show up only as a foreign note.
+        self._bind()
+        code, _, err = self._create("--at", self._future_at())
+        self.assertEqual(code, 0, err)
+
+        code, out, err = self._run_cli("--instance", "acme", "schedule", "list")
+
+        self.assertEqual(code, 0, err)
+        self.assertIn("(no schedules)", out)
+        self.assertIn("outside this instance's namespace", out)
+
+        code, out, err = self._run_cli("schedule", "list")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("outside this instance's namespace", out)
+
     def test_show_and_remove_are_fail_closed_across_instances(self) -> None:
         self._bind()
         code, out, err = self._create("--at", self._future_at())

@@ -1728,7 +1728,8 @@ class AppHandler(TransportHandler):
                 self._reply_to(message, exclusive.reason_text)
                 return
         # Permission/plan modes are chat-level settings: they carry over.
-        # So do the binding-level effort and goal objective (mvp-scope §2).
+        # So does the binding-level effort (mvp-scope §2); the goal lives
+        # upstream in the session itself, so nothing goal-related is copied.
         binding: StoredBinding = {
             "session_id": info.session_id,
             "attached": DEFAULT_ATTACHED,
@@ -1958,6 +1959,11 @@ class AppHandler(TransportHandler):
         if binding is None:
             return
         session_id = binding["session_id"]
+        # Same §4.7 preflight as the prompt path (audit R3-MED-4): profile/goal
+        # routes resume() too, so an archived session must error here instead
+        # of being quietly materialized.
+        if self._preflight_session_for_submit(message, session_id) is None:
+            return
         text = arg.strip()
         if not text:
             try:
@@ -2042,6 +2048,11 @@ class AppHandler(TransportHandler):
             return
         binding = self._load_binding_or_reply(message)
         if binding is None:
+            return
+        # Same §4.7 preflight as the prompt path (audit R3-MED-4 note):
+        # profile resumes too, so renaming an archived session must error
+        # instead of resurrecting it.
+        if self._preflight_session_for_submit(message, binding["session_id"]) is None:
             return
         try:
             info = self._ops.rename_session(binding["session_id"], title)
