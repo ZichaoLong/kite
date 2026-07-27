@@ -24,6 +24,16 @@ KITE 需要在同一台主机上为不同企业（飞书租户）各跑一个机
 `instances/<name>/`。实例名限于 `[a-z0-9][a-z0-9._-]*`，最长 64 字符
 （与 FOCUS 一致；其他一律拒绝；禁用 `default`、`instances`、`..`)。
 
+创建：`kitectl instance create <name>`（对标 FOCUS 的 `focusctl
+instance create`）搭建实例——目录、由随包模板写入的 `system.yaml`
+(0600，此后绝不覆盖）、每次运行都刷新的 `system.yaml.example` 参考副
+本、0600 env 模板；`default` 搭建根实例。模板以 package data 随包分发
+(`kite/install_template_data/`，经 `kite/install_templates.py` 加载，
+源码检出内优先取仓库 `config/` 副本），安装后的部署无需回找源码树。
+`install.sh` 委托同一 scaffold——默认流程搭建根实例，`--instance
+<名称>` 搭建命名实例。写 service 定义仍是显式后续步骤
+(`kitectl [--instance <名称>] service install`，设计 §9)。
+
 ### 2. 每实例隔离 kap home（撕裂杀手）
 
 每个实例的 kited 以**隔离的 `KIMI_CODE_HOME`**（位于 `<data>/kap-home/`)
@@ -52,11 +62,12 @@ KITE 需要在同一台主机上为不同企业（飞书租户）各跑一个机
 类命令只接受显式或默认实例（破坏性操作不走"单实例便利")。
 
 阶梯第 2 级在"绝不可能是这个意思"的场景一律跳过（审查 N1-LOW)：除
-`service` 外，实例无关命令（`completion`）不查它；任何携带显式目录轴
-的调用——`--config-dir`/`--data-dir`，或预设的
-`KITE_CONFIG_DIR`/`KITE_DATA_ROOT`——同样跳过，因为调用者已经点名
-了目录，不能再混入某个在跑实例的名字。kited 自身也从不走第 2 级：
-daemon 本身就是实例，经 `--instance`/`KITE_INSTANCE` 或默认实例点名。
+`service` 外，实例无关命令（`completion`、`instance create`）不查
+它；任何携带显式目录轴的调用——`--config-dir`/`--data-dir`，或预设
+的 `KITE_CONFIG_DIR`/`KITE_DATA_ROOT`——同样跳过，因为调用者已经点
+名了目录，不能再混入某个在跑实例的名字。kited 自身也从不走第 2
+级：daemon 本身就是实例，经 `--instance`/`KITE_INSTANCE` 或默认实例
+点名。
 
 ### 4. daemon 实例租约（真正需要的跨实例守卫）
 

@@ -133,8 +133,8 @@ kitectl service autostart enable
 
 编辑实例配置（首次安装后已生成模板）：
 
-- `~/.config/kite/system.yaml`：填入 `app_id`、`app_secret`（其余字段均有默认值，
-  全部可配项见仓库 `config/system.yaml.example`）
+- `~/.config/kite/system.yaml`：填入 `app_id`、`app_secret`（安装时已从随包模板
+  生成；其余字段均有默认值，全部可配项见同目录 `system.yaml.example` 参考副本）
 - `~/.config/kite/env`：按需填入 provider 环境变量（如 `KIMI_API_KEY`，0600 模板
   已生成）
 
@@ -211,8 +211,8 @@ kitectl interaction sweep
 一个 KITE 实例：
 
 ```bash
-bash install.sh --instance corp-a        # 只创建该实例的目录与 env 模板
-# 编辑 ~/.config/kite/instances/corp-a/system.yaml 与 env
+kitectl instance create corp-a           # 搭建目录，并从随包模板写入 system.yaml / env
+# 编辑 ~/.config/kite/instances/corp-a/system.yaml 与 env（建议同时配一个不同的 kap.port）
 kitectl --instance corp-a service install
 kitectl --instance corp-a service start
 ```

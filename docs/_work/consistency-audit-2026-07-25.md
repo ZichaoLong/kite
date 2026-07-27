@@ -403,3 +403,72 @@ EN:172-176 / zh-CN:140-144 仍写 "goal_objective persist in the binding store",
 
 - btw×goal 正交(submit 不再带 goal;goal 是 main-agent 作用域);btw FIFO 与 RuntimeLoop 串行一致(命令 loop.call、事件 loop.submit,note_btw_prompt 先于 turn.started);/archive×btw 缓存一致性(归档预检 + 40401 重试兜住);btw 不产生 approval/question(上游工具全 veto);/abort 不见 btw(合同已登记);升级窗口 lease 双文件已记录。
 - 测试:全量 **1327 passed**(各代理分片另跑 366/476/223/212 等,全绿)。
+
+---
+
+# 第四轮复审(2026-07-26,基线 46297f3 → HEAD 7bc29cc)
+
+> 范围:复核第三轮清单的修复(1bd46d7 code、253ea9e docs、7bc29cc README),猎捕新引入问题。
+> 方法:3 个并行复审代理(B-btw/B-misc/B-docs);主审查人直接读码确认 R4-HIGH-1。测试基线:**1346 passed 全绿**。
+
+## 〇、总体结论
+
+第三轮清单**全部落地**:R3-HIGH-1、R3-MED-1/2/3、abort retire、/goal+/rename 预检、R-3(a)(freeze 走 dispatcher)、schedule foreign-namespace、item 12、全部文档项,均 FIXED-CORRECT 且有针对性测试(含上轮盲区的两 chat 场景)。但 btw 修复引入 **1 个新 HIGH**(error 帧误杀在排提交,定向泄漏借道复活)+ 1 个 MED;README 重写引入 3 处虚假/误导声明(MED)。
+
+## 一、新发现
+
+### R4-HIGH-1 `_btw_error_frame` 把 FIFO 头误判为夭折 prompt,误杀仍在排队的下一笔(主审查人已读码确认)
+
+- 位置:`kite/event_pipeline.py:783-801`("无 tracked turn + 有 FIFO 头"分支)
+- 场景(上游确定性事件序,loopService.ts:410-418 先 turn.ended 后 error,同 tick):p-b1(chat1)在飞、p-b2(chat2)排队;p-b1 失败 → turn.ended(failed) 已通知 chat1 并把 FIFO 头推进到 p-b2;紧随的 error 帧(KapErrorFrame 无 prompt_id)撞上该分支 → 向 chat2 发**虚假**"⚠️ 旁路 prompt 失败"、退役 p-b2、forget 其 ownership;p-b2 的 turn.started 到达时 FIFO 已空 → 真实答复**广播给全部 attached chat**(R3-HIGH-1 同类泄漏)。触发条件现实:model.not_configured 等场景连发两笔 /btw 即命中。代理已实证。
+- 修复方向:per-(session,agent) 记录"刚结束 turn"去重标记(短窗口内 error 帧命中即静默,主路径 `_terminal_delivered` 同款思路);更根本:turn.started 归因时把 FIFO 头**弹出**而非 peek,使"无 tracked turn + 有 FIFO 头"真正等价于夭折。
+
+### R4-MED-1 `_end_btw_turn` 的"未归因 turn 退役 FIFO 头"兜底误伤外来 turn 后的在排提交
+
+- 位置:`kite/event_pipeline.py:728-732`
+- 场景:多客户端下他端向同一 session 的 btw agent 提交(FIFO 空)→ KITE 用户随后 /btw 提交 S2 排队;外来 turn 结束时兜底把活着的 S2 退役并 forget ownership → S2 答复广播(实证)。修复:prompt_id 未知的 tracked turn 结束时不碰 FIFO(该兜底只在 error 帧路径生效,且配合去重标记)。
+
+### R4-MED-2/3/4 README 三处虚假/误导声明(7bc29cc 引入)
+
+- README.md:205-206 "zsh/PowerShell 同样支持" — 实际 SUPPORTED_SHELLS 只有 bash/zsh/fish,全仓无 powershell;与 install.py:175、mvp-scope 自相矛盾。
+- README.md:134-136 称 system.yaml "首次安装后已生成模板" — install.py 只生成 env 模板,从不写 system.yaml(缺失时 kited exit 2 并提示自行复制)。
+- README.md:53-55 quick start 第 1 步即 `kitectl service start`,而 system.yaml 第 3 步才创建 — 首次启动必失败;与 install.py next-steps(先配置后 start)冲突。
+- (LOW) README.md:172 "图片、文件、合并转发消息可以直接发" — 文件附件明确不支持(attachment_domain.py:55、images.md §2.1 "images only")。
+
+### LOW 新增
+
+- `_sweep_btw_tracking` 重复计数日志(retired=['p-b1','p-b1'],幂等仅噪音);rebuild sweep 通知后迟到的 untracked turn.ended 再发第二条降级通知(内容真实但吵),且文案硬编码"KITE 重启"(resync 也会触发)。
+- 合同 item 13 未登记新行为:ownership 缺失广播兜底、untracked turn.ended 降级通知、rebuild sweep 通知、远端 abort 退役。
+- freeze minimal 可取代 rebuild 的 FROZEN_UNKNOWN re-freeze(极窄窗口:kap 不可达+230099 同时;卡面问题;建议 freeze 序号守卫)。
+- tool-line 同步 patch 通道(`_patch_execution_card`,event_pipeline.py:2874-2886)仍不过 dispatcher——R-3(a) 同形的 230020 不重排症状只关了一半(先于本批存在)。
+- ImmediateDispatcher 测试替身对 stale render 也触发 on_result(success),与真 dispatcher 语义相反(当前无实际影响)。
+
+## 二、复核结论(第三轮清单逐项)
+
+- **R3-HIGH-1 — FIXED-CORRECT**:两处均先算 targets 再 retire;两 chat 场景新测试锁定(上轮盲区已补);ownership 缺失/owner detached 广播兜底独立验证通过。
+- **R3-MED-1 双重通知 — FIXED-CORRECT(原始场景)**:error 帧对 tracked turn 静默、无 FIFO 头仅日志、仅夭折路径通知;双序测试齐全。但修复引入了 R4-HIGH-1(见上)。
+- **R3-MED-2 rebuild 清理 — FIXED-CORRECT**:`_sweep_btw_tracking` 挂 `_rebuild_session` 顶部,resync/startup 两 origin、快照成败两路径覆盖,归因重排有测试。
+- **R3-MED-3 重启降级通知 — FIXED-CORRECT**:untracked turn.ended 发"答复内容无法取回"通知(两 chat 测试);零 attached chat log-only(docstring 已改写,有测试)。
+- **abort retire — FIXED-CORRECT**:PromptAborted 路由+按 prompt_id 精确移除(含非头中部项);已 tracked 的交给 turn.ended(cancelled)关闭;上游 agent 作用域事件可达性已核实。
+- **R3-MED-4 /goal+/rename 预检 — FIXED-CORRECT**:同款 `_preflight_session_for_submit`;GET 路径也预检是正确的(上游 GET goal 同样 resume 物化)。/goal 无 goal 英文错误维持 LOW 登记。
+- **R-3(a) freeze 走 dispatcher — FIXED-CORRECT**:230020 重排(双重下钳)、恰一次纪律 per-card guard、回调 latest-wins 随 pending 替换、freeze 与流式无倒挂(先 cancel stream 再 freeze submit,generation guard 兜迟到 flush)。新增 49 行正确性逐项验证。
+- **R3-MED-5 schedule — FIXED-CORRECT**:list 末尾 foreign-namespace note + 合同迁移说明(双语);旧裸名归默认实例可见可删,不孤儿;双发风险文档明示。
+- **R3-MED-6 item 12 — FIXED-CORRECT**(双语改为仅 effort persists,指向 item 14)。
+- **文档项 — 全部 FIXED-CORRECT**:kite-design §7 effort 登记(双语,与代码三点吻合);group-chat §3.7 认领合并(双语,逐点对照代码吻合);multi-instance §3 rung-2 跳过(双语);/compact 措辞(双语,上游 fire-and-forget 已核实);/goal help。
+- **README 其余声明 — 抽查属实**:入口表、quick start 命令与 flag 逐一存在、scopes/events 与实际订阅一致(预留权限标注诚实)、Web UI/端口/multi-instance/CI 声明一致;check-docs.sh 通过;双语对偶抽查通过。
+
+## 三、遗留状态盘点(均未升级,维持登记)
+
+- NOT-FIXED(LOW):claim 路径 mode 复查(2s 窗口)、/archive queued 登记、btw work_changed 合同句、btw 48k 截断提示、/goal replace(只能先 off 再设)、升级窗口 lease 双文件、显式 --data-dir schedule create、/goal 英文错误 UX、command_surface.py:24-26 旧模型注释、test 死参数/错误注释(test_app_handler.py:526,537;test_binding_store.py:90)。
+
+## 四、下一轮修复优先级
+
+1. **R4-HIGH-1 + R4-MED-1**(同一片 `_btw_*` 代码,一起修):去重标记 + FIFO 头弹出任因 + 未归因 turn 不碰 FIFO;补两 chat + 排队场景的回归测试。
+2. **README 三处 MED + 一处 LOW**(单文件修复)。
+3. LOW:合同 item 13 补登记新行为、tool-line 改走 dispatcher、freeze 序号守卫、command_surface 注释与测试残留清理、sweep 日志/双通知。
+4. 既有 LOW 登记项维持(见三)。
+
+## 五、交叉与测试
+
+- btw×/goal 正交(goal 限 main agent)、btw×/archive 预检完好、btw×多实例无共享面,均无回归。
+- 全量 **1346 passed**(代理分片 347/474/167 另跑全绿);独立验证脚本(V1a-V5)覆盖两 chat 定向、广播兜底、零 attached、sweep、abort retire。

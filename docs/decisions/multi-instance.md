@@ -27,6 +27,19 @@ the default instance with zero migration. Named instances live under
 characters (FOCUS parity; fail-closed on anything else; no `default`,
 `instances`, `..`).
 
+Creation: `kitectl instance create <name>` (FOCUS's `focusctl instance
+create` parity) scaffolds the instance — directories, `system.yaml` written
+from the bundled template (0600, never overwritten afterwards), the
+`system.yaml.example` reference copy refreshed on every run, and the 0600
+env template; `default` scaffolds the root instance. The template ships as
+package data (`kite/install_template_data/`, loaded via
+`kite/install_templates.py` with the repo `config/` copy preferred in a
+checkout), so an installed deployment never reaches back into the source
+tree. `install.sh` delegates to the same scaffold — the default flow for
+the root instance, `--instance <name>` for a named one. Writing the service
+definition stays an explicit follow-up step (`kitectl [--instance <name>]
+service install`, design §9).
+
 ### 2. Per-instance isolated kap home (the tearing killer)
 
 Each instance's kited spawns its kap child with an **isolated
@@ -59,13 +72,13 @@ candidates. `kitectl service` commands always take an explicit-or-default
 instance (no "single running" convenience for destructive ops).
 
 Rung 2 is skipped wherever it cannot be meant (audit N1-LOW): besides
-`service`, instance-agnostic commands (`completion`) never consult it, and
-any invocation carrying an explicit directory axis — `--config-dir` /
-`--data-dir`, or pre-set `KITE_CONFIG_DIR` / `KITE_DATA_ROOT` — also skips
-it, because the caller already named the directories and a running
-instance's name must not be mixed in. kited itself never uses rung 2: the
-daemon IS an instance, spelled via `--instance` / `KITE_INSTANCE` or the
-default.
+`service`, instance-agnostic commands (`completion`, `instance create`)
+never consult it, and any invocation carrying an explicit directory axis —
+`--config-dir` / `--data-dir`, or pre-set `KITE_CONFIG_DIR` /
+`KITE_DATA_ROOT` — also skips it, because the caller already named the
+directories and a running instance's name must not be mixed in. kited
+itself never uses rung 2: the daemon IS an instance, spelled via
+`--instance` / `KITE_INSTANCE` or the default.
 
 ### 4. Daemon instance lease (the real cross-instance guard)
 
