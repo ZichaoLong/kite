@@ -46,19 +46,9 @@ cd /path/to/kite
 bash install.sh
 ```
 
-安装器会创建独立 venv、在 `~/.local/bin` 写入 `kited` / `kitectl` 包装命令，并
-写入 OS service 定义（Linux 为 systemd --user `kite.service`；**只写入，不启动**）。
-然后执行：
-
-```bash
-kitectl service start
-```
-
-如需登录后自动启动：
-
-```bash
-kitectl service autostart enable
-```
+安装器会创建独立 venv、在 `~/.local/bin` 写入 `kited` / `kitectl` 包装命令、
+写入 OS service 定义（Linux 为 systemd --user `kite.service`；**只写入，不启动**），
+并从随包模板生成 `~/.config/kite/system.yaml` 与 `~/.config/kite/env`。
 
 不要使用 `pip install .` 或 `pip install -e .`——唯一支持的安装路径是仓库提供
 的 install 脚本。
@@ -129,19 +119,25 @@ kitectl service autostart enable
 
 配置完成后记得发布应用版本，权限与事件才会生效。
 
-### 3. 本地启动、配置、初始化
+### 3. 本地配置、启动、初始化
 
-编辑实例配置（首次安装后已生成模板）：
+编辑实例配置（安装时已从随包模板生成）：
 
-- `~/.config/kite/system.yaml`：填入 `app_id`、`app_secret`（安装时已从随包模板
-  生成；其余字段均有默认值，全部可配项见同目录 `system.yaml.example` 参考副本）
+- `~/.config/kite/system.yaml`：填入 `app_id`、`app_secret`（其余字段均有默认值，
+  全部可配项见同目录 `system.yaml.example` 参考副本）
 - `~/.config/kite/env`：按需填入 provider 环境变量（如 `KIMI_API_KEY`，0600 模板
   已生成）
 
-改完配置后重启服务：
+配置就绪后启动服务（之后每次改配置用 `kitectl service restart` 生效）：
 
 ```bash
-kitectl service restart
+kitectl service start
+```
+
+如需登录后自动启动：
+
+```bash
+kitectl service autostart enable
 ```
 
 查看初始化口令：
@@ -169,8 +165,9 @@ kitectl config init-token
   手动发送 `/abort`
 - 用 `/new`、`/sessions`、`/switch` 管理会话；用 `/mode`、`/plan`、`/effort`
   调整当前绑定的权限模式、计划模式与思考强度；`/goal` 管理会话目标
-- 图片、文件、合并转发消息可以直接发；转发后紧接着发一条文字说明，两者会合并
-  为一条 prompt（说明在前还是内容在前由认领语义保证，指令不会跑在内容之前）
+- 图片、合并转发消息可以直接发（其他文件类型暂不支持）；转发后紧接着发一条
+  文字说明，两者会合并为一条 prompt（说明在前还是内容在前由认领语义保证，
+  指令不会跑在内容之前）
 - 群聊里管理员先用 `/group activate` 激活，再用 `/group-mode` 选择
   `mention_only` / `assistant` / `all` 三种模式
 - 如果想让同一个机器人同时服务多个项目，建议为每个项目单独建一个群聊；每个
@@ -202,7 +199,7 @@ kitectl interaction sweep
   分别走 launchd / Task Scheduler），适合做例行任务。
 - `kitectl interaction sweep` 清理上游残留的过期审批/问题，适用于重启后或长时间
   运行时的卫生检查。
-- shell 补全：`eval "$(kitectl completion bash)"`（zsh/PowerShell 同样支持，
+- shell 补全：`eval "$(kitectl completion bash)"`（zsh/fish 同样支持，
   见 `kitectl completion --help`）。
 
 ### 5. 多机器人多实例

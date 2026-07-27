@@ -22,8 +22,8 @@ _PLAN_ON = "on"
 _PLAN_OFF = "off"
 
 # /goal keywords that are NOT objective text (mvp-scope §2 /goal row):
-# pause/resume/cancel are the kap one-shot ``goal_control`` values; ``off``
-# clears the persisted objective (never sent upstream).
+# pause/resume/cancel map onto kap ``goal_control`` via the profile route;
+# ``off`` cancels the current goal (upstream goal_control=cancel).
 GOAL_CONTROL_PAUSE = "pause"
 GOAL_CONTROL_RESUME = "resume"
 GOAL_CONTROL_CANCEL = "cancel"
