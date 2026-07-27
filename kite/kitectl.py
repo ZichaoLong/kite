@@ -6,7 +6,10 @@ Multi-instance (docs/decisions/multi-instance.md §3): the global
 instance living under `<root>/instances/<name>/`; without either, the single
 running instance wins when exactly one is live (per-instance
 control_plane.json discovery, stale pids filtered; ambiguity exits 2 with
-the candidate list), otherwise the default instance. `service` commands,
+the candidate list), otherwise the default instance. An explicit named
+instance must exist on disk — uncreated names exit 2 pointing at
+`kitectl instance create` (FOCUS parity; a typo never silently scaffolds
+an empty instance). `service` commands,
 `completion` and `instance` (instance-agnostic), and any invocation with
 explicit --config-dir/--data-dir (or KITE_CONFIG_DIR/KITE_DATA_ROOT set)
 skip the single-running rung. Explicit --config-dir/--data-dir always win
@@ -1295,6 +1298,12 @@ def _apply_instance_environment(args: argparse.Namespace) -> None:
         and not os.environ.get("KITE_DATA_ROOT", "").strip()
     ):
         os.environ["KITE_DATA_ROOT"] = str(paths.data_dir)
+    if instance_name is not None:
+        # Fail-closed on uncreated named instances (FOCUS parity, decision
+        # §3): a typo must never silently scaffold an empty instance. Checked
+        # against the EFFECTIVE dirs — explicit axes are already published
+        # above, and single-running discoveries exist by construction.
+        instance_layout.require_existing_instance(instance_name)
 
 
 def main(argv: list[str] | None = None) -> int:

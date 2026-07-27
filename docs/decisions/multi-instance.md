@@ -71,6 +71,13 @@ Ambiguity (multiple running, none explicit) fails closed with the list of
 candidates. `kitectl service` commands always take an explicit-or-default
 instance (no "single running" convenience for destructive ops).
 
+An explicit named instance must EXIST (either axis of its effective
+directories on disk; FOCUS's `require_existing_instance` parity): kitectl
+and kited both fail closed on an uncreated name, pointing at `kitectl
+instance create` — a typo must never silently scaffold an empty instance.
+The check runs after explicit directory axes are published, so
+`--instance <name> --data-dir <custom>` judges the effective dirs.
+
 Rung 2 is skipped wherever it cannot be meant (audit N1-LOW): besides
 `service`, instance-agnostic commands (`completion`, `instance create`)
 never consult it, and any invocation carrying an explicit directory axis —

@@ -652,6 +652,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"kited: error: {exc}", file=sys.stderr)
         return 2
     _apply_instance_environment(instance_name, args)
+    if instance_name is not None:
+        # Fail-closed on uncreated named instances (FOCUS parity, decision
+        # §3) — BEFORE the lease mkdirs the data dir, so a typo can never
+        # silently scaffold an empty instance. Effective dirs are already
+        # published, so resolve() sees them.
+        try:
+            instance_layout.require_existing_instance(instance_name)
+        except ValueError as exc:
+            print(f"kited: error: {exc}", file=sys.stderr)
+            return 2
 
     log_path = configure_logging()
     logger.info(

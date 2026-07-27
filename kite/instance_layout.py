@@ -104,6 +104,30 @@ def resolve(name: str | None = None) -> InstancePaths:
     )
 
 
+def instance_exists(instance_name: str) -> bool:
+    """FOCUS's existence rule: either axis on disk counts (config or data)."""
+    paths = resolve(instance_name)
+    return paths.config_dir.exists() or paths.data_dir.exists()
+
+
+def require_existing_instance(instance_name: str) -> str:
+    """Fail-closed on uncreated named instances (FOCUS parity, decision §3).
+
+    A typo'd ``--instance`` must never silently scaffold an empty instance;
+    the caller is pointed at ``kitectl instance create``. Existence is
+    checked against the EFFECTIVE directories — call this only after any
+    explicit directory axes have been published into the environment. The
+    default instance never comes through here (it resolves as None).
+    """
+    normalized = validate_instance_name(instance_name)
+    if instance_exists(normalized):
+        return normalized
+    raise ValueError(
+        f"named instance {normalized!r} does not exist; "
+        f"create it first: kitectl instance create {normalized}"
+    )
+
+
 def resolve_effective_kap_home(
     configured: str | None, instance_name: str | None
 ) -> pathlib.Path:

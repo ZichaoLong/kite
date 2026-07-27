@@ -269,6 +269,7 @@ class ServiceDefinitionInstanceTests(MultiInstanceTestCase):
         self.assertNotIn("--instance", definition.daemon_command)
 
     def test_named_instance_definition_dirs_and_unit(self) -> None:
+        self._instance_dirs("acme")  # created instance: fail-close passes (§3)
         definition = self._definition("acme")
         self.assertEqual(definition.identifier, "kite-acme")
         self.assertEqual(definition.config_dir, self.config_root / "instances" / "acme")
@@ -556,6 +557,68 @@ class InstanceCreateTests(MultiInstanceTestCase):
 
         self.assertEqual(code, 0, err)
         self.assertIn("corp-b", out)
+
+
+class FailClosedUncreatedInstanceTests(MultiInstanceTestCase):
+    """Uncreated named instances are rejected, never implicitly scaffolded
+    (FOCUS parity, docs/decisions/multi-instance.md §3)."""
+
+    def _ghost_dirs(self) -> tuple[pathlib.Path, pathlib.Path]:
+        return (
+            self.config_root / "instances" / "ghost",
+            self.data_root / "instances" / "ghost",
+        )
+
+    def test_kitectl_flag_rejects_ghost_without_scaffolding(self) -> None:
+        code, _, err = self._run_cli("--instance", "ghost", "binding", "list")
+
+        self.assertEqual(code, 2)
+        self.assertIn("kitectl instance create ghost", err)
+        config_dir, data_dir = self._ghost_dirs()
+        self.assertFalse(config_dir.exists())
+        self.assertFalse(data_dir.exists())
+
+    def test_kitectl_env_rejects_ghost(self) -> None:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with _saved_env(), patch.dict(
+            os.environ, {**self._roots_env(), "KITE_INSTANCE": "ghost"}
+        ):
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = kitectl.main(["binding", "list"])
+        self.assertEqual(code, 2)
+        self.assertIn("kitectl instance create ghost", stderr.getvalue())
+
+    def test_service_install_rejects_ghost(self) -> None:
+        # Previously this call implicitly mkdir'd the instance dirs
+        # (service_manager.install) — the fail-close now fires first.
+        code, _, err = self._run_cli("--instance", "ghost", "service", "install")
+
+        self.assertEqual(code, 2)
+        self.assertIn("kitectl instance create ghost", err)
+        config_dir, data_dir = self._ghost_dirs()
+        self.assertFalse(config_dir.exists())
+        self.assertFalse(data_dir.exists())
+
+    def test_kited_rejects_ghost_before_lease(self) -> None:
+        stderr = io.StringIO()
+        with _saved_env(), patch.dict(os.environ, self._roots_env()):
+            with contextlib.redirect_stderr(stderr):
+                rc = kited.main(["--instance", "ghost"])
+        self.assertEqual(rc, 2)
+        self.assertIn("kitectl instance create ghost", stderr.getvalue())
+        # Rejected before the lease could mkdir the data dir.
+        _, data_dir = self._ghost_dirs()
+        self.assertFalse(data_dir.exists())
+
+    def test_created_instance_passes(self) -> None:
+        code, _, err = self._run_cli("instance", "create", "ghost")
+        self.assertEqual(code, 0, err)
+
+        code, out, err = self._run_cli("--instance", "ghost", "binding", "list")
+
+        self.assertEqual(code, 0, err)
+        self.assertIn("(no bindings)", out)
 
 
 if __name__ == "__main__":

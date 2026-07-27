@@ -159,5 +159,50 @@ class DaemonInstanceTests(ResolutionTestCase):
             instance_resolution.daemon_instance_name("default")
 
 
+class RequireExistingInstanceTests(ResolutionTestCase):
+    """instance_layout.require_existing_instance (FOCUS parity, decision §3)."""
+
+    def test_uncreated_name_fails_closed_pointing_at_create(self) -> None:
+        from kite import instance_layout
+
+        with self.assertRaises(ValueError) as ctx:
+            instance_layout.require_existing_instance("ghost")
+        message = str(ctx.exception)
+        self.assertIn("ghost", message)
+        self.assertIn("kitectl instance create ghost", message)
+        # Nothing was scaffolded as a side effect.
+        self.assertFalse((self.config_root / "instances" / "ghost").exists())
+        self.assertFalse((self.data_root / "instances" / "ghost").exists())
+
+    def test_either_axis_on_disk_counts_as_existing(self) -> None:
+        from kite import instance_layout
+
+        (self.config_root / "instances" / "acme").mkdir(parents=True)
+        self.assertEqual(instance_layout.require_existing_instance("acme"), "acme")
+
+        (self.data_root / "instances" / "bravo").mkdir(parents=True)
+        self.assertEqual(instance_layout.require_existing_instance("bravo"), "bravo")
+
+    def test_explicit_directory_axes_are_judged(self) -> None:
+        # With KITE_CONFIG_DIR/KITE_DATA_ROOT published, existence is decided
+        # by those effective dirs, not the instance layout (kitectl/kited
+        # call this only after publishing the axes).
+        from kite import instance_layout
+
+        custom = self.root / "custom-config"
+        custom.mkdir()
+        with patch.dict(
+            os.environ,
+            {"KITE_CONFIG_DIR": str(custom), "KITE_DATA_ROOT": str(self.root / "nope")},
+        ):
+            self.assertEqual(instance_layout.require_existing_instance("ghost"), "ghost")
+
+    def test_bad_name_still_fails_format_first(self) -> None:
+        from kite import instance_layout
+
+        with self.assertRaises(ValueError):
+            instance_layout.require_existing_instance("..")
+
+
 if __name__ == "__main__":
     unittest.main()

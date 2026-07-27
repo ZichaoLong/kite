@@ -18,6 +18,13 @@ with an explicit directory axis (``--config-dir``/``--data-dir`` or pre-set
 directories, so a running instance's name must not be mixed in). kited
 never uses rung 2 either — the daemon IS an instance, spelled via
 ``--instance`` / ``KITE_INSTANCE`` or the default.
+
+This module validates the NAME only. Existence is enforced separately at
+the call sites (kitectl's ``_apply_instance_environment`` and kited's
+``main``) via ``instance_layout.require_existing_instance``: an explicit
+named instance must exist on disk (either axis of its EFFECTIVE dirs), or
+the caller fails closed pointing at ``kitectl instance create`` — a typo
+must never silently scaffold an empty instance (FOCUS parity, decision §3).
 """
 
 from __future__ import annotations

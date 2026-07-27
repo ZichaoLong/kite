@@ -61,6 +61,12 @@ instance create`）搭建实例——目录、由随包模板写入的 `system.y
 歧义（多实例在跑且未显式指定）fail-closed 并列出候选。`kitectl service`
 类命令只接受显式或默认实例（破坏性操作不走"单实例便利")。
 
+显式指定的命名实例必须**已存在**（生效目录任一轴在盘上即算存在；对标
+FOCUS 的 `require_existing_instance`):kitectl 与 kited 对未创建的实
+例名一律 fail-closed，报错指向 `kitectl instance create`——打错名字
+绝不静默搭建出一个空实例。检查发生在显式目录轴发布之后，因此
+`--instance <名称> --data-dir <自定义>` 按生效目录判定。
+
 阶梯第 2 级在"绝不可能是这个意思"的场景一律跳过（审查 N1-LOW)：除
 `service` 外，实例无关命令（`completion`、`instance create`）不查
 它；任何携带显式目录轴的调用——`--config-dir`/`--data-dir`，或预设
