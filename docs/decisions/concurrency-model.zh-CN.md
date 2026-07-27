@@ -48,8 +48,8 @@ KITE 顺势采用：
 
 | 风险 | 处置 |
 | --- | --- |
-| 跨进程 session 撕裂（kap live 时 TUI/`kimi web` 并发写同一 session) | 单实例部署前提 + "裸 kimi 不在合同内"条款（见 `process-shape-and-language.md`);MVP 不做 loaded gate |
-| 多实例（多飞书应用）需求出现 | Phase 3 候选；届时先补跨实例合同（loaded gate 等价物），再开放多实例 |
+| 跨进程 session 撕裂（kap live 时 TUI/`kimi web` 并发写同一 session) | 单写者前提，现按实例各自成立：各实例 kap home 相互隔离（见 `docs/decisions/multi-instance.md`),"裸 kimi 不在合同内"条款仍然适用（见 `process-shape-and-language.md`)；不做 loaded gate |
+| 多实例（多飞书应用） | 已定案（2026-07-26,`docs/decisions/multi-instance.md`)：命名实例完全隔离（配置/数据/kap home/守护租约），本文语义按实例各自成立；跨实例协调仍不在范围内 |
 | 队列被长 prompt 堵住，用户体验差 | 卡片显式展示队列深度；`/abort`（发起者/管理员）提供出口；不自动超时取消 |
 | prompt 归属跨重启丢失 | 经 `GET .../prompts` + snapshot 尽力重建；建不回的审批卡显式过期（fail-closed，见 mvp-scope §4.6) |
 | loopback 下 `POST /api/v1/shutdown` 对任何 token 持有者开放 | KITE 仅允许 service stop 路径调用；managed 形态负责意外关停后的拉起 |
@@ -59,5 +59,5 @@ KITE 顺势采用：
 出现以下任一信号时，重开本文档：
 
 1. 真实用户反馈"别人乱动我的 session"类问题；
-2. 多实例需求进入路线图；
+2. 跨实例协调（实例间共享 session/状态）需求进入路线图；
 3. 上游引入 ownership/锁原语（届时优先用上游的，不自建）。

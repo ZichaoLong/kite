@@ -47,6 +47,14 @@ class ValidateInstanceNameTests(unittest.TestCase):
             with self.assertRaises(ValueError, msg=f"name {name!r} must be rejected"):
                 instance_layout.validate_instance_name(name)
 
+    def test_name_length_is_capped_at_64(self) -> None:
+        # FOCUS parity (audit N1): 64 characters pass, 65 fail closed.
+        self.assertEqual(
+            instance_layout.validate_instance_name("a" * 64), "a" * 64
+        )
+        with self.assertRaisesRegex(ValueError, "at most 64"):
+            instance_layout.validate_instance_name("a" * 65)
+
 
 class ResolveLayoutTests(unittest.TestCase):
     def setUp(self) -> None:

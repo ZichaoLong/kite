@@ -207,6 +207,38 @@ class RendererTests(unittest.TestCase):
         self.assertIn("complete -c kited", script)
         self.assertIn("__kitectl_entered_path", script)
 
+    def test_fish_value_flag_guard_keeps_flag_argument_completion(self) -> None:
+        # Audit N4-MED-1: at `--display <TAB>` (empty value) the fish guard
+        # used to suppress the flag's own choice completion too, silently
+        # degrading to file completion. The after-value-flag guard attaches
+        # to word entries only; flag entries keep the bare path guard.
+        script = shell_completion.render("fish")
+        display_lines = [
+            line
+            for line in script.splitlines()
+            if line.startswith("complete -c kitectl") and "-l display" in line
+        ]
+        # Both --display sites (prompt send, schedule create) offer the
+        # choices at the empty-value moment.
+        self.assertEqual(len(display_lines), 2)
+        for line in display_lines:
+            self.assertNotIn("after_value_flag", line)
+            self.assertIn('-a "silent announce"', line)
+            self.assertIn('__kitectl_at ', line)
+        # Word entries still carry the guard: a subcommand name is never
+        # offered as a flag's value.
+        word_lines = [
+            line
+            for line in script.splitlines()
+            if line.startswith("complete -c kitectl")
+            and ' -a "' in line
+            and "-l " not in line
+            and "-s " not in line
+        ]
+        self.assertTrue(word_lines)
+        for line in word_lines:
+            self.assertIn("after_value_flag", line)
+
     @unittest.skipUnless(shutil.which("bash"), "bash not installed")
     def test_bash_script_has_valid_syntax(self) -> None:
         result = subprocess.run(

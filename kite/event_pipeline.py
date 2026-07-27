@@ -2523,9 +2523,15 @@ class EventPipeline:
                 self._on_snapshot_rebuilt(session_id, snapshot)
             except Exception:
                 logger.exception("on_snapshot_rebuilt hook failed session=%s", session_id)
+        # mvp-scope §6: one single-line log per resync/snapshot rebuild
+        # carrying session_id + prompt_id; chat_id only where a chat is
+        # attributable (the snapshot's current prompt may have a recorded
+        # owner — best-effort ownership survives restarts).
+        owner_entry = self._ownership.entry_of(snapshot.current_prompt_id)
         logger.info(
-            "session rebuilt (%s) session=%s as_of_seq=%d busy=%s prompt_id=%s",
+            "session rebuilt (%s) chat_id=%s session=%s as_of_seq=%d busy=%s prompt_id=%s",
             origin,
+            owner_entry.chat_id if owner_entry is not None else "-",
             session_id,
             snapshot.as_of_seq,
             snapshot.busy,

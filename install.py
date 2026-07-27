@@ -7,7 +7,8 @@ it, writes the user-bin wrapper(s), and registers the OS service definition
 WITHOUT starting it (docs/architecture/kite-design.md §9). Starting the
 daemon and enabling autostart are explicit later steps (`kitectl service`).
 With `--instance <name>` it only creates that named instance's directories
-(docs/decisions/multi-instance.md) and leaves venv/wrappers/service alone.
+plus its 0600 provider-env template (docs/decisions/multi-instance.md) and
+leaves venv/wrappers/service alone.
 """
 
 from __future__ import annotations
@@ -180,9 +181,13 @@ def _install_instance(name: str) -> None:
 
     The managed venv / wrappers / service flow is instance-independent and
     stays on the default path; `--instance <name>` only lays out the new
-    instance's config/data/kap-home directories. Fail-closed on a bad name.
+    instance's config/data/kap-home directories plus the 0600 provider-env
+    template next to its future system.yaml (same as the default install).
+    Fail-closed on a bad name.
     """
+    from kite.env_file import ensure_env_template
     from kite.instance_layout import resolve, validate_instance_name
+    from kite.platform_paths import ENV_FILE_NAME
 
     try:
         instance_name = validate_instance_name(name)
@@ -191,10 +196,12 @@ def _install_instance(name: str) -> None:
     paths = resolve(instance_name)
     for directory in (paths.config_dir, paths.data_dir, paths.kap_home):
         directory.mkdir(parents=True, exist_ok=True)
+    env_path = ensure_env_template(paths.config_dir / ENV_FILE_NAME)
     print(f"instance '{instance_name}' directories ready:")
     print(f"  config  : {paths.config_dir}")
     print(f"  data    : {paths.data_dir}")
     print(f"  kap home: {paths.kap_home}")
+    print(f"  env     : {env_path} (0600 template; fill in provider credentials)")
     print()
     print("Next steps:")
     print(f"  - Fill in {paths.config_dir}/system.yaml and the env file next to it.")

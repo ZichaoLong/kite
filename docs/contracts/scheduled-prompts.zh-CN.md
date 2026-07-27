@@ -24,8 +24,10 @@
 KITE 实例经普通 prompt 路径执行。
 
 - 触发路径：systemd --user 定时器 → service unit 执行
-  `kitectl prompt send --chat <chat_id> --text <text>` → loopback 控制
-  面 → daemon 提交（归属记到该 chat，模式随绑定）。
+  `kitectl [--instance <名称>] prompt send --chat <chat_id> --text <text>`
+  → loopback 控制面 → daemon 提交（归属记到该 chat，模式随绑定）。为
+  命名实例创建的定时任务触发时携带 `--instance <名称>`，因此总是路由回
+  创建它的实例（见 §3.1)。
 - 冲突交给 kap 服务端 FIFO(session 忙则排队；不需要也不存在本地内存
   队列）。
 - 平台边界：受管定时助手与 `service_manager` 同构分派——Linux
@@ -36,20 +38,37 @@ KITE 实例经普通 prompt 路径执行。
 
 - `kitectl schedule create --chat <id> --text <text> (--at <ISO 时间戳> | --cron <表达式>) [--display silent|announce]`
   - 在 `~/.config/systemd/user/` 写入 `kite-schedule-<hash>.timer` +
-    `.service` 并启用定时器；不为未来时刻手动触发（触发归 systemd)。
+    `.service`（默认实例）或 `kite-schedule-<实例>-<hash>.timer` +
+    `.service`（命名实例）并启用定时器；不为未来时刻手动触发（触发归
+    systemd)。
   - `--at` 生成一次性定时器（`OnCalendar=<ts>`);`--cron` 生成周期定
     时器。过去的时间戳与无法解析的 cron 在写入前拒绝（fail-closed)。
   - 生成 unit 中的 kitectl 路径解析顺序：显式 `--ctl-path` >
     `KITE_BIN_DIR/kitectl` 或 `~/.local/bin/kitectl` > `<数据根>/.venv/bin/kitectl`。
     解析结果写入 unit。
-- `kitectl schedule list` —— 列出 `kite-schedule-*.timer` 及其计划与
-  下次触发时间（优先解析 `systemctl --user list-timers`，失败回退 unit
-  文件）。
+- `kitectl schedule list` —— 列出当前实例的 `kite-schedule-*.timer`
+  及其计划与下次触发时间（优先解析 `systemctl --user list-timers`，失
+  败回退 unit 文件）。
 - `kitectl schedule show <name>` —— 打印 timer + service 定义。
 - `kitectl schedule remove <name>` —— 停用并删除 unit 对（仅 `--yes`
   免确认）。
 - `kitectl schedule run-now <name>` —— 立即触发一次（经
   `systemctl --user start`)。
+
+### 3.1 实例作用域（多实例）
+
+OS 定时器存储在同一主机用户下是单一共享命名空间，因此定时任务按实例
+划分命名空间（docs/decisions/multi-instance.md):
+
+- 命名实例的 unit 名携带实例段：`kite-schedule-<实例>-<hash>`（默认实
+  例保持 `kite-schedule-<hash>`)。hash 本身仍由 chat + 计划 + 文本决
+  定，两个实例绝不冲突、也不会互相覆盖对方的定时器。
+- 命名实例生成的 ExecStart 触发 `kitectl --instance <名称> prompt
+  send ...`,prompt 提交回创建该定时任务的实例；默认实例省略该旗标
+  （此后走 kitectl 常规解析阶梯）。
+- `list`、`show`、`remove`、`run-now` 只看见、只接受当前实例的定时任
+  务：裸 hash 在当前命名空间内解析；属于其他命名空间的完整名称一律
+  fail-closed 拒绝。
 
 ## 4. 行为与安全合同
 
@@ -75,6 +94,9 @@ KITE 实例经普通 prompt 路径执行。
   任何文件。
 - list/show/remove/run-now 全流程（mock systemctl，不触真实 systemd);
   remove 需 `--yes`。
+- 实例作用域（§3.1)：命名实例的 unit 名携带实例段、ExecStart 携带
+  `--instance <名称>`；两个实例不可能冲突；list 按当前实例过滤；
+  show/remove 对其他实例的定时任务 fail-closed 拒绝。
 - `announce` 在提交前发出触发提示（daemon 侧，经控制面 prompt/submit
   的 display 标志）。
 - 触发时 daemon 不在：service 日志记录拒绝且退出非零。

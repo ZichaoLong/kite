@@ -1260,7 +1260,13 @@ class KapWsClient:
         self._ws: Any = None
         self._send_lock = threading.Lock()
         self._ack_cond = threading.Condition()
+        # Acks are only stored while a _send_and_wait waiter is registered
+        # for their id (audit R-4): an ack that arrives after its wait timed
+        # out (or for a never-awaited id) is dropped instead of leaking into
+        # the map forever. Both maps are therefore bounded by the number of
+        # in-flight waits; waiters unregister on success AND on timeout.
         self._pending_acks: dict[str, dict[str, Any]] = {}
+        self._awaited_acks: set[str] = set()
         self._memory_cursors: dict[str, EventCursor] = {}
         self._connected_at: float | None = None
         # M7 anti-tight-loop state (per connection): sessions an ack flagged
@@ -1386,7 +1392,17 @@ class KapWsClient:
                 if self._stop_event.is_set():
                     break
                 logger.warning("WS connection closed (%s); reconnecting", exc)
-            except (KapWsError, KapTransportError, OSError) as exc:
+            except (
+                KapError,
+                KapWsError,
+                KapTransportError,
+                OSError,
+                # The WS upgrade HTTP rejection (401 → InvalidStatus; neither
+                # an OSError nor a Kap error, so without being named here it
+                # fell into the generic branch below and the auth-escalation
+                # counter never moved — audit R-5).
+                websockets.exceptions.InvalidHandshake,
+            ) as exc:
                 if self._stop_event.is_set():
                     break
                 if _is_auth_failure(exc):
@@ -1486,8 +1502,11 @@ class KapWsClient:
         frame_id = frame.get("id")
         if frame_type == "ack" and isinstance(frame_id, str):
             with self._ack_cond:
-                self._pending_acks[frame_id] = frame
-                self._ack_cond.notify_all()
+                if frame_id in self._awaited_acks:
+                    self._pending_acks[frame_id] = frame
+                    self._ack_cond.notify_all()
+                # else: a late (post-timeout) or never-awaited ack — dropped
+                # (audit R-4), never stored.
             return
         if frame_type == "resync_required":
             payload = frame.get("payload") if isinstance(frame.get("payload"), dict) else {}
@@ -1583,38 +1602,47 @@ class KapWsClient:
         """
         request_id = f"{self._client_id}-{uuid.uuid4().hex[:8]}"
         message = json.dumps({"type": frame_type, "id": request_id, "payload": payload})
-        with self._send_lock:
-            ws.send(message)
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if self._stop_event.is_set():
-                raise KapWsError(f"{frame_type} aborted: client stopping")
-            with self._ack_cond:
-                ack = self._pending_acks.pop(request_id, None)
-            if ack is not None:
-                if ack.get("code") not in (0, None):
-                    raise KapWsError(f"{frame_type} rejected: {ack.get('msg')}")
-                return ack.get("payload") if isinstance(ack.get("payload"), dict) else {}
-            # During the handshake the recv loop is not running yet: pump
-            # frames inline so pre-ack frames are still dispatched in order.
-            if self._connected_at is None:
-                try:
-                    raw = ws.recv(timeout=max(0.05, min(0.5, deadline - time.monotonic())))
-                except TimeoutError:
-                    continue
-                try:
-                    frame = json.loads(raw)
-                except ValueError:
-                    continue
-                if isinstance(frame, dict):
-                    self._dispatch_frame(ws, frame)
-            else:
-                with self._ack_cond:
-                    self._ack_cond.wait(timeout=max(0.05, min(0.5, deadline - time.monotonic())))
-        # A late ack must not leak into the next request's slot (audit L32).
         with self._ack_cond:
-            self._pending_acks.pop(request_id, None)
-        raise KapWsError(f"no ack for {frame_type} within {timeout}s")
+            # Register BEFORE sending so the ack can never arrive to a
+            # dispatcher that has no waiter for it (audit R-4).
+            self._awaited_acks.add(request_id)
+        try:
+            with self._send_lock:
+                ws.send(message)
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if self._stop_event.is_set():
+                    raise KapWsError(f"{frame_type} aborted: client stopping")
+                with self._ack_cond:
+                    ack = self._pending_acks.pop(request_id, None)
+                if ack is not None:
+                    if ack.get("code") not in (0, None):
+                        raise KapWsError(f"{frame_type} rejected: {ack.get('msg')}")
+                    return ack.get("payload") if isinstance(ack.get("payload"), dict) else {}
+                # During the handshake the recv loop is not running yet: pump
+                # frames inline so pre-ack frames are still dispatched in order.
+                if self._connected_at is None:
+                    try:
+                        raw = ws.recv(timeout=max(0.05, min(0.5, deadline - time.monotonic())))
+                    except TimeoutError:
+                        continue
+                    try:
+                        frame = json.loads(raw)
+                    except ValueError:
+                        continue
+                    if isinstance(frame, dict):
+                        self._dispatch_frame(ws, frame)
+                else:
+                    with self._ack_cond:
+                        self._ack_cond.wait(timeout=max(0.05, min(0.5, deadline - time.monotonic())))
+            # A late ack must not leak into the next request's slot (audit L32).
+            with self._ack_cond:
+                self._pending_acks.pop(request_id, None)
+            raise KapWsError(f"no ack for {frame_type} within {timeout}s")
+        finally:
+            with self._ack_cond:
+                self._awaited_acks.discard(request_id)
+                self._pending_acks.pop(request_id, None)
 
     def _handle_ack_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Adopt ack cursors (a cursor source of truth) and surface resyncs."""
@@ -1692,6 +1720,13 @@ class KapWsClient:
         try:
             self._rest.get_prompts(session_id)
         except (KapError, KapTransportError) as exc:
+            if _is_auth_failure(exc):
+                # A warmup 401 must NOT be swallowed (audit R-5): the token
+                # is dead, the subscribe that follows would fail anyway, and
+                # only a raised connect failure feeds the run loop's
+                # auth-escalation counter. Every caller of subscribe() wraps
+                # exceptions, so this never crashes a caller.
+                raise
             # Not fatal: the subscribe ack reports not_found / resync itself.
             logger.warning("warmup GET prompts failed for %s: %s", session_id, exc)
 
@@ -1802,10 +1837,19 @@ def _is_auth_failure(exc: BaseException) -> bool:
     status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
     if status == 401:
         return True
+    # KapError carries the HTTP status as ``http_status``; the websockets
+    # upgrade rejection (InvalidStatus) carries it on ``response.status_code``.
+    if getattr(exc, "http_status", None) == 401:
+        return True
+    response = getattr(exc, "response", None)
+    if getattr(response, "status_code", None) == 401:
+        return True
     code = getattr(exc, "code", None) or getattr(exc, "rcvd_code", None)
     if code in (4401, 401):
         return True
-    return "401" in str(exc)
+    # Word-bounded: a kap business code like 40401 contains "401" but is not
+    # an auth rejection.
+    return re.search(r"\b401\b", str(exc)) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -1890,10 +1934,17 @@ def _parse_wire_cursor(raw: Any) -> EventCursor | None:
 
 
 def _tool_display_detail(display: Any) -> str:
-    """Salient plain-text field from a ToolInputDisplay payload.
+    """Salient plain-text field(s) from a ToolInputDisplay payload.
 
-    Returns "<kind>: <field>" (or "<field>" / "") — a neutral extraction, not
-    presentation (protocol/display.ts ToolInputDisplaySchema).
+    Returns a short per-kind extraction — never the kind itself — e.g. the
+    command string (command), "<operation> <path>" (file_io), the path
+    (diff), the query (search), the URL (url_fetch), the agent name
+    (agent_call), "<name> <args>" (skill_call), the description (task),
+    comma-joined item titles (todo_list), the task description (task_stop),
+    the plan (plan_review), the objective (goal_start) or the summary
+    (generic); "" for a non-dict payload or an unknown kind. A neutral
+    extraction, not presentation (protocol/display.ts
+    ToolInputDisplaySchema).
     """
     if not isinstance(display, dict):
         return ""

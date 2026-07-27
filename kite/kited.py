@@ -23,9 +23,10 @@ KITE_INSTANCE) runs the daemon as a named instance — config/data under
 `<root>/instances/<name>/`, the provider env file next to its system.yaml,
 and an isolated kap home at `<data>/kap-home` (the default instance keeps
 `~/.kimi-code`; an explicit `kap.home` always wins). At startup kited takes
-an exclusive advisory lease on `<instance config>/kited.lock`; a second
-kited on the same instance exits 2 naming the holder pid, and a stale
-(dead) holder never blocks a restart.
+an exclusive advisory lease on `<instance data>/kited.lock` (the mutable
+shared surfaces all live in the data dir, so that is the directory the lease
+must cover); a second kited on the same data dir exits 2 naming the holder
+pid, and a stale (dead) holder never blocks a restart.
 """
 
 from __future__ import annotations
@@ -101,19 +102,24 @@ def _lock_holder_pid(lock_path: pathlib.Path) -> int | None:
 
 
 def acquire_instance_lease(
-    config_dir: pathlib.Path | str, *, instance_name: str | None = None
+    data_dir: pathlib.Path | str, *, instance_name: str | None = None
 ):
-    """Take the exclusive advisory lease on `<config>/kited.lock` (decision §4).
+    """Take the exclusive advisory lease on `<data>/kited.lock` (decision §4).
 
     Two kited processes must never drive the same instance (Feishu would
-    load-balance bot events between them). Returns the open lock handle —
-    the caller MUST keep it open for the process lifetime; the OS releases
-    the flock at exit, so a stale (dead) holder never blocks a restart. On
-    conflict raises InstanceLeaseError naming the recorded holder pid.
+    load-balance bot events between them). The lease lives in the DATA dir,
+    not the config dir: every mutable shared surface (control_plane.json,
+    the stores, runtime_status.json, `<data>/kap-home`) is there, and a
+    per-axis explicit override can point two config dirs at one data dir
+    (audit N1-MED-1 — FOCUS locks the data dir too). Returns the open lock
+    handle — the caller MUST keep it open for the process lifetime; the OS
+    releases the flock at exit, so a stale (dead) holder never blocks a
+    restart. On conflict raises InstanceLeaseError naming the recorded
+    holder pid.
     """
-    config_dir = pathlib.Path(config_dir)
-    config_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = config_dir / KITED_LOCK_FILE_NAME
+    data_dir = pathlib.Path(data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = data_dir / KITED_LOCK_FILE_NAME
     # Text mode: file_lock._ensure_lock_file writes a str placeholder byte.
     handle = open(lock_path, "a+", encoding="utf-8")
     try:
@@ -464,10 +470,11 @@ def run(
                 cursor_store.set(request.session_id, snapshot.cursor)
                 status.update(ws={"last_resync_at": time.time()})
                 logger.info(
-                    "resync rebuilt session=%s as_of_seq=%d busy=%s",
+                    "resync rebuilt session=%s as_of_seq=%d busy=%s prompt_id=%s",
                     request.session_id,
                     snapshot.as_of_seq,
                     snapshot.busy,
+                    snapshot.current_prompt_id or "-",
                 )
 
             def on_connection_change(connected: bool) -> None:
@@ -655,11 +662,13 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         # The daemon instance lease (decision §4): the ONLY cross-process
-        # coordination multi-instance needs. The handle must stay open for
-        # the whole process lifetime — the flock is released at exit, so a
-        # stale holder never blocks a restart.
+        # coordination multi-instance needs. It locks the DATA dir — every
+        # mutable shared surface lives there, so two kited with different
+        # config dirs but one data dir still conflict (audit N1-MED-1). The
+        # handle must stay open for the whole process lifetime — the flock
+        # is released at exit, so a stale holder never blocks a restart.
         _lease_handle = acquire_instance_lease(
-            kite_config.config_dir(), instance_name=instance_name
+            default_data_root(), instance_name=instance_name
         )
     except InstanceLeaseError as exc:
         logger.error("%s", exc)

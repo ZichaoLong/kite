@@ -3057,6 +3057,56 @@ class StructuredLogFieldTests(ApprovalTests):
         self.assertEqual(len(resolved), 1)
         self.assertIn("prompt_id=p-1", resolved[0])
 
+    def test_session_rebuilt_log_carries_ids(self) -> None:
+        # Audit R-6 (mvp-scope §6): the resync/snapshot-rebuild line carries
+        # session_id + prompt_id, plus chat_id where a chat is attributable
+        # (the snapshot's current prompt has a recorded owner).
+        self.bind(CHAT_ID)
+        self.ownership.record("p-1", CHAT_ID, sender_open_id=ADMIN_OPEN_ID)
+        self.rest.snapshots[SESSION_ID] = make_snapshot(
+            as_of_seq=42, current_prompt_id="p-1", in_flight=True, turn_id=1
+        )
+
+        with self.assertLogs("kite.outbound", level="INFO") as captured:
+            self.pipeline.handle_resync_required(
+                ResyncRequest(
+                    session_id=SESSION_ID,
+                    reason="buffer_overflow",
+                    current_seq=42,
+                    epoch="e1",
+                )
+            )
+            self.flush()
+
+        rebuilt = [line for line in captured.output if "session rebuilt" in line]
+        self.assertEqual(len(rebuilt), 1)
+        self.assertIn(f"chat_id={CHAT_ID}", rebuilt[0])
+        self.assertIn(f"session={SESSION_ID}", rebuilt[0])
+        self.assertIn("prompt_id=p-1", rebuilt[0])
+
+    def test_session_rebuilt_log_without_owner_dashes_chat_id(self) -> None:
+        # No attributable chat (no recorded owner for the current prompt):
+        # chat_id degrades to "-" rather than being guessed (§6).
+        self.rest.snapshots[SESSION_ID] = make_snapshot(
+            as_of_seq=42, current_prompt_id="p-1", in_flight=True, turn_id=1
+        )
+
+        with self.assertLogs("kite.outbound", level="INFO") as captured:
+            self.pipeline.handle_resync_required(
+                ResyncRequest(
+                    session_id=SESSION_ID,
+                    reason="buffer_overflow",
+                    current_seq=42,
+                    epoch="e1",
+                )
+            )
+            self.flush()
+
+        rebuilt = [line for line in captured.output if "session rebuilt" in line]
+        self.assertEqual(len(rebuilt), 1)
+        self.assertIn("chat_id=-", rebuilt[0])
+        self.assertIn("prompt_id=p-1", rebuilt[0])
+
 
 if __name__ == "__main__":
     unittest.main()

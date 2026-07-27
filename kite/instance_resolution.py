@@ -10,10 +10,14 @@ kitectl resolution ladder:
    list,
 3. the default instance.
 
-``kitectl service`` commands skip rung 2 (explicit-or-default only: no
-"single running" convenience for destructive ops). kited never uses rung 2
-either — the daemon IS an instance, spelled via ``--instance`` /
-``KITE_INSTANCE`` or the default.
+Rung 2 is skipped where it cannot be meant: ``kitectl service`` commands
+(explicit-or-default only: no "single running" convenience for destructive
+ops), instance-agnostic commands like ``completion``, and any invocation
+with an explicit directory axis (``--config-dir``/``--data-dir`` or pre-set
+``KITE_CONFIG_DIR``/``KITE_DATA_ROOT`` — the caller already named the
+directories, so a running instance's name must not be mixed in). kited
+never uses rung 2 either — the daemon IS an instance, spelled via
+``--instance`` / ``KITE_INSTANCE`` or the default.
 """
 
 from __future__ import annotations

@@ -1,10 +1,20 @@
 import tempfile
 import time
+import types
 import unittest
 import unittest.mock
+import uuid
 
 import fake_kap
-from kite.adapters.kap_server import KapEvent, KapRestClient, KapWsClient, KapWsError
+import websockets.exceptions
+from kite.adapters.kap_server import (
+    KapError,
+    KapEvent,
+    KapRestClient,
+    KapTransportError,
+    KapWsClient,
+    KapWsError,
+)
 from kite.stores.event_cursor_store import EventCursor, EventCursorStore
 
 
@@ -186,13 +196,122 @@ class KapWsClientTests(unittest.TestCase):
             client._send_and_wait(client._ws, "bogus", {"session_ids": []}, 0.3)
         self.assertEqual(client._pending_acks, {})
 
+    def test_late_ack_after_timeout_is_dropped(self) -> None:
+        # Audit R-4: an ack that arrives after its wait timed out used to be
+        # stored unconditionally and leak in _pending_acks forever; only ids
+        # with a live waiter may be stored now.
+        client = self._start_client()
+        self.assertTrue(wait_until(lambda: client.connected))
+        fixed = uuid.UUID(int=0)
+        with unittest.mock.patch(
+            "kite.adapters.kap_server.uuid.uuid4", return_value=fixed
+        ):
+            with self.assertRaises(KapWsError):
+                # The fake ignores unknown frame types, so no ack can arrive.
+                client._send_and_wait(client._ws, "bogus", {"session_ids": []}, 0.3)
+        request_id = f"{client._client_id}-{fixed.hex[:8]}"
+        client._dispatch_frame(
+            client._ws, {"type": "ack", "id": request_id, "code": 0, "payload": {}}
+        )
+        self.assertEqual(client._pending_acks, {})
+        self.assertNotIn(request_id, client._awaited_acks)
+
+    def test_never_awaited_ack_is_dropped(self) -> None:
+        client = self._start_client()
+        self.assertTrue(wait_until(lambda: client.connected))
+        client._dispatch_frame(
+            client._ws,
+            {"type": "ack", "id": "kited-deadbeef", "code": 0, "payload": {}},
+        )
+        self.assertEqual(client._pending_acks, {})
+
     def test_is_auth_failure_classification(self) -> None:
         from kite.adapters.kap_server import _is_auth_failure
 
         self.assertTrue(_is_auth_failure(Exception("401 Unauthorized")))
         self.assertTrue(_is_auth_failure(type("E", (Exception,), {"status": 401})()))
         self.assertTrue(_is_auth_failure(type("E", (Exception,), {"code": 4401})()))
+        # The WS upgrade rejection shape (audit R-5): websockets' InvalidStatus
+        # carries the status on .response.status_code.
+        rejected = websockets.exceptions.InvalidStatus(
+            types.SimpleNamespace(status_code=401)
+        )
+        self.assertTrue(_is_auth_failure(rejected))
+        # A REST 401 envelope raises KapError(http_status=401); a non-envelope
+        # reply raises KapTransportError with the status in the message.
+        self.assertTrue(_is_auth_failure(KapError(40001, "unauthorized", http_status=401)))
+        self.assertTrue(_is_auth_failure(KapTransportError("HTTP 401: non-envelope reply")))
         self.assertFalse(_is_auth_failure(Exception("connection refused")))
+        self.assertFalse(
+            _is_auth_failure(
+                websockets.exceptions.InvalidStatus(types.SimpleNamespace(status_code=404))
+            )
+        )
+
+    def test_repeated_ws_auth_rejections_reach_the_alert_log(self) -> None:
+        # Audit R-5: the upgrade-401 (InvalidStatus) must feed the auth
+        # escalation counter, not the generic unexpected-error branch.
+        rejection = websockets.exceptions.InvalidStatus(
+            types.SimpleNamespace(status_code=401)
+        )
+        failing = KapWsClient(
+            host="127.0.0.1",
+            port=self.ws_server.port,
+            token=self.state.token,
+            rest_client=self.rest,
+            reconnect_delay_seconds=0.01,
+        )
+        with unittest.mock.patch.object(KapWsClient, "_connect_once", side_effect=rejection):
+            with self.assertLogs("kite.adapters.kap", level="ERROR") as captured:
+                failing.start()
+                try:
+                    self.assertTrue(
+                        wait_until(
+                            lambda: any(
+                                "auth failed 3 times" in record.getMessage()
+                                for record in captured.records
+                            ),
+                            timeout=5.0,
+                        )
+                    )
+                finally:
+                    failing.stop()
+
+    def test_warmup_auth_failure_propagates(self) -> None:
+        # Audit R-5: a warmup REST 401 was swallowed as a warning and the
+        # connect succeeded; it must raise so the run loop counts it.
+        class _StubRest:
+            def __init__(self, exc: Exception) -> None:
+                self._exc = exc
+
+            def get_prompts(self, _session_id: str) -> None:
+                raise self._exc
+
+        auth_dead = KapWsClient(
+            host="127.0.0.1",
+            port=1,
+            token="t",
+            rest_client=_StubRest(KapError(40001, "unauthorized", http_status=401)),
+        )
+        with self.assertRaises(KapError):
+            auth_dead._warm_session("s-1")
+        transport_dead = KapWsClient(
+            host="127.0.0.1",
+            port=1,
+            token="t",
+            rest_client=_StubRest(KapTransportError("HTTP 401: non-envelope reply")),
+        )
+        with self.assertRaises(KapTransportError):
+            transport_dead._warm_session("s-1")
+        # Non-auth warmup failures stay non-fatal (the ack reports not_found).
+        missing = KapWsClient(
+            host="127.0.0.1",
+            port=1,
+            token="t",
+            rest_client=_StubRest(KapError(40401, "session not found")),
+        )
+        with self.assertLogs("kite.adapters.kap", level="WARNING"):
+            missing._warm_session("s-1")
 
     def test_reconnect_backoff_grows_exponentially(self) -> None:
         client = self._start_client()

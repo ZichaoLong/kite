@@ -23,8 +23,9 @@ multi-instance shape and what concurrency machinery it actually requires.
 The **default instance keeps today's paths byte-identically**
 (`~/.config/kite` + `~/.local/share/kite`) — the current deployment becomes
 the default instance with zero migration. Named instances live under
-`instances/<name>/`. A name is `[a-z0-9][a-z0-9._-]*` (fail-closed on
-anything else; no `default`, `instances`, `..`).
+`instances/<name>/`. A name is `[a-z0-9][a-z0-9._-]*`, at most 64
+characters (FOCUS parity; fail-closed on anything else; no `default`,
+`instances`, `..`).
 
 ### 2. Per-instance isolated kap home (the tearing killer)
 
@@ -61,10 +62,15 @@ instance (no "single running" convenience for destructive ops).
 
 Two kited processes must never drive the same instance (Feishu would
 load-balance bot events between them → inconsistent behavior). kited takes
-an **exclusive advisory file lock on `<instance config>/kited.lock`** at
-startup; a second kited on the same instance exits immediately with a clear
-message naming the holder pid. This replaces nothing else — it is the only
-cross-process coordination multi-instance actually needs.
+an **exclusive advisory file lock on `<instance data>/kited.lock`** at
+startup; a second kited on the same data dir exits immediately with a clear
+message naming the holder pid. The lease lives in the data dir — not the
+config dir — because every mutable shared surface is there
+(`control_plane.json`, the stores, `runtime_status.json`,
+`<data>/kap-home`), and a per-axis explicit `--config-dir`/`--data-dir`
+override can point two different config dirs at one data dir (FOCUS locks
+the data dir for the same reason). This replaces nothing else — it is the
+only cross-process coordination multi-instance actually needs.
 
 ### 5. Interaction owner: still NOT implemented (deliberate)
 

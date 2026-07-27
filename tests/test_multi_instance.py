@@ -12,6 +12,7 @@ import io
 import json
 import os
 import pathlib
+import stat
 import tempfile
 import time
 import unittest
@@ -22,6 +23,7 @@ import install
 from kite import instance_layout
 from kite import kitectl
 from kite import kited
+from kite.platform_paths import ENV_FILE_NAME
 from kite.stores.binding_store import BindingStore
 
 _MUTATED_ENV_VARS = (
@@ -189,6 +191,64 @@ class KitectlInstanceFlagTests(MultiInstanceTestCase):
                 os.environ.get("KITE_CONFIG_DIR", ""), str(acme_data)
             )
 
+    def test_explicit_dirs_skip_single_running_rung(self) -> None:
+        # Audit N1: an explicit --config-dir/--data-dir already names the
+        # directories; rung 2 must not mix in a running instance's name.
+        _, acme_data = self._instance_dirs("acme")
+        self._publish_live_control_plane(acme_data)
+        with _saved_env(), patch.dict(os.environ, self._roots_env()):
+            kitectl._apply_instance_environment(
+                SimpleNamespace(
+                    instance=None,
+                    config_dir=str(self.home / "explicit-cfg"),
+                    data_dir=str(self.home / "explicit-data"),
+                    command="binding",
+                )
+            )
+            self.assertEqual(os.environ.get("KITE_INSTANCE", ""), "")
+
+    def test_preset_dir_env_vars_skip_single_running_rung(self) -> None:
+        # Same for pre-set KITE_CONFIG_DIR / KITE_DATA_ROOT (audit N1).
+        _, acme_data = self._instance_dirs("acme")
+        self._publish_live_control_plane(acme_data)
+        env = {**self._roots_env(), "KITE_DATA_ROOT": str(self.home / "explicit-data")}
+        with _saved_env(), patch.dict(os.environ, env):
+            kitectl._apply_instance_environment(
+                SimpleNamespace(instance=None, config_dir=None, data_dir=None, command="binding")
+            )
+            self.assertEqual(os.environ.get("KITE_INSTANCE", ""), "")
+
+    def test_explicit_dirs_do_not_hide_ambiguity_behind_rung2(self) -> None:
+        # Two live instances + explicit dirs: rung 2 skipped means NO
+        # ambiguity error — the explicit dirs ARE the target.
+        _, acme_data = self._instance_dirs("acme")
+        _, bravo_data = self._instance_dirs("bravo")
+        self._publish_live_control_plane(acme_data)
+        self._publish_live_control_plane(bravo_data)
+        explicit_data = self.home / "explicit-data"
+        explicit_data.mkdir()
+        self._bind(explicit_data, "chat-explicit", "s-explicit")
+
+        code, out, err = self._run_cli(
+            "--data-dir", str(explicit_data), "binding", "list"
+        )
+
+        self.assertEqual(code, 0, err)
+        self.assertIn("chat-explicit", out)
+
+    def test_completion_ignores_running_instance_ambiguity(self) -> None:
+        # Audit N1: `completion` is instance-agnostic; the ambiguity guard
+        # must not reject it.
+        _, acme_data = self._instance_dirs("acme")
+        _, bravo_data = self._instance_dirs("bravo")
+        self._publish_live_control_plane(acme_data)
+        self._publish_live_control_plane(bravo_data)
+
+        code, out, err = self._run_cli("completion", "bash")
+
+        self.assertEqual(code, 0, err)
+        self.assertIn("_kitectl_complete", out)
+
 
 class ServiceDefinitionInstanceTests(MultiInstanceTestCase):
     def _definition(self, instance: str | None):
@@ -228,40 +288,56 @@ class ServiceDefinitionInstanceTests(MultiInstanceTestCase):
 
 
 class KitedLeaseTests(MultiInstanceTestCase):
+    """The lease locks the instance DATA dir (decision §4, audit N1-MED-1)."""
+
     def test_second_lease_fails_naming_holder_pid(self) -> None:
-        config_dir, _ = self._instance_dirs("acme")
-        handle = kited.acquire_instance_lease(config_dir, instance_name="acme")
+        _, data_dir = self._instance_dirs("acme")
+        handle = kited.acquire_instance_lease(data_dir, instance_name="acme")
         self.addCleanup(handle.close)
         with self.assertRaises(kited.InstanceLeaseError) as ctx:
-            kited.acquire_instance_lease(config_dir, instance_name="acme")
+            kited.acquire_instance_lease(data_dir, instance_name="acme")
         message = str(ctx.exception)
         self.assertIn(str(os.getpid()), message)
         self.assertIn("acme", message)
         self.assertIn(kited.KITED_LOCK_FILE_NAME, message)
 
     def test_lease_records_holder_pid(self) -> None:
-        config_dir, _ = self._instance_dirs("acme")
-        handle = kited.acquire_instance_lease(config_dir, instance_name="acme")
+        _, data_dir = self._instance_dirs("acme")
+        handle = kited.acquire_instance_lease(data_dir, instance_name="acme")
         self.addCleanup(handle.close)
-        recorded = (config_dir / kited.KITED_LOCK_FILE_NAME).read_text(
+        recorded = (data_dir / kited.KITED_LOCK_FILE_NAME).read_text(
             encoding="utf-8"
         ).strip()
         self.assertEqual(recorded, str(os.getpid()))
 
     def test_stale_holder_lock_is_acquirable(self) -> None:
-        config_dir, _ = self._instance_dirs("acme")
-        handle = kited.acquire_instance_lease(config_dir, instance_name="acme")
+        _, data_dir = self._instance_dirs("acme")
+        handle = kited.acquire_instance_lease(data_dir, instance_name="acme")
         handle.close()  # simulates holder death: the OS releases the flock
-        takeover = kited.acquire_instance_lease(config_dir, instance_name="acme")
+        takeover = kited.acquire_instance_lease(data_dir, instance_name="acme")
         self.addCleanup(takeover.close)
         # The new holder overwrote the recorded pid.
-        self.assertEqual(kited._lock_holder_pid(config_dir / kited.KITED_LOCK_FILE_NAME), os.getpid())
+        self.assertEqual(kited._lock_holder_pid(data_dir / kited.KITED_LOCK_FILE_NAME), os.getpid())
+
+    def test_two_config_dirs_sharing_one_data_dir_conflict(self) -> None:
+        # Audit N1-MED-1: per-axis explicit dirs can break the config:data
+        # 1:1 — two kited with DIFFERENT config dirs but the SAME data dir
+        # must still conflict (every mutable shared surface is in the data
+        # dir). The lease therefore lives in the data dir.
+        shared_data = self.home / "shared-data"
+        (self.home / "cfg-a").mkdir(parents=True)
+        (self.home / "cfg-b").mkdir(parents=True)
+        handle = kited.acquire_instance_lease(shared_data)
+        self.addCleanup(handle.close)
+        with self.assertRaises(kited.InstanceLeaseError):
+            kited.acquire_instance_lease(shared_data)
+        self.assertTrue((shared_data / kited.KITED_LOCK_FILE_NAME).exists())
 
     def test_main_exits_2_on_lease_conflict(self) -> None:
         config_dir = self.home / "cfg"
         data_dir = self.home / "data2"
         data_dir.mkdir(parents=True)
-        handle = kited.acquire_instance_lease(config_dir)
+        handle = kited.acquire_instance_lease(data_dir)
         self.addCleanup(handle.close)
         with _saved_env(), patch.dict(os.environ, self._roots_env()):
             rc = kited.main(
@@ -371,6 +447,17 @@ class InstallInstanceTests(MultiInstanceTestCase):
         self.assertTrue(paths.data_dir.is_dir())
         self.assertTrue(paths.kap_home.is_dir())
         self.assertIn("acme", stdout.getvalue())
+
+    def test_install_instance_writes_env_template(self) -> None:
+        # Audit N1: --instance lays out the provider-env template next to the
+        # instance's future system.yaml, same as the default install.
+        with _saved_env(), patch.dict(os.environ, self._roots_env()):
+            install.main(["--instance", "acme"])
+            paths = instance_layout.resolve("acme")
+        env_path = paths.config_dir / ENV_FILE_NAME
+        self.assertTrue(env_path.is_file())
+        self.assertIn("KIMI_API_KEY", env_path.read_text(encoding="utf-8"))
+        self.assertEqual(stat.S_IMODE(env_path.stat().st_mode), 0o600)
 
     def test_install_instance_rejects_bad_name(self) -> None:
         with _saved_env(), patch.dict(os.environ, self._roots_env()):

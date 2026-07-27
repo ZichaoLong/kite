@@ -456,7 +456,10 @@ def _fish_helper_lines(command: str, spec: dict) -> list[str]:
         "end",
         "",
         # True when the word before the cursor is a flag that consumes the
-        # word being completed: offer nothing (fish completes paths then).
+        # word being completed. Used to suppress WORD candidates there (a
+        # subcommand name is never a flag value); the flag's own argument
+        # completion (fixed choices or paths) is governed by the flag
+        # entries and is deliberately NOT gated on this.
         f"function {prefix}_after_value_flag",
         "    set -l tokens (commandline -opc)",
         "    if test (count $tokens) -lt 2",
@@ -492,16 +495,22 @@ def _fish_complete_lines(command: str, spec: dict) -> list[str]:
     has_subcommands = bool(spec.get("subcommands"))
     for path, node in _iter_nodes(spec):
         if has_subcommands:
-            condition = (
-                f"__{command}_at '{' '.join(path)}'; and not __{command}_after_value_flag"
-            )
-            guard = f' -n "{condition}"'
+            path_guard = f' -n "__{command}_at \'{" ".join(path)}\'"'
+            # The value-flag guard attaches to WORD entries only (audit
+            # N4-MED-1): right after a value flag (e.g. `--display <TAB>`,
+            # empty value) subcommand/positional words must stay out of the
+            # way, but the flag's own argument completion — fixed choices
+            # like silent/announce, or the path fallback — lives on the flag
+            # entry and must NOT be suppressed (it would silently degrade
+            # to file completion).
+            word_guard = f' -n "__{command}_at \'{" ".join(path)}\'; and not __{command}_after_value_flag"'
         else:
-            guard = ""
+            path_guard = ""
+            word_guard = ""
         for word in _node_words(node):
-            lines.append(f'complete -c {command}{guard} -f -a "{word}"')
+            lines.append(f'complete -c {command}{word_guard} -f -a "{word}"')
         for flag in _node_flags(node):
-            lines.append(f"complete -c {command}{guard}{_fish_flag_options(flag, node)}")
+            lines.append(f"complete -c {command}{path_guard}{_fish_flag_options(flag, node)}")
     return lines
 
 

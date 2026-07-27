@@ -94,6 +94,7 @@ from kite.adapters.kap_server import (
     KapTransportError,
     PromptQueueState,
     SessionSummary,
+    _optional_pending_interaction,
 )
 from kite.attachment_domain import AttachmentDomain, AttachmentPorts
 from kite.card_text_projection import (
@@ -420,16 +421,17 @@ class KapSessionOps:
             raise KapTransportError(f"{context}: unexpected data shape")
         metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
         cwd = metadata.get("cwd")
-        pending_interaction = data.get("pending_interaction")
         return SessionSummary(
             session_id=session_id,
             title=str(data.get("title") or ""),
             cwd=str(cwd) if isinstance(cwd, str) and cwd else None,
             busy=bool(data.get("busy")),
-            pending_interaction=(
-                str(pending_interaction)
-                if isinstance(pending_interaction, str) and pending_interaction
-                else None
+            # Same normalization as the adapter's typed parse points (audit
+            # R-1): the upstream 'none' enum value means NO pending
+            # interaction and must not leak to consumers (e.g. /status) as a
+            # truthy string.
+            pending_interaction=_optional_pending_interaction(
+                data.get("pending_interaction")
             ),
             archived=bool(data.get("archived")),
         )
@@ -2059,7 +2061,11 @@ class AppHandler(TransportHandler):
 
     def _cmd_archive(self, message: InboundMessage, arg: str) -> None:
         """/archive: kap :archive pass-through; the binding is kept, so the
-        next message hits the §4.7 archived-session error path."""
+        next message hits the §4.7 archived-session error path. Denied while
+        the bound session has an active prompt (mvp-scope aligned item 15):
+        upstream archive drains agents and cancels every pending turn, so the
+        in-flight execution card, terminal result and approval routing would
+        lose visibility — the same reasoning as /switch (aligned item 11)."""
         if arg.strip():
             self._reply_to(message, build_usage_text("/archive"))
             return
@@ -2067,6 +2073,25 @@ class AppHandler(TransportHandler):
         if binding is None:
             return
         session_id = binding["session_id"]
+        # Preflight (fail-closed): same check_new denial as /new and /switch.
+        # Unverifiable queue state also refuses.
+        try:
+            queue = self._ops.get_prompts(session_id)
+        except KapTransportError:
+            self._reply_to(message, _KAP_UNREACHABLE_TEXT)
+            return
+        except KapError as exc:
+            self._reply_to(message, f"查询会话状态失败：{exc.msg}")
+            return
+        check = preflights.check_new(queue)
+        if not check.allowed:
+            logger.info(
+                "/archive denied chat_id=%s reason_code=%s",
+                message.chat_id,
+                check.reason_code,
+            )
+            self._reply_to(message, check.reason_text)
+            return
         try:
             self._ops.archive_session(session_id)
         except KapTransportError:
@@ -2579,6 +2604,37 @@ class AppHandler(TransportHandler):
         if current is not None and current["session_id"] == session_id:
             if current["attached"]:
                 return True, f"当前已绑定该会话（`{session_id}`）。"
+            # Same-session shortcut (detached -> re-attached): this IS a
+            # re-attach, so it must pass the same all-mode exclusivity probes
+            # as /attach (audit R-2) — while this chat was detached (detached
+            # does not count as sharing), another chat may have bound the
+            # session, or an all-mode group may have occupied it; flipping
+            # attached back on would silently recreate a shared session.
+            exclusive = preflights.all_mode_session_exclusive(
+                chat_id, self._binding_store, self._group_config_store
+            )
+            if not exclusive.allowed:
+                logger.info(
+                    "session switch denied chat_id=%s session_id=%s reason_code=%s",
+                    chat_id,
+                    session_id,
+                    exclusive.reason_code,
+                )
+                return False, exclusive.reason_text
+            occupied = preflights.all_mode_session_occupied(
+                chat_id,
+                self._binding_store,
+                self._group_config_store,
+                session_id=session_id,
+            )
+            if not occupied.allowed:
+                logger.info(
+                    "session switch denied chat_id=%s session_id=%s reason_code=%s",
+                    chat_id,
+                    session_id,
+                    occupied.reason_code,
+                )
+                return False, occupied.reason_text
             current["attached"] = True
             self._binding_store.save(chat_id, current)
             return True, "当前已绑定该会话，推送已恢复。"

@@ -185,10 +185,17 @@ explicitly; "best-effort" silent degradation is forbidden:
     from its own volatile stream) to the initiating chat on `turn.ended`.
     Error frames apply only to their own agent; work state tracks the main
     agent only. Ownership is recorded to the chat so approvals route as
-    usual. No queue, no interrupt of the main turn.
+    usual. No queue, no interrupt of the main turn. Boundaries in this cut:
+    btw prompts cannot be `/abort`ed; after a restart the btw agent is
+    re-created on demand and old ones are left to upstream hygiene
+    (registered 2026-07-27).
 14. `/goal` rewired (2026-07-27, audit N2-HIGH-1): the prompt-submit route
     parses but silently drops `goal_*` fields — the real upstream goal path
     is `POST .../profile {agent_config.goal_objective|goal_control}` plus
     `GET .../goal`. `/goal` now uses those routes with no local persistence
     (the binding store's `goal_objective` field and the per-prompt carry
     model were removed).
+15. `/archive` is denied while the bound session has an active prompt — same
+    reasoning as `/switch` (aligned item 11): upstream archive drains agents
+    and cancels all pending turns, so the in-flight execution card, terminal
+    result and approval routing would lose visibility (2026-07-27).

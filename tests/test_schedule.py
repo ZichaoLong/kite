@@ -1288,5 +1288,240 @@ class TaskSchedulerBackendTests(unittest.TestCase):
             self.backend.run_now("kite-schedule-000000000000")
 
 
+class InstanceScheduleNameTests(unittest.TestCase):
+    """Instance-namespaced schedule identities (contract §3.1, audit N1-MED-2)."""
+
+    def test_named_instance_name_is_prefixed_and_collision_free(self) -> None:
+        default_name = schedule_units.schedule_name("chat-1", "*-*-* 09:00:00", "hello")
+        acme_name = schedule_units.schedule_name(
+            "chat-1", "*-*-* 09:00:00", "hello", instance="acme"
+        )
+        bravo_name = schedule_units.schedule_name(
+            "chat-1", "*-*-* 09:00:00", "hello", instance="bravo"
+        )
+        self.assertRegex(default_name, r"^kite-schedule-[0-9a-f]{12}$")
+        self.assertRegex(acme_name, r"^kite-schedule-acme-[0-9a-f]{12}$")
+        # Same chat/schedule/text → identical hash, different namespaces:
+        # a cross-instance name collision is impossible by construction.
+        self.assertEqual(
+            acme_name.rsplit("-", 1)[1], default_name[len("kite-schedule-"):]
+        )
+        self.assertEqual(len({default_name, acme_name, bravo_name}), 3)
+
+    def test_hash_shaped_instance_name_stays_unambiguous(self) -> None:
+        # An instance named exactly like a 12-hex digest cannot be confused
+        # with the default form: its units always carry the trailing digest.
+        name = schedule_units.schedule_name(
+            "chat-1", "*-*-* 09:00:00", "hello", instance="abcdef123456"
+        )
+        parsed = schedule_units.parse_schedule_name(name)
+        self.assertEqual(parsed, ("abcdef123456", name.rsplit("-", 1)[1]))
+
+    def test_parse_schedule_name_shapes(self) -> None:
+        default_name = schedule_units.schedule_name("chat-1", "daily", "x")
+        self.assertEqual(
+            schedule_units.parse_schedule_name(default_name),
+            (None, default_name[len("kite-schedule-") :]),
+        )
+        for garbage in (
+            "",
+            "kite-schedule-",
+            "kite-schedule-zzzzzzzzzzzz",
+            "kite-schedule-Acme-abcdef123456",
+            "other-abcdef123456",
+            # Reserved instance names never parse as a namespace.
+            "kite-schedule-default-abcdef123456",
+            "kite-schedule-instances-abcdef123456",
+        ):
+            self.assertIsNone(schedule_units.parse_schedule_name(garbage), garbage)
+
+    def test_scoped_schedule_name(self) -> None:
+        digest = schedule_units.schedule_name("chat-1", "daily", "x")[
+            len("kite-schedule-") :
+        ]
+        # A bare hash expands into the current instance's namespace.
+        self.assertEqual(
+            schedule_units.scoped_schedule_name(digest, "acme"),
+            f"kite-schedule-acme-{digest}",
+        )
+        self.assertEqual(
+            schedule_units.scoped_schedule_name(digest, None),
+            f"kite-schedule-{digest}",
+        )
+        # Full names of the current namespace pass through (suffixes too).
+        self.assertEqual(
+            schedule_units.scoped_schedule_name(f"kite-schedule-acme-{digest}", "acme"),
+            f"kite-schedule-acme-{digest}",
+        )
+        self.assertEqual(
+            schedule_units.scoped_schedule_name(f"{digest}.timer", "acme"),
+            f"kite-schedule-acme-{digest}",
+        )
+        # Cross-instance names are rejected fail-closed.
+        with self.assertRaises(ScheduleError):
+            schedule_units.scoped_schedule_name(f"kite-schedule-{digest}", "acme")
+        with self.assertRaises(ScheduleError):
+            schedule_units.scoped_schedule_name(f"kite-schedule-acme-{digest}", None)
+        with self.assertRaises(ScheduleError):
+            schedule_units.scoped_schedule_name(f"kite-schedule-bravo-{digest}", "acme")
+
+
+class InstanceScheduleRenderTests(unittest.TestCase):
+    """The fired command carries --instance for named instances only."""
+
+    def _named_spec(self, **overrides) -> schedule_units.ScheduleSpec:
+        values = {
+            "chat_id": "chat-1",
+            "text": "hello",
+            "plan": schedule_units.parse_cron_schedule("0 9 * * *"),
+            "display": "silent",
+            "ctl_path": "/home/user/.local/bin/kitectl",
+            "instance": "acme",
+        }
+        values.update(overrides)
+        return schedule_units.build_schedule_spec(**values)
+
+    def test_named_instance_unit_carries_the_instance_flag(self) -> None:
+        spec = self._named_spec()
+        self.assertEqual(spec.instance, "acme")
+        self.assertRegex(spec.name, r"^kite-schedule-acme-[0-9a-f]{12}$")
+        rendered = schedule_units.render_service_unit(spec)
+        # --instance is a GLOBAL kitectl flag: argparse only accepts it
+        # before the subcommand, so it must lead the fired argv.
+        self.assertIn('"--instance" "acme" "prompt" "send"', rendered)
+        default_rendered = schedule_units.render_service_unit(_spec())
+        self.assertNotIn("--instance", default_rendered)
+
+    def test_fired_argv_parses_against_the_real_kitectl_parser(self) -> None:
+        spec = self._named_spec()
+        args = kitectl._build_parser().parse_args(schedule_units._prompt_send_args(spec))
+        self.assertEqual(args.instance, "acme")
+        self.assertEqual(args.command, "prompt")
+        self.assertEqual(args.chat, "chat-1")
+        default_args = kitectl._build_parser().parse_args(
+            schedule_units._prompt_send_args(_spec())
+        )
+        self.assertIsNone(default_args.instance)
+
+    def test_launchd_plist_carries_the_instance_flag(self) -> None:
+        spec = self._named_spec()
+        payload = plistlib.loads(schedule_units.render_launchd_plist(spec))
+        argv = payload["ProgramArguments"]
+        self.assertEqual(argv[0], "/home/user/.local/bin/kitectl")
+        self.assertEqual(argv[1:5], ["--instance", "acme", "prompt", "send"])
+
+    def test_task_xml_carries_the_instance_flag(self) -> None:
+        spec = self._named_spec()
+        root = ET.fromstring(schedule_units.render_task_xml(spec, now=datetime(2026, 7, 25)))
+        arguments = root.find(
+            f"{_tag('Actions')}/{_tag('Exec')}/{_tag('Arguments')}"
+        ).text
+        self.assertEqual(
+            arguments.split()[:4], ['"--instance"', '"acme"', '"prompt"', '"send"']
+        )
+
+
+class ScheduleInstanceCliTests(ScheduleCliTests):
+    """kitectl schedule instance scoping over mocked systemctl (audit N1-MED-2)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        saved = {
+            key: os.environ.get(key)
+            for key in ("KITE_INSTANCE", "KITE_CONFIG_DIR", "KITE_DATA_ROOT")
+        }
+
+        def _restore() -> None:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        self.addCleanup(_restore)
+
+    def _run_cli(self, *argv: str) -> tuple[int, str, str]:
+        # kitectl.main publishes the resolved instance via env; scrub it so
+        # every call in a test starts from a clean resolution.
+        for key in ("KITE_INSTANCE", "KITE_CONFIG_DIR", "KITE_DATA_ROOT"):
+            os.environ.pop(key, None)
+        return super()._run_cli(*argv)
+
+    def _create_named(self, instance: str, *extra: str) -> tuple[int, str, str]:
+        return self._run_cli(
+            "--instance",
+            instance,
+            "schedule",
+            "create",
+            "--chat",
+            "chat-1",
+            "--text",
+            "hello kite",
+            "--ctl-path",
+            str(self.ctl_path),
+            *extra,
+        )
+
+    def test_create_for_named_instance_prefixes_unit_and_carries_flag(self) -> None:
+        self._bind()
+        code, out, err = self._create_named("acme", "--at", self._future_at())
+        self.assertEqual(code, 0, err)
+        name = next(
+            line for line in out.splitlines() if line.startswith("name: ")
+        ).split(": ", 1)[1]
+        self.assertRegex(name, r"^kite-schedule-acme-[0-9a-f]{12}$")
+        self.assertIn("instance: acme", out)
+        service = (self.unit_dir / f"{name}.service").read_text(encoding="utf-8")
+        self.assertIn('"--instance" "acme" "prompt" "send"', service)
+
+    def test_list_filters_to_the_current_instance(self) -> None:
+        self._bind()
+        code, _, err = self._create("--at", self._future_at())
+        self.assertEqual(code, 0, err)
+        # Same chat/text/time → same hash; only the namespace differs.
+        code, _, err = self._create_named("acme", "--at", self._future_at())
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(list(self.unit_dir.glob("*.timer"))), 2)
+
+        code, out, err = self._run_cli("schedule", "list")
+        self.assertEqual(code, 0, err)
+        self.assertIn("kite-schedule-", out)
+        self.assertNotIn("kite-schedule-acme-", out)
+
+        code, out, err = self._run_cli("--instance", "acme", "schedule", "list")
+        self.assertEqual(code, 0, err)
+        self.assertIn("kite-schedule-acme-", out)
+
+    def test_show_and_remove_are_fail_closed_across_instances(self) -> None:
+        self._bind()
+        code, out, err = self._create("--at", self._future_at())
+        self.assertEqual(code, 0, err)
+        name = next(
+            line for line in out.splitlines() if line.startswith("name: ")
+        ).split(": ", 1)[1]
+
+        code, _, err = self._run_cli("--instance", "acme", "schedule", "show", name)
+        self.assertEqual(code, 2)
+        self.assertIn("default instance", err)
+        code, _, err = self._run_cli("--instance", "acme", "schedule", "remove", name, "--yes")
+        self.assertEqual(code, 2)
+        # The owning (default) instance still sees the schedule.
+        code, out, err = self._run_cli("schedule", "show", name)
+        self.assertEqual(code, 0, err)
+        self.assertIn("OnCalendar", out)
+
+    def test_bare_hash_resolves_inside_the_named_namespace(self) -> None:
+        self._bind()
+        code, out, err = self._create_named("acme", "--at", self._future_at())
+        self.assertEqual(code, 0, err)
+        name = next(
+            line for line in out.splitlines() if line.startswith("name: ")
+        ).split(": ", 1)[1]
+        digest = name.rsplit("-", 1)[1]
+        code, out, err = self._run_cli("--instance", "acme", "schedule", "show", digest)
+        self.assertEqual(code, 0, err)
+        self.assertIn("OnCalendar", out)
+
+
 if __name__ == "__main__":
     unittest.main()

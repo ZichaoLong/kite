@@ -64,8 +64,8 @@ KITE follows suit:
 
 | Risk | Handling |
 | --- | --- |
-| Cross-process session tearing (TUI/`kimi web` concurrently writing the same session while kap is live) | Single-instance deployment premise + the "bare kimi is out of contract" clause (see `process-shape-and-language.md`); MVP does not implement a loaded gate |
-| Multi-instance (multiple Feishu apps) demand appears | Phase 3 candidate; when that happens, first fill in the cross-instance contract (a loaded-gate equivalent), then open up multi-instance |
+| Cross-process session tearing (TUI/`kimi web` concurrently writing the same session while kap is live) | Single-writer premise, now per-instance: each instance's kap home is isolated (see `docs/decisions/multi-instance.md`), and the "bare kimi is out of contract" clause still applies (see `process-shape-and-language.md`); no loaded gate |
+| Multi-instance (multiple Feishu apps) | Decided 2026-07-26 (`docs/decisions/multi-instance.md`): named instances are fully isolated (config/data/kap home/daemon lease), so this document's semantics hold per-instance; cross-instance coordination remains out of scope |
 | Queue blocked by a long prompt, poor UX | Cards explicitly show queue depth; `/abort` (initiator/admin) provides an exit; no automatic timeout cancellation |
 | Prompt ownership lost across restarts | Best-effort rebuild via `GET .../prompts` + snapshot; approval cards that cannot be rebuilt expire explicitly (fail-closed; see mvp-scope §4.6) |
 | Under loopback, `POST /api/v1/shutdown` is open to any token holder | KITE only allows invocation via the service stop path; the managed shape is responsible for relaunching after an unexpected shutdown |
@@ -75,6 +75,7 @@ KITE follows suit:
 Reopen this document when any of the following signals appears:
 
 1. Real users report "someone else is messing with my session" problems;
-2. Multi-instance demand enters the roadmap;
+2. Cross-instance coordination (instances sharing sessions/state) enters the
+   roadmap;
 3. Upstream introduces ownership/lock primitives (prefer upstream's then; do
    not build our own).

@@ -1,11 +1,12 @@
 """OS timer backends for `kitectl schedule` (docs/contracts/scheduled-prompts.md).
 
 A scheduled prompt is deliberately NOT a daemon subsystem: the schedule lives
-only in OS-level timer definitions named `kite-schedule-<hash>`, which fire
-`<kitectl> prompt send --chat <id> --text <text> --display <mode>` back into
-the daemon through the loopback control plane, so the fired prompt rides the
-normal submit path (ownership recorded to the bound chat, modes carried from
-the binding).
+only in OS-level timer definitions named `kite-schedule-<hash>` (default
+instance) or `kite-schedule-<instance>-<hash>` (named instance), which fire
+`<kitectl> [--instance <name>] prompt send --chat <id> --text <text>
+--display <mode>` back into the daemon through the loopback control plane,
+so the fired prompt rides the normal submit path (ownership recorded to the
+bound chat, modes carried from the binding).
 
 Platform boundary (contract §2): dispatch mirrors kite.service_manager —
 Linux `systemd --user` timers, macOS launchd (`StartCalendarInterval`),
@@ -16,7 +17,9 @@ schedule's semantics are never silently degraded).
 
 The unit name hash comes from chat + schedule + text, so re-creating the same
 scheduled prompt replaces the same timer definition instead of accumulating
-(stable identity, contract §3).
+(stable identity, contract §3). The instance segment namespaces the shared
+OS timer store per instance (contract §3.1): two instances can never
+collide, and list/show/remove are scoped to the current instance.
 """
 
 from __future__ import annotations
@@ -32,6 +35,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from kite.instance_layout import validate_instance_name
 from kite.platform_paths import (
     default_data_root,
     default_launch_agent_dir,
@@ -47,7 +51,13 @@ DISPLAY_MODES = ("silent", "announce")
 
 _HASH_LENGTH = 12
 _UNIT_SCALAR_FORBIDDEN = {"\x00", "\r", "\n"}
-_NAME_RE = re.compile(rf"^{UNIT_PREFIX}-[0-9a-f]{{{_HASH_LENGTH}}}$")
+_NAME_DEFAULT_RE = re.compile(rf"^{UNIT_PREFIX}-[0-9a-f]{{{_HASH_LENGTH}}}$")
+# The instance segment reuses the decision-§1 charset; the final dash +
+# 12-hex digest disambiguates it from the default form (a bare hash never
+# contains a dash, so the two shapes cannot overlap).
+_NAME_NAMED_RE = re.compile(
+    rf"^{UNIT_PREFIX}-[a-z0-9][a-z0-9._-]*-[0-9a-f]{{{_HASH_LENGTH}}}$"
+)
 
 _LAUNCHD_LABEL_PREFIX = "io.kite.schedule"
 _TASK_XML_NAMESPACE = "http://schemas.microsoft.com/windows/2004/02/mit/task"
@@ -135,6 +145,10 @@ class ScheduleSpec:
     display: str
     ctl_path: str
     plan: SchedulePlan | None = None
+    # The owning instance (None = the default instance). A named instance
+    # prefixes the unit name and adds `--instance <name>` to the fired
+    # command (contract §3.1).
+    instance: str | None = None
 
     @property
     def timer_unit_name(self) -> str:
@@ -170,13 +184,40 @@ class ScheduleUnitFiles:
 # ---------------------------------------------------------------------------
 
 
-def schedule_name(chat_id: str, on_calendar: str, text: str) -> str:
+def schedule_name(
+    chat_id: str, on_calendar: str, text: str, *, instance: str | None = None
+) -> str:
     """Stable identity (contract §3): chat + schedule + text → one hash, so
-    re-creating the same scheduled prompt rewrites the same unit pair."""
+    re-creating the same scheduled prompt rewrites the same unit pair.
+
+    The hash itself stays instance-independent; a named instance namespaces
+    the unit name as `kite-schedule-<instance>-<hash>` (contract §3.1), so
+    two instances can never collide in the shared OS timer store.
+    """
     digest = hashlib.sha256(
         "\n".join([chat_id, on_calendar, text]).encode("utf-8")
     ).hexdigest()
-    return f"{UNIT_PREFIX}-{digest[:_HASH_LENGTH]}"
+    if instance is None:
+        return f"{UNIT_PREFIX}-{digest[:_HASH_LENGTH]}"
+    return f"{UNIT_PREFIX}-{validate_instance_name(instance)}-{digest[:_HASH_LENGTH]}"
+
+
+def parse_schedule_name(name: str) -> tuple[str | None, str] | None:
+    """Split a full unit base name into (instance, hash); None when the shape
+    is not a KITE schedule name at all. The default instance's names carry
+    no instance segment.
+    """
+    value = str(name or "").strip()
+    if _NAME_DEFAULT_RE.fullmatch(value):
+        return None, _name_hash(value)
+    if not _NAME_NAMED_RE.fullmatch(value):
+        return None
+    instance_part, _, digest = value[len(UNIT_PREFIX) + 1 :].rpartition("-")
+    try:
+        instance = validate_instance_name(instance_part)
+    except ValueError:
+        return None
+    return instance, digest
 
 
 def timer_unit_path(name: str) -> pathlib.Path:
@@ -188,8 +229,8 @@ def service_unit_path(name: str) -> pathlib.Path:
 
 
 def normalize_name(raw: str) -> str:
-    """Accept `kite-schedule-<hash>`, the bare hash, or either with a unit
-    suffix; anything else is rejected (fail-closed)."""
+    """Accept a full unit name (either instance shape), the bare hash, or
+    either with a unit suffix; anything else is rejected (fail-closed)."""
     value = str(raw or "").strip()
     for suffix in (".timer", ".service", ".plist", ".xml"):
         if value.endswith(suffix):
@@ -198,11 +239,41 @@ def normalize_name(raw: str) -> str:
         value = f"{UNIT_PREFIX}-{value[len(_LAUNCHD_LABEL_PREFIX) + 1:]}"
     if not value.startswith(f"{UNIT_PREFIX}-"):
         value = f"{UNIT_PREFIX}-{value}"
-    if not _NAME_RE.fullmatch(value):
+    if parse_schedule_name(value) is None:
         raise ScheduleError(
             f"invalid schedule name: {raw!r} (expected {UNIT_PREFIX}-<hash>)"
         )
     return value
+
+
+def scoped_schedule_name(raw: str, instance: str | None) -> str:
+    """normalize_name scoped to one instance's namespace (contract §3.1).
+
+    A bare hash expands into the instance's prefixed name (the default
+    instance keeps the plain `kite-schedule-<hash>` form); a full name that
+    belongs to a different instance is rejected fail-closed, so
+    show/remove/run-now can never cross instances.
+    """
+    value = str(raw or "").strip()
+    if (
+        instance is not None
+        and value
+        and not value.startswith((f"{UNIT_PREFIX}-", f"{_LAUNCHD_LABEL_PREFIX}."))
+    ):
+        value = f"{instance}-{value}"
+    base = normalize_name(value)
+    parsed = parse_schedule_name(base)
+    if parsed is None:  # normalize_name already raised; defensive
+        raise ScheduleError(f"invalid schedule name: {raw!r}")
+    name_instance, _digest = parsed
+    if name_instance != instance:
+        owner = (
+            f"instance '{name_instance}'"
+            if name_instance is not None
+            else "the default instance"
+        )
+        raise ScheduleError(f"no schedule named {base} for this instance (it belongs to {owner})")
+    return base
 
 
 def _name_hash(name: str) -> str:
@@ -452,13 +523,18 @@ def build_schedule_spec(
     plan: SchedulePlan,
     display: str,
     ctl_path: str,
+    instance: str | None = None,
 ) -> ScheduleSpec:
     """Validate every input and derive the stable name — before the first
     write on any backend (fail-closed, contract §3)."""
+    instance_name = (
+        validate_instance_name(instance) if instance and str(instance).strip() else None
+    )
     name = schedule_name(
         _unit_scalar(chat_id, "chat_id"),
         _unit_scalar(plan.on_calendar, "on_calendar"),
         _unit_scalar(text, "text"),
+        instance=instance_name,
     )
     if display not in DISPLAY_MODES:
         raise ScheduleError(f"display must be one of {list(DISPLAY_MODES)}")
@@ -471,6 +547,7 @@ def build_schedule_spec(
         display=display,
         ctl_path=_unit_scalar(ctl_path, "ctl_path"),
         plan=plan,
+        instance=instance_name,
     )
 
 
@@ -496,23 +573,35 @@ def _quote_unit_arg(arg: str) -> str:
     return f'"{escaped}"'
 
 
+def _prompt_send_args(spec: ScheduleSpec) -> list[str]:
+    """The fired command's argv after the kitectl binary (contract §3.1).
+
+    `--instance` is a GLOBAL kitectl flag: argparse only accepts it before
+    the subcommand, so it leads the argv when the schedule belongs to a
+    named instance (the default instance omits it, today's behavior).
+    """
+    args: list[str] = []
+    if spec.instance is not None:
+        args += ["--instance", _unit_scalar(spec.instance, "instance")]
+    args += [
+        "prompt",
+        "send",
+        "--chat",
+        _unit_scalar(spec.chat_id, "chat_id"),
+        "--text",
+        _unit_scalar(spec.text, "text"),
+        "--display",
+        _unit_scalar(spec.display, "display"),
+    ]
+    return args
+
+
 def render_service_unit(spec: ScheduleSpec) -> str:
     description = _unit_scalar(
         f"KITE scheduled prompt (chat {spec.chat_id})", "description"
     ).replace("%", "%%")
     exec_start = " ".join(
-        _quote_unit_arg(part)
-        for part in [
-            spec.ctl_path,
-            "prompt",
-            "send",
-            "--chat",
-            _unit_scalar(spec.chat_id, "chat_id"),
-            "--text",
-            _unit_scalar(spec.text, "text"),
-            "--display",
-            _unit_scalar(spec.display, "display"),
-        ]
+        _quote_unit_arg(part) for part in [spec.ctl_path, *_prompt_send_args(spec)]
     )
     return "\n".join(
         [
@@ -618,14 +707,7 @@ def render_launchd_plist(spec: ScheduleSpec) -> bytes:
         # plist arrays carry each argument verbatim — no shell quoting layer.
         "ProgramArguments": [
             _unit_scalar(spec.ctl_path, "ctl_path"),
-            "prompt",
-            "send",
-            "--chat",
-            _unit_scalar(spec.chat_id, "chat_id"),
-            "--text",
-            _unit_scalar(spec.text, "text"),
-            "--display",
-            _unit_scalar(spec.display, "display"),
+            *_prompt_send_args(spec),
         ],
         "StartCalendarInterval": launchd_start_calendar_interval(plan),
         "RunAtLoad": False,
@@ -831,17 +913,7 @@ def render_task_xml(spec: ScheduleSpec, *, now: datetime | None = None) -> bytes
     exec_action = ET.SubElement(actions, tag("Exec"))
     ET.SubElement(exec_action, tag("Command")).text = _unit_scalar(spec.ctl_path, "ctl_path")
     ET.SubElement(exec_action, tag("Arguments")).text = " ".join(
-        _quote_windows_arg(part)
-        for part in [
-            "prompt",
-            "send",
-            "--chat",
-            _unit_scalar(spec.chat_id, "chat_id"),
-            "--text",
-            _unit_scalar(spec.text, "text"),
-            "--display",
-            _unit_scalar(spec.display, "display"),
-        ]
+        _quote_windows_arg(part) for part in _prompt_send_args(spec)
     )
     return ET.tostring(task, encoding="utf-16", xml_declaration=True)
 
@@ -1043,7 +1115,7 @@ class LaunchdScheduleBackend(ScheduleBackend):
         for plist_path in sorted(agent_dir.glob(f"{_LAUNCHD_LABEL_PREFIX}.*.plist")):
             digest = plist_path.name[len(_LAUNCHD_LABEL_PREFIX) + 1 : -len(".plist")]
             base = f"{UNIT_PREFIX}-{digest}"
-            if not _NAME_RE.fullmatch(base):
+            if parse_schedule_name(base) is None:
                 continue
             on_calendar = "-"
             try:
@@ -1122,7 +1194,7 @@ class TaskSchedulerScheduleBackend(ScheduleBackend):
         registry = schedule_data_dir()
         for xml_path in sorted(registry.glob(f"{UNIT_PREFIX}-*.xml")):
             base = xml_path.name[: -len(".xml")]
-            if not _NAME_RE.fullmatch(base):
+            if parse_schedule_name(base) is None:
                 continue
             on_calendar = "-"
             try:
@@ -1201,6 +1273,7 @@ def create_schedule(
     recurring: bool,
     display: str,
     ctl_path: str,
+    instance: str | None = None,
 ) -> ScheduleSpec:
     """Write the unit pair and enable the timer (systemd owns firing; the
     service is never started manually for the future time, contract §3).
@@ -1211,6 +1284,7 @@ def create_schedule(
         plan=SchedulePlan(on_calendar=str(on_calendar), recurring=bool(recurring)),
         display=display,
         ctl_path=ctl_path,
+        instance=instance,
     )
     SystemdScheduleBackend().install(spec)
     return spec

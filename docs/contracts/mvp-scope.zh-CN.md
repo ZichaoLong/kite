@@ -149,9 +149,12 @@
    btw agent 的事件走轻量路径：不创建/接管执行卡，不污染主卡流式文本,
    其答复在 `turn.ended` 时以纯文本（自 volatile 流累积）发给发起
    chat。错误帧只作用于本 agent;work state 只跟踪主 agent。归属记到
-   本 chat，审批路由不变。不排队、不打断主 turn。
+   本 chat，审批路由不变。不排队、不打断主 turn。本刀边界：btw prompt
+   不支持 `/abort`；重启后 btw agent 按需重建，旧 agent 交由上游卫生
+   机制处理（2026-07-27 登记）。
 14. `/goal` 重接线（2026-07-27，复审 N2-HIGH-1):prompt 提交路由解析但
    静默丢弃 `goal_*` 字段——上游真实 goal 路径为
    `POST .../profile {agent_config.goal_objective|goal_control}` 与
    `GET .../goal`。`/goal` 改用这些路由，本地不再持久化（binding store
    的 `goal_objective` 字段与 per-prompt 携带模型已移除）。
+15. `/archive` 在有 active prompt 时拒绝（与 /switch 同理由）(2026-07-27)。

@@ -27,10 +27,12 @@ from kite.platform_paths import default_config_root, default_data_root
 DEFAULT_INSTANCE_NAME = "default"
 INSTANCES_SEGMENT = "instances"
 KAP_HOME_DIR_NAME = "kap-home"
+# FOCUS parity: instance names are capped at 64 characters.
+MAX_INSTANCE_NAME_LENGTH = 64
 
-# Decision §1: a name is [a-z0-9][a-z0-9._-]*; `default` (the default
-# instance is spelled None, never named), `instances` (the layout segment)
-# and `..` are reserved; anything else fails closed.
+# Decision §1: a name is [a-z0-9][a-z0-9._-]* (≤ 64 chars); `default` (the
+# default instance is spelled None, never named), `instances` (the layout
+# segment) and `..` are reserved; anything else fails closed.
 _INSTANCE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 _RESERVED_NAMES = frozenset({DEFAULT_INSTANCE_NAME, INSTANCES_SEGMENT})
 
@@ -40,6 +42,11 @@ def validate_instance_name(name: str) -> str:
     normalized = str(name or "").strip()
     if not normalized:
         raise ValueError("instance name must not be empty")
+    if len(normalized) > MAX_INSTANCE_NAME_LENGTH:
+        raise ValueError(
+            f"instance name must be at most {MAX_INSTANCE_NAME_LENGTH} "
+            f"characters (got {len(normalized)})"
+        )
     if normalized in _RESERVED_NAMES:
         raise ValueError(f"instance name is reserved: {normalized!r}")
     if normalized == ".." or not _INSTANCE_NAME_RE.match(normalized):

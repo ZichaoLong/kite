@@ -6,9 +6,11 @@ Multi-instance (docs/decisions/multi-instance.md §3): the global
 instance living under `<root>/instances/<name>/`; without either, the single
 running instance wins when exactly one is live (per-instance
 control_plane.json discovery, stale pids filtered; ambiguity exits 2 with
-the candidate list), otherwise the default instance. `service` commands
-resolve explicit-or-default only. Explicit --config-dir/--data-dir always
-win over the instance layout.
+the candidate list), otherwise the default instance. `service` commands,
+`completion` (instance-agnostic), and any invocation with explicit
+--config-dir/--data-dir (or KITE_CONFIG_DIR/KITE_DATA_ROOT set) skip the
+single-running rung. Explicit --config-dir/--data-dir always win over the
+instance layout.
 
 Implemented slice (docs/contracts/mvp-scope.md §2 kitectl row, §6):
   - `kitectl config show`     — the effective config with secrets redacted
@@ -52,6 +54,10 @@ Implemented slice (docs/contracts/mvp-scope.md §2 kitectl row, §6):
                                 Validation is fail-closed before anything is
                                 written (past --at, unparseable --cron,
                                 unknown chat); remove requires --yes.
+                                Schedules are namespaced per instance: a named
+                                instance's units are `kite-schedule-<instance>-<hash>`
+                                and fire with `--instance <name>`; list/show/
+                                remove only see the current instance.
   - `kitectl completion <shell>`
                               — the static bash/zsh/fish completion script
                                 (kite/shell_completion.py), meant for
@@ -689,6 +695,26 @@ def _schedule_error(exc: Exception) -> NoReturn:
     _die(str(exc))
 
 
+def _schedule_instance() -> str | None:
+    """The instance the schedule commands operate on (None = the default).
+
+    `_apply_instance_environment` has already published the resolved name in
+    KITE_INSTANCE (explicit flag/env, or the single-running rung). Schedules
+    are namespaced per instance (contract §3.1, audit N1-MED-2): the unit
+    name carries the instance, the fired command carries `--instance`, and
+    list/show/remove only see the current instance's schedules.
+    """
+    return instance_resolution.explicit_instance_name()
+
+
+def _scoped_schedule_name(raw: str) -> str:
+    """Resolve a user-given schedule name inside the current instance."""
+    try:
+        return schedule_units.scoped_schedule_name(raw, _schedule_instance())
+    except schedule_units.ScheduleError as exc:
+        _die(str(exc))
+
+
 def _cmd_schedule_create(args: argparse.Namespace) -> int:
     backend = _schedule_backend()
     text = str(args.text or "").strip()
@@ -712,11 +738,13 @@ def _cmd_schedule_create(args: argparse.Namespace) -> int:
             plan=plan,
             display=args.display,
             ctl_path=ctl_path,
+            instance=_schedule_instance(),
         )
         artifacts = backend.install(spec)
     except (schedule_units.ScheduleError, schedule_units.ScheduleBackendError) as exc:
         _schedule_error(exc)
     print(f"name: {spec.name}")
+    print(f"instance: {spec.instance or instance_layout.DEFAULT_INSTANCE_NAME}")
     print(f"chat_id: {spec.chat_id}")
     print(f"on_calendar: {spec.on_calendar}")
     print(f"display: {spec.display}")
@@ -739,10 +767,19 @@ def _cmd_schedule_create(args: argparse.Namespace) -> int:
 
 def _cmd_schedule_list(_args: argparse.Namespace) -> int:
     backend = _schedule_backend()
+    instance = _schedule_instance()
     try:
         entries = backend.list()
     except (schedule_units.ScheduleError, schedule_units.ScheduleBackendError) as exc:
         _schedule_error(exc)
+    # The OS timer store is shared across instances; only the current
+    # instance's namespace is visible here (contract §3.1).
+    entries = [
+        entry
+        for entry in entries
+        if (parsed := schedule_units.parse_schedule_name(entry.name)) is not None
+        and parsed[0] == instance
+    ]
     if not entries:
         print("(no schedules)")
         return 0
@@ -754,7 +791,7 @@ def _cmd_schedule_list(_args: argparse.Namespace) -> int:
 def _cmd_schedule_show(args: argparse.Namespace) -> int:
     backend = _schedule_backend()
     try:
-        files = backend.show(args.name)
+        files = backend.show(_scoped_schedule_name(args.name))
     except schedule_units.ScheduleError as exc:
         _schedule_error(exc)
     for path, text in files:
@@ -765,8 +802,9 @@ def _cmd_schedule_show(args: argparse.Namespace) -> int:
 
 def _cmd_schedule_remove(args: argparse.Namespace) -> int:
     backend = _schedule_backend()
+    base = _scoped_schedule_name(args.name)
     try:
-        base = backend.resolve_name(args.name)
+        base = backend.resolve_name(base)
     except schedule_units.ScheduleError as exc:
         _schedule_error(exc)
     if not args.yes:
@@ -782,7 +820,7 @@ def _cmd_schedule_remove(args: argparse.Namespace) -> int:
 def _cmd_schedule_run_now(args: argparse.Namespace) -> int:
     backend = _schedule_backend()
     try:
-        base = backend.run_now(args.name)
+        base = backend.run_now(_scoped_schedule_name(args.name))
     except (schedule_units.ScheduleError, schedule_units.ScheduleBackendError) as exc:
         _schedule_error(exc)
     print(f"schedule '{base}' started")
@@ -893,8 +931,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "--instance",
         metavar="NAME",
         help="target instance (default: KITE_INSTANCE, then the single "
-        "running instance, then the default instance; `service` commands "
-        "skip the single-running rung)",
+        "running instance, then the default instance; the single-running "
+        "rung is skipped for `service`/`completion` and whenever explicit "
+        "--config-dir/--data-dir or their env vars are set)",
     )
     parser.add_argument(
         "--config-dir",
@@ -1096,12 +1135,20 @@ def _build_parser() -> argparse.ArgumentParser:
     show_parser = schedule_sub.add_parser(
         "show", help="print the stored timer definition(s) of one schedule"
     )
-    show_parser.add_argument("name", help="schedule name (kite-schedule-<hash> or the hash)")
+    show_parser.add_argument(
+        "name",
+        help="schedule name (kite-schedule-[<instance>-]<hash> or the bare hash; "
+        "resolved inside the current instance)",
+    )
     show_parser.set_defaults(func=_cmd_schedule_show)
     remove_parser = schedule_sub.add_parser(
         "remove", help="disable + delete a schedule"
     )
-    remove_parser.add_argument("name", help="schedule name (kite-schedule-<hash> or the hash)")
+    remove_parser.add_argument(
+        "name",
+        help="schedule name (kite-schedule-[<instance>-]<hash> or the bare hash; "
+        "resolved inside the current instance)",
+    )
     remove_parser.add_argument(
         "--yes",
         action="store_true",
@@ -1111,7 +1158,11 @@ def _build_parser() -> argparse.ArgumentParser:
     run_now_parser = schedule_sub.add_parser(
         "run-now", help="fire a schedule once immediately"
     )
-    run_now_parser.add_argument("name", help="schedule name (kite-schedule-<hash> or the hash)")
+    run_now_parser.add_argument(
+        "name",
+        help="schedule name (kite-schedule-[<instance>-]<hash> or the bare hash; "
+        "resolved inside the current instance)",
+    )
     run_now_parser.set_defaults(func=_cmd_schedule_run_now)
 
     completion_parser = subparsers.add_parser(
@@ -1132,16 +1183,35 @@ def _apply_instance_environment(args: argparse.Namespace) -> None:
     """Resolve the target instance and publish its directories via env.
 
     Resolution ladder (docs/decisions/multi-instance.md §3): --instance >
-    KITE_INSTANCE > the single running instance (skipped for `service`
-    commands) > the default instance. Explicit directories win over the
-    instance layout per axis: --config-dir/--data-dir (or pre-set
-    KITE_CONFIG_DIR / KITE_DATA_ROOT) are never overwritten by the layout.
-    Downstream code keeps reading kite_config.config_dir() /
-    default_data_root(), which now point at the resolved instance.
+    KITE_INSTANCE > the single running instance > the default instance. The
+    single-running rung is skipped when it cannot be meant:
+    - `service` commands (explicit-or-default only, no convenience for
+      destructive ops),
+    - instance-agnostic commands (`completion` prints a static script; an
+      ambiguity error there would be pure collateral, audit N1),
+    - any explicit directory axis (--config-dir/--data-dir or pre-set
+      KITE_CONFIG_DIR/KITE_DATA_ROOT): the user already said WHICH
+      directories; resolving a running instance would mix its name (kap
+      home, unit name) with the explicit dirs (audit N1).
+
+    Explicit directories win over the instance layout per axis:
+    --config-dir/--data-dir (or pre-set KITE_CONFIG_DIR / KITE_DATA_ROOT)
+    are never overwritten by the layout. Downstream code keeps reading
+    kite_config.config_dir() / default_data_root(), which now point at the
+    resolved instance.
     """
+    explicit_dirs = bool(
+        args.config_dir
+        or args.data_dir
+        or os.environ.get("KITE_CONFIG_DIR", "").strip()
+        or os.environ.get("KITE_DATA_ROOT", "").strip()
+    )
+    allow_single_running = (
+        args.command not in ("service", "completion") and not explicit_dirs
+    )
     instance_name = instance_resolution.resolve_instance_name(
         args.instance,
-        allow_single_running=args.command != "service",
+        allow_single_running=allow_single_running,
     )
     if instance_name is None:
         paths = None

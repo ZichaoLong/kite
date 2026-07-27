@@ -1083,6 +1083,66 @@ class BindingCommandTests(AppHandlerTestCase):
         assert binding is not None
         self.assertTrue(binding["attached"])
 
+    def test_switch_same_session_shortcut_denied_when_session_shared(self) -> None:
+        # Audit R-2 path C: G (all-mode group) /detach -> another chat binds
+        # the session (detached does not count as sharing, by design) ->
+        # G /switch S. The detached->re-attach shortcut must run the same
+        # probes as /attach; flipping attached back on would silently share
+        # the session between the all-mode group and the other chat.
+        self.bind("s-1", attached=False, chat_id="oc_group")
+        self.group_config_store.activate("oc_group", activated_by=ADMIN_OPEN_ID)
+        self.group_config_store.set_mode("oc_group", "all")
+        self.bind("s-1")  # another attached chat bound the session meanwhile
+
+        self.send("/switch s-1", chat_id="oc_group")
+
+        text = self.transport.last_text()
+        self.assertIn("all 模式", text)
+        self.assertIn("被拒绝", text)
+        binding = self.store.load("oc_group")
+        assert binding is not None
+        self.assertFalse(binding["attached"])
+
+    def test_switch_same_session_shortcut_denied_when_occupied(self) -> None:
+        # Audit R-2, reverse direction (§3.8): while this chat was detached,
+        # an all-mode group bound the session — re-switching must not
+        # silently join the occupied session.
+        self.bind("s-1", attached=False)
+        self.bind("s-1", chat_id="oc_group")
+        self.group_config_store.activate("oc_group", activated_by=ADMIN_OPEN_ID)
+        self.group_config_store.set_mode("oc_group", "all")
+
+        self.send("/switch s-1")
+
+        text = self.transport.last_text()
+        self.assertIn("独占", text)
+        self.assertIn("被拒绝", text)
+        binding = self.store.load(CHAT_ID)
+        assert binding is not None
+        self.assertFalse(binding["attached"])
+
+    def test_switch_card_button_same_session_shortcut_runs_probes(self) -> None:
+        # Audit R-2: the /sessions card button reaches the same shortcut —
+        # same denial (error toast), and the binding stays detached.
+        self.bind("s-1", attached=False, chat_id="oc_group")
+        self.group_config_store.activate("oc_group", activated_by=ADMIN_OPEN_ID)
+        self.group_config_store.set_mode("oc_group", "all")
+        self.bind("s-1")  # another attached chat bound the session meanwhile
+
+        response = self.handler.on_card_action(
+            make_card_action(
+                {"action": ACTION_SESSION_SWITCH, "session_id": "s-1"},
+                chat_id="oc_group",
+            )
+        )
+
+        self.assertEqual(response.toast_type, "error")
+        assert response.toast is not None
+        self.assertIn("被拒绝", response.toast)
+        binding = self.store.load("oc_group")
+        assert binding is not None
+        self.assertFalse(binding["attached"])
+
     def test_switch_denied_while_prompt_active(self) -> None:
         # mvp-scope aligned item 11 (audit M9): same denial as /new —
         # rebinding would strand the in-flight prompt's execution card,
@@ -1556,6 +1616,36 @@ class SessionLifecycleCommandTests(AppHandlerTestCase):
         self.send("/archive")
         self.assertIn("归档失败：session is busy", self.transport.last_text())
 
+    def test_archive_denied_while_prompt_active(self) -> None:
+        # Audit N2-MED-1 (mvp-scope aligned item 15): same check_new denial
+        # as /switch (aligned item 11) — upstream archive drains agents and
+        # cancels every pending turn, so the in-flight prompt's execution
+        # card, terminal result and approval routing would lose visibility.
+        self.bind("s-1")
+        self.rest.add_session("s-1")
+        self.rest.set_prompts("s-1", active="p-1")
+        self.send("/archive")
+        self.assertIn("请先 /abort 或等待完成", self.transport.last_text())
+        self.assertEqual(self.rest.session_actions, [])
+
+    def test_archive_preflight_unverifiable_is_fail_closed(self) -> None:
+        self.bind("s-1")
+        self.rest.add_session("s-1")
+        self.rest.prompts_error = KapTransportError("down")
+        self.send("/archive")
+        self.assertIn("无法连接 kap-server", self.transport.last_text())
+        self.assertEqual(self.rest.session_actions, [])
+
+    def test_archive_allowed_with_queued_only(self) -> None:
+        # Same check_new semantics as /switch: a queued-but-not-active
+        # prompt does not block (audit M9: queued 放行).
+        self.bind("s-1")
+        self.rest.add_session("s-1")
+        self.rest.set_prompts("s-1", queued=("p-2",))
+        self.send("/archive")
+        self.assertEqual(self.rest.session_actions, [("s-1", "archive", None)])
+        self.assertIn("已归档", self.transport.last_text())
+
     def test_restore_upstream_error_shows_msg(self) -> None:
         self.bind("s-1")
         self.rest.add_session("s-1", archived=True)
@@ -1586,6 +1676,17 @@ class StatusTests(AppHandlerTestCase):
         self.assertIn("approval", reply)
         self.assertIn("1 条执行中", reply)
         self.assertIn("排队 2 条", reply)
+
+    def test_status_idle_session_never_shows_raw_none(self) -> None:
+        # Audit R-1: the upstream wire enum is the STRING 'none' on an idle
+        # session; the fourth parse point (KapSessionOps._parse_session) must
+        # normalize it like the adapter's three, or /status leaks "待处理交互:none".
+        self.bind("s-1")
+        self.rest.add_session("s-1", title="Alpha", pending_interaction="none")
+        self.send("/status")
+        reply = self.transport.last_text()
+        self.assertIn("待处理交互：无", reply)
+        self.assertNotIn("none", reply)
 
     def test_status_without_binding_shows_hint(self) -> None:
         self.send("/status")

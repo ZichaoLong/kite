@@ -17,8 +17,6 @@
 - Memory, voice ASR, device control, text-to-image, MCP/Skills hot reload —
   permanent non-goals.
 - Session deletion (upstream has no such capability; do not work around it).
-- Multi-instance / cross-instance coordination (MVP assumes a single instance; see
-  `docs/decisions/concurrency-model.md`).
 
 ## 2. Process Shape
 
