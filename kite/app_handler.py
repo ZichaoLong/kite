@@ -186,6 +186,9 @@ _NOT_BOUND_TEXT = (
     "尚未绑定会话。直接发送文字即可自动创建并绑定会话；"
     "或发送 /sessions 查看已有会话后用 /switch 〈id〉 切换。"
 )
+_DETACHED_DENIED_TEXT = (
+    "当前会话已暂停推送（/detach 状态），消息未提交。发送 /attach 恢复后再继续。"
+)
 _NON_ADMIN_TEXT = "抱歉，KITE 目前仅对管理员开放。发送 /help 查看说明。"
 _GROUP_NOT_ACTIVATED_MEMBER_TEXT = "本群尚未激活，@我 发送的消息不会被处理。请联系管理员发送 /group activate 激活。"
 _GROUP_NOT_ACTIVATED_ADMIN_TEXT = "本群尚未激活，@我 发送的消息不会被处理。发送 /group activate 激活后，群成员即可 @我 使用。"
@@ -470,6 +473,7 @@ class AppHandler(TransportHandler):
         prompt_model: str | None = None,
         prompt_ownership: Optional[PromptOwnership] = None,
         on_session_bound: Optional[Callable[[str], None]] = None,
+        on_btw_prompt_submitted: Optional[Callable[[str, str, str], None]] = None,
         persist_admins: Optional[Callable[[set[str]], None]] = None,
         terminal_store: Any = None,
         names: Optional[IdentityNames] = None,
@@ -527,6 +531,10 @@ class AppHandler(TransportHandler):
         # Side-channel agent per session for /btw (in-memory; a restart just
         # starts a fresh one — mvp-scope aligned item 13).
         self._btw_agents: dict[str, str] = {}
+        # Outbound seam (wired by OutboundAppHandler): a successful /btw
+        # submit is reported as (session_id, agent_id, prompt_id) so the
+        # pipeline can FIFO-attribute the side turn's events to its chat.
+        self._on_btw_prompt_submitted = on_btw_prompt_submitted
         self._commands: dict[str, Callable[[InboundMessage, str], None]] = {
             "/new": self._cmd_new,
             "/sessions": self._cmd_sessions,
@@ -1202,37 +1210,15 @@ class AppHandler(TransportHandler):
         if not binding["attached"]:
             # A detached chat must not silently run invisible work: refuse
             # with a pointer to /attach (fail-closed).
-            self._reply_to(
-                message,
-                "当前会话已暂停推送（/detach 状态），消息未提交。发送 /attach 恢复后再继续。",
-            )
+            self._reply_to(message, _DETACHED_DENIED_TEXT)
             return None
         session_id = binding["session_id"]
         # Pre-flight: an archived (or vanished) session errors and points to
         # /sessions; KITE never auto-recreates one (mvp-scope §4.7). Upstream
         # resume() would quietly resurrect an archived session, so the check
         # must happen here, before submit.
-        try:
-            info = self._ops.get_session(session_id)
-        except KapTransportError:
-            self._reply_to(message, _KAP_UNREACHABLE_TEXT)
-            return None
-        except KapError as exc:
-            if exc.code == KAP_ERROR_SESSION_NOT_FOUND:
-                self._reply_to(
-                    message,
-                    f"绑定的会话 `{session_id}` 在 kap-server 上已不存在。"
-                    "发送 /sessions 查看可用会话并切换；KITE 不会自动新建会话。",
-                )
-            else:
-                self._reply_to(message, f"查询会话状态失败：{exc.msg}")
-            return None
-        if info.archived:
-            self._reply_to(
-                message,
-                f"绑定的会话 `{session_id}` 已被归档。"
-                "发送 /sessions 查看可用会话并切换；KITE 不会自动新建会话。",
-            )
+        info = self._preflight_session_for_submit(message, session_id)
+        if info is None:
             return None
         # Pending staged images are consumed by this prompt (images contract
         # §2.3): an expired/missing/stale-cwd record blocks the prompt
@@ -1306,6 +1292,38 @@ class AppHandler(TransportHandler):
         else:
             self._reply_to(message, f"{prefix}已提交，正在执行。{suffix}")
         return result
+
+    def _preflight_session_for_submit(
+        self, message: InboundMessage, session_id: str
+    ) -> Optional[SessionSummary]:
+        """The §4.7 preflight shared by the prompt path and /btw: an archived
+        (or vanished) session errors and points to /sessions; KITE never
+        auto-recreates one (upstream ``resume()`` would quietly resurrect an
+        archived session, so the check must happen before any submit).
+        Returns the session summary, or None after replying."""
+        try:
+            info = self._ops.get_session(session_id)
+        except KapTransportError:
+            self._reply_to(message, _KAP_UNREACHABLE_TEXT)
+            return None
+        except KapError as exc:
+            if exc.code == KAP_ERROR_SESSION_NOT_FOUND:
+                self._reply_to(
+                    message,
+                    f"绑定的会话 `{session_id}` 在 kap-server 上已不存在。"
+                    "发送 /sessions 查看可用会话并切换；KITE 不会自动新建会话。",
+                )
+            else:
+                self._reply_to(message, f"查询会话状态失败：{exc.msg}")
+            return None
+        if info.archived:
+            self._reply_to(
+                message,
+                f"绑定的会话 `{session_id}` 已被归档。"
+                "发送 /sessions 查看可用会话并切换；KITE 不会自动新建会话。",
+            )
+            return None
+        return info
 
     def _create_and_bind(self, chat_id: str, text: str) -> Optional[StoredBinding]:
         try:
@@ -2381,7 +2399,12 @@ class AppHandler(TransportHandler):
 
         The agent is started on demand and cached per session in memory
         (a restart simply starts a fresh one — mvp-scope aligned item 13).
-        No queue, no interrupt of the main turn.
+        No queue, no interrupt of the main turn. Same denial/preflight
+        discipline as the main prompt path: detached chats are refused
+        (N3-MED-4) and archived/vanished sessions error per §4.7 instead of
+        being silently resurrected (N3-MED-3); a dead cached agent
+        (agent.not_found → 40401 at submit, e.g. after a kap restart) is
+        cleared and started+submitted once more (N3-MED-2).
         """
         text = arg.strip()
         if not text:
@@ -2390,20 +2413,87 @@ class AppHandler(TransportHandler):
         binding = self._load_binding_or_reply(message)
         if binding is None:
             return
+        if not binding["attached"]:
+            # Same denial as the main prompt path (fail-closed: a detached
+            # chat must not run invisible work).
+            self._reply_to(message, _DETACHED_DENIED_TEXT)
+            return
         session_id = binding["session_id"]
+        # Same archived/vanished preflight as the main prompt path (§4.7).
+        if self._preflight_session_for_submit(message, session_id) is None:
+            return
         agent_id = self._btw_agents.get(session_id)
         if not agent_id:
-            try:
-                agent_id = self._ops.start_btw(session_id)
-            except KapTransportError:
-                self._reply_to(message, _KAP_UNREACHABLE_TEXT)
+            agent_id = self._start_btw_agent(message, session_id)
+            if agent_id is None:
                 return
-            except KapError as exc:
-                self._reply_to(message, f"启动旁路 agent 失败：{exc.msg}")
-                return
-            self._btw_agents[session_id] = agent_id
         try:
-            result = self._ops.submit_prompt(
+            result = self._submit_btw(message, session_id, binding, agent_id, text)
+        except KapError:
+            # agent.not_found (40401-class; the session itself just passed
+            # the preflight): the cached agent id is dead (a kap restart
+            # drops forked agents). Clear it and start+submit ONCE more
+            # (N3-MED-2); the session-gone race surfaces from the re-start.
+            self._btw_agents.pop(session_id, None)
+            agent_id = self._start_btw_agent(message, session_id)
+            if agent_id is None:
+                return
+            try:
+                result = self._submit_btw(message, session_id, binding, agent_id, text)
+            except KapError as exc:
+                self._reply_to(message, f"提交失败：{exc.msg}")
+                return
+        if result is None:
+            return
+        if result.status == "blocked":
+            self._reply_to(message, "提交被 kap-server 拒绝（blocked），该旁路 prompt 未执行。")
+            return
+        self._ownership.record(
+            result.prompt_id, message.chat_id, sender_open_id=message.sender_open_id
+        )
+        if self._on_btw_prompt_submitted is not None:
+            # On the loop, before the turn's events can be dispatched: the
+            # pipeline FIFO-attributes the side turn to this prompt.
+            self._on_btw_prompt_submitted(session_id, agent_id, result.prompt_id)
+        logger.info(
+            "btw submitted chat_id=%s session_id=%s prompt_id=%s agent=%s",
+            message.chat_id,
+            session_id,
+            result.prompt_id,
+            agent_id,
+        )
+        self._reply_to(message, "已发给旁路 agent（不打断当前执行）。")
+
+    def _start_btw_agent(self, message: InboundMessage, session_id: str) -> Optional[str]:
+        """Start (or re-start) the session's side-channel agent and cache it."""
+        try:
+            agent_id = self._ops.start_btw(session_id)
+        except KapTransportError:
+            self._reply_to(message, _KAP_UNREACHABLE_TEXT)
+            return None
+        except KapError as exc:
+            self._reply_to(message, f"启动旁路 agent 失败：{exc.msg}")
+            return None
+        self._btw_agents[session_id] = agent_id
+        return agent_id
+
+    def _submit_btw(
+        self,
+        message: InboundMessage,
+        session_id: str,
+        binding: StoredBinding,
+        agent_id: str,
+        text: str,
+    ) -> Optional[SubmitPromptResult]:
+        """One /btw submit attempt; None after replying the failure.
+
+        agent.not_found surfaces as KapError(40401) (upstream maps it onto
+        the SESSION_NOT_FOUND envelope, routes/prompts.ts sendMappedError) —
+        re-raised here so the caller can clear the dead cached agent and
+        retry start+submit once (N3-MED-2).
+        """
+        try:
+            return self._ops.submit_prompt(
                 session_id,
                 text,
                 permission_mode=binding["permission_mode"],
@@ -2413,24 +2503,12 @@ class AppHandler(TransportHandler):
             )
         except KapTransportError:
             self._reply_to(message, _KAP_UNREACHABLE_TEXT)
-            return
+            return None
         except KapError as exc:
+            if exc.code == KAP_ERROR_SESSION_NOT_FOUND:
+                raise
             self._reply_to(message, f"提交失败：{exc.msg}")
-            return
-        if result.status == "blocked":
-            self._reply_to(message, "提交被 kap-server 拒绝（blocked），该旁路 prompt 未执行。")
-            return
-        self._ownership.record(
-            result.prompt_id, message.chat_id, sender_open_id=message.sender_open_id
-        )
-        logger.info(
-            "btw submitted chat_id=%s session_id=%s prompt_id=%s agent=%s",
-            message.chat_id,
-            session_id,
-            result.prompt_id,
-            agent_id,
-        )
-        self._reply_to(message, "已发给旁路 agent（不打断当前执行）。")
+            return None
 
     def _cmd_abort(self, message: InboundMessage, arg: str) -> None:
         if arg.strip():

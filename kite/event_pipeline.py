@@ -61,6 +61,16 @@ Implements the outbound half of the MVP contract
   terminal card falls back to plain text once. Volatile text is
   enhancement, never evidence: with no deltas the durable path alone still
   produces correct cards.
+- agent routing (mvp-scope aligned item 13, audit N3-HIGH-1): every
+  normalized event carries the emitting ``agent_id``; events of the main
+  agent ("" / "main" / missing) take the card pipeline above, while a
+  `/btw` side-channel agent's events take a lightweight path — no
+  execution card is created or taken over, the main card's stream is never
+  touched, error frames end only the side turn's own tracking, and the
+  side answer accumulates from its own volatile deltas (keyed by
+  (session_id, agent_id)) and is delivered as a plain-text "旁路回复" to
+  the initiating chat on turn.ended (a completion note when the stream is
+  empty — never a hijack of the main prompt's terminal).
 
 Threading: every mutation runs on the RuntimeLoop. WS callbacks
 (``handle_event`` / ``handle_resync_required`` / ``handle_volatile``), timer
@@ -142,6 +152,13 @@ _TERMINAL_DELIVERED_CAP = 1024
 _LATEST_ASSISTANT_PAGE_SIZE = 20
 
 _KAP_UNREACHABLE_TOAST = "无法连接 kap-server，操作未完成，请稍后再试。"
+
+
+def _is_main_agent(agent_id: Optional[str]) -> bool:
+    """The main agent drives the card pipeline; any other id is a `/btw`
+    side-channel agent (mvp-scope aligned item 13). An empty/missing agent
+    id takes the main path (older frames, global events, defensive)."""
+    return agent_id in (None, "", "main")
 
 # Pending-approval click phases (interaction_request_controller discipline):
 # a click flips pending -> processing before the REST resolve so a second
@@ -363,6 +380,23 @@ class _PendingFeedback:
     operator_open_id: str
 
 
+@dataclass(slots=True)
+class _BtwTurnState:
+    """One side-channel (`/btw`) agent's in-flight turn (aligned item 13).
+
+    The lightweight path: no card, no main-stream patches — the answer
+    accumulates from the agent's own volatile deltas (offset-less upstream,
+    so in arrival order; the synthetic-offset append below can never gap)
+    and is delivered as plain text on turn.ended. ``prompt_id`` is the
+    FIFO-attributed /btw submission that owns the turn ("" when unknown,
+    e.g. submitted before a kited restart).
+    """
+
+    turn_id: int
+    prompt_id: str = ""
+    transcript: StreamingTranscript = field(default_factory=StreamingTranscript)
+
+
 class _InvalidReply(Exception):
     """The text looked like an interaction reply but did not parse."""
 
@@ -455,6 +489,11 @@ class EventPipeline:
         self._terminal_retry_timers: dict[tuple[str, str], TimerHandle] = {}
         # Volatile streaming transcripts, keyed by (session_id, prompt_id).
         self._transcripts: dict[tuple[str, str], StreamingTranscript] = {}
+        # Side-channel (/btw) tracking, both keyed by (session_id, agent_id):
+        # the in-flight side turn and the FIFO of /btw submissions awaiting
+        # turn attribution (fed by the AppHandler's note_btw_prompt seam).
+        self._btw_turns: dict[tuple[str, str], _BtwTurnState] = {}
+        self._btw_prompts: dict[tuple[str, str], deque[str]] = {}
         self._shutdown = False
 
     # ------------------------------------------------------------------
@@ -520,6 +559,11 @@ class EventPipeline:
         if self._shutdown:
             return
         try:
+            if not _is_main_agent(event.agent_id):
+                # Side-channel (/btw) agent: the lightweight path (aligned
+                # item 13) — never the card pipeline below.
+                self._dispatch_btw(event)
+                return
             if isinstance(event, TurnStarted):
                 self._turn_started(event)
             elif isinstance(event, TurnEnded):
@@ -544,6 +588,174 @@ class EventPipeline:
                 self._work_changed(event)
         except Exception:
             logger.exception("outbound dispatch failed for %r", event)
+
+    # ------------------------------------------------------------------
+    # /btw side-channel: the lightweight path (aligned item 13)
+    # ------------------------------------------------------------------
+
+    def _dispatch_btw(self, event: DurableEvent) -> None:
+        """Route a side-channel agent's durable event.
+
+        Only turn.started/turn.ended carry meaning here: the side answer is
+        delivered on turn.ended. Everything else is inert by construction —
+        the upstream btw agent has every tool call vetoed
+        (agent-core-v2 SessionBtwService), so it can never raise approvals,
+        questions, or tool events, and KITE exposes no abort/steer surface
+        for side prompts. work_changed tracks the main agent only.
+        """
+        if isinstance(event, TurnStarted):
+            self._btw_turn_started(event)
+        elif isinstance(event, TurnEnded):
+            self._btw_turn_ended(event)
+        else:
+            logger.debug(
+                "btw event %s ignored session=%s agent=%s",
+                type(event).__name__,
+                event.session_id,
+                event.agent_id,
+            )
+
+    def note_btw_prompt(self, session_id: str, agent_id: str, prompt_id: str) -> None:
+        """AppHandler seam: a /btw submit succeeded; FIFO-attribute the side
+        agent's next turn to this prompt.
+
+        Called directly from ``_cmd_btw`` on the RuntimeLoop thread (inbound
+        commands are serialized there), so the entry is in place before the
+        turn's events can be dispatched — the WS-delivered turn.started hops
+        onto the same loop behind the command.
+        """
+        key = (session_id, agent_id)
+        queue = self._btw_prompts.get(key)
+        if queue is None:
+            queue = deque()
+            self._btw_prompts[key] = queue
+        queue.append(prompt_id)
+
+    def _btw_turn_started(self, event: TurnStarted) -> None:
+        key = (event.session_id, event.agent_id)
+        queue = self._btw_prompts.get(key)
+        prompt_id = queue[0] if queue else ""
+        if not prompt_id:
+            logger.warning(
+                "btw turn.started without a tracked submission session=%s agent=%s turn=%s; "
+                "the answer will broadcast to attached chats",
+                event.session_id,
+                event.agent_id,
+                event.turn_id,
+            )
+        # A new turn re-baselines the side stream: any leftover from a turn
+        # whose turn.ended was missed is dropped, never merged.
+        self._btw_turns[key] = _BtwTurnState(turn_id=event.turn_id, prompt_id=prompt_id)
+        logger.info(
+            "btw turn started session=%s agent=%s turn=%s prompt=%s",
+            event.session_id,
+            event.agent_id,
+            event.turn_id,
+            prompt_id or "-",
+        )
+
+    def _btw_assistant_delta(self, delta: AssistantDelta) -> None:
+        turn = self._btw_turns.get((delta.session_id, delta.agent_id))
+        if turn is None:
+            # A delta for an untracked side turn (started while kited was
+            # down): volatile text is enhancement, never evidence — drop it;
+            # turn.ended still closes with the fallback note.
+            return
+        # Upstream stamps no offsets for non-main agents (the in-flight
+        # tracker is main-only), so the append feeds the transcript its own
+        # expected offset: arrival order, never a gap.
+        turn.transcript.append_delta(turn.transcript.expected_offset, delta.text_delta)
+
+    def _btw_turn_ended(self, event: TurnEnded) -> None:
+        key = (event.session_id, event.agent_id)
+        turn = self._btw_turns.get(key)
+        if turn is None:
+            # Already ended (an error frame closed it) or never tracked —
+            # the error frame's notice was the terminal surface; no repeat.
+            logger.debug(
+                "btw turn.ended for an untracked turn session=%s agent=%s turn=%s",
+                event.session_id,
+                event.agent_id,
+                event.turn_id,
+            )
+            return
+        self._end_btw_turn(key)
+        text = turn.transcript.full_text()
+        if event.reason == "completed":
+            body = f"旁路回复：{text}" if text else "旁路 prompt 已完成（没有文本输出）。"
+        elif event.reason == "cancelled":
+            body = "旁路 prompt 已取消。"
+        else:
+            detail = f"：{event.error_message}" if event.error_message else "。"
+            body = f"旁路 prompt 执行失败{detail}"
+        for chat_id in self._btw_target_chats(event.session_id, turn.prompt_id):
+            self._send_text(chat_id, body)
+        logger.info(
+            "btw turn ended session=%s agent=%s turn=%s reason=%s prompt=%s",
+            event.session_id,
+            event.agent_id,
+            event.turn_id,
+            event.reason,
+            turn.prompt_id or "-",
+        )
+
+    def _end_btw_turn(self, key: tuple[str, str]) -> None:
+        """Close the side turn's own tracking (turn.ended / error frame):
+        pop the turn, retire its FIFO-attributed submission, and forget its
+        ownership entry (the main prompt's state is never touched)."""
+        turn = self._btw_turns.pop(key, None)
+        queue = self._btw_prompts.get(key)
+        prompt_id = turn.prompt_id if turn is not None else ""
+        if not prompt_id and queue:
+            # The turn died before it could be attributed (e.g. an error
+            # frame ahead of turn.started): the head submission is the one
+            # that died — retire it too, or the next turn would mis-attribute.
+            prompt_id = queue[0]
+        if queue and prompt_id and queue[0] == prompt_id:
+            queue.popleft()
+            if not queue:
+                self._btw_prompts.pop(key, None)
+        if prompt_id:
+            self._ownership.forget(prompt_id)
+
+    def _btw_target_chats(self, session_id: str, prompt_id: str) -> list[str]:
+        """The side answer's audience: the initiating chat when attribution
+        is certain (ownership recorded at /btw submit time); every attached
+        chat otherwise — a side answer is never dropped silently."""
+        attached = [chat_id for chat_id, _binding in self._attached_chats(session_id)]
+        if prompt_id:
+            entry = self._ownership.entry_of(prompt_id)
+            if entry is not None and entry.chat_id in attached:
+                return [entry.chat_id]
+        return attached
+
+    def _btw_error_frame(self, error: KapErrorFrame) -> None:
+        """A side-channel agent's error frame ends only the side turn's own
+        tracking (audit N3-HIGH-1): the main prompt is untouched, and the
+        initiating chat gets an explicit failure note (never silent)."""
+        session_id = error.session_id
+        if not session_id:
+            logger.error("btw error frame without session: %s %s", error.code, error.message)
+            return
+        key = (session_id, error.agent_id or "")
+        turn = self._btw_turns.get(key)
+        prompt_id = turn.prompt_id if turn is not None else ""
+        if not prompt_id:
+            # The turn died before turn.started was tracked: the FIFO head
+            # submission is the one that died (mirrors _end_btw_turn).
+            queue = self._btw_prompts.get(key)
+            prompt_id = queue[0] if queue else ""
+        self._end_btw_turn(key)
+        text = f"上游错误 {error.code}: {error.message}" if error.code else error.message
+        for chat_id in self._btw_target_chats(session_id, prompt_id):
+            self._send_text(chat_id, f"⚠️ 旁路 prompt 失败：{text}")
+        logger.info(
+            "btw error frame closed the side turn session=%s agent=%s prompt=%s: %s",
+            session_id,
+            error.agent_id,
+            prompt_id or "-",
+            text,
+        )
 
     def _session(self, session_id: str) -> _SessionState:
         session = self._sessions.get(session_id)
@@ -839,9 +1051,14 @@ class EventPipeline:
 
         The REST submit can succeed while the turn dies immediately
         (e.g. ``model.not_configured``, observed live 2026-07-22); without
-        this the user is left with "已提交，正在执行" forever.
+        this the user is left with "已提交，正在执行" forever. Only
+        main-agent frames apply here — a side-channel agent's frame ends
+        only its own turn's tracking (audit N3-HIGH-1).
         """
         if self._shutdown:
+            return
+        if not _is_main_agent(error.agent_id):
+            self._btw_error_frame(error)
             return
         session_id = error.session_id
         if not session_id:
@@ -1141,6 +1358,15 @@ class EventPipeline:
 
     def _assistant_delta(self, delta: AssistantDelta) -> None:
         if self._shutdown:
+            return
+        if not _is_main_agent(delta.agent_id):
+            # Side-channel (/btw) stream: accumulates for the plain-text
+            # answer, NEVER into the main card's transcript (N3-HIGH-1).
+            self._btw_assistant_delta(delta)
+            return
+        if delta.offset is None:
+            # normalize_volatile_event already drops offset-less main deltas;
+            # this guards a direct handle_volatile caller.
             return
         session = self._sessions.get(delta.session_id)
         prompt_id = session.active_prompt_id if session else None
@@ -2684,6 +2910,10 @@ class OutboundAppHandler(AppHandler):
     """AppHandler with the E3 seams wired to the outbound pipeline."""
 
     def __init__(self, *, event_pipeline: EventPipeline, **kwargs: Any) -> None:
+        # The /btw FIFO-attribution seam (aligned item 13): the pipeline
+        # learns each side-channel submission so the side turn's events can
+        # find their initiating chat.
+        kwargs.setdefault("on_btw_prompt_submitted", event_pipeline.note_btw_prompt)
         super().__init__(**kwargs)
         self._event_pipeline = event_pipeline
 

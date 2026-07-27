@@ -171,6 +171,12 @@ class FakeKapRestClient:
         # Upstream goal state per session (profile agent_config goal_objective
         # / goal_control semantics).
         self.goals: dict[str, dict] = {}
+        # /btw scripting: agent ids handed out per :btw start (empty = the
+        # legacy deterministic id), and agent ids whose prompt submit must
+        # fail with agent.not_found (upstream maps it onto the 40401
+        # envelope, routes/prompts.ts sendMappedError).
+        self.btw_agent_ids: list[str] = []
+        self.dead_btw_agents: set[str] = set()
         self._prompt_counter = 0
 
     # -- scripting helpers ---------------------------------------------------
@@ -245,6 +251,9 @@ class FakeKapRestClient:
             session = self.sessions.get(match.group(1))
             if session is None:
                 raise KapError(40401, f"session {match.group(1)} does not exist")
+            agent_id = body.get("agent_id") if isinstance(body, dict) else None
+            if agent_id and agent_id in self.dead_btw_agents:
+                raise KapError(40401, f"agent {agent_id} does not exist")
             self._prompt_counter += 1
             prompt_id = f"p-{self._prompt_counter}"
             self.submissions.append(
@@ -297,7 +306,10 @@ class FakeKapRestClient:
             if session is None:
                 raise KapError(40401, f"session {match.group(1)} does not exist")
             self.session_actions.append((match.group(1), "btw", body))
-            return {"agent_id": f"btw-{match.group(1)}"}
+            agent_id = (
+                self.btw_agent_ids.pop(0) if self.btw_agent_ids else f"btw-{match.group(1)}"
+            )
+            return {"agent_id": agent_id}
         match = re.fullmatch(r"/sessions/([^/]+):(compact|archive|restore)", path)
         if method == "POST" and match:
             if self.action_error is not None:
@@ -1636,6 +1648,76 @@ class BtwTests(AppHandlerTestCase):
 
         self.assertIn("启动旁路 agent 失败", self.transport.last_text())
         self.assertEqual(self.rest.submissions, [])
+
+    def test_btw_agent_not_found_clears_cache_and_retries_once(self) -> None:
+        # Audit N3-MED-2: a kap restart drops forked agents; the cached id
+        # then dies at submit with agent.not_found (40401-class).
+        self.bind("s-1")
+        self.rest.add_session("s-1")
+        self.rest.btw_agent_ids = ["btw-s-1", "btw-s-1-fresh"]
+
+        self.send("/btw 第一句")
+        self.rest.dead_btw_agents.add("btw-s-1")  # the kap restart happens here
+        self.send("/btw 第二句")
+
+        bodies = [s["body"] for s in self.rest.submissions]
+        # The dead cached id was cleared and the submit retried with a fresh
+        # agent — transparently, with a normal ack.
+        self.assertEqual([body["agent_id"] for body in bodies], ["btw-s-1", "btw-s-1-fresh"])
+        btw_starts = [a for a in self.rest.session_actions if a[1] == "btw"]
+        self.assertEqual(len(btw_starts), 2)
+        self.assertIn("已发给旁路 agent", self.transport.last_text())
+
+    def test_btw_agent_not_found_retries_only_once(self) -> None:
+        self.bind("s-1")
+        self.rest.add_session("s-1")
+        self.rest.btw_agent_ids = ["btw-1", "btw-2", "btw-3"]
+        self.rest.dead_btw_agents.update({"btw-1", "btw-2"})
+
+        self.send("/btw 你好")
+
+        # start btw-1 → submit 40401 → clear + start btw-2 → submit 40401 →
+        # give up (never a third attempt).
+        self.assertEqual(self.rest.submissions, [])
+        btw_starts = [a for a in self.rest.session_actions if a[1] == "btw"]
+        self.assertEqual(len(btw_starts), 2)
+        self.assertIn("提交失败", self.transport.last_text())
+        self.assertIn("agent btw-2 does not exist", self.transport.last_text())
+
+    def test_btw_archived_session_gets_preflight_error(self) -> None:
+        # Audit N3-MED-3: same §4.7 preflight as the main prompt path — no
+        # silent resurrection of an archived session.
+        self.bind("s-1")
+        self.rest.add_session("s-1", archived=True)
+
+        self.send("/btw 你好")
+
+        self.assertIn("已被归档", self.transport.last_text())
+        self.assertIn("KITE 不会自动新建会话", self.transport.last_text())
+        self.assertEqual(self.rest.submissions, [])
+        self.assertEqual([a for a in self.rest.session_actions if a[1] == "btw"], [])
+
+    def test_btw_vanished_session_gets_preflight_error(self) -> None:
+        self.bind("s-ghost")
+
+        self.send("/btw 你好")
+
+        self.assertIn("已不存在", self.transport.last_text())
+        self.assertEqual(self.rest.submissions, [])
+
+    def test_btw_detached_chat_is_denied_like_the_main_path(self) -> None:
+        # Audit N3-MED-4: a detached chat must not run invisible work.
+        self.bind("s-1", attached=False)
+        self.rest.add_session("s-1")
+
+        self.send("/btw 你好")
+
+        self.assertEqual(
+            self.transport.last_text(),
+            "当前会话已暂停推送（/detach 状态），消息未提交。发送 /attach 恢复后再继续。",
+        )
+        self.assertEqual(self.rest.submissions, [])
+        self.assertEqual([a for a in self.rest.session_actions if a[1] == "btw"], [])
 
 
 class AbortTests(AppHandlerTestCase):

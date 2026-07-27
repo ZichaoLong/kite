@@ -14,6 +14,7 @@ import tempfile
 import unittest
 
 from test_event_pipeline import (
+    ADMIN_OPEN_ID,
     CHAT_ID,
     CHAT_ID_2,
     FakeInteractionRest,
@@ -320,6 +321,78 @@ class StreamIntoCardTests(StreamingPipelineTestCase):
             applied = self.dispatcher.applied_to(message_id)
             self.assertEqual(len(applied), 1)
             self.assertIn("广播正文", rendered(applied[0]))
+
+
+class BtwStreamIsolationTests(StreamingPipelineTestCase):
+    """Volatile isolation (audit N3-HIGH-1): a /btw agent's deltas accumulate
+    for its plain-text answer, never into the main card's streamed body."""
+
+    BTW_AGENT = "btw-s-1"
+
+    def _btw_turn_started(self, *, turn_id: int = 7) -> KapEvent:
+        return kap_event(
+            "turn.started",
+            {
+                "type": "turn.started",
+                "turnId": turn_id,
+                "origin": {"kind": "user"},
+                "prompt": "旁路问题",
+                "agentId": self.BTW_AGENT,
+                "sessionId": SESSION_ID,
+            },
+        )
+
+    def _btw_delta(self, text: str) -> None:
+        # Offset-less on the real wire (the upstream tracker is main-only).
+        self.pipeline.handle_volatile(
+            AssistantDelta(
+                session_id=SESSION_ID, offset=None, text_delta=text, agent_id=self.BTW_AGENT
+            )
+        )
+        self.flush()
+
+    def test_btw_deltas_never_pollute_the_main_stream(self) -> None:
+        self.bind()
+        message_id = self.start_prompt()  # main busy with a live card
+
+        # The btw turn runs alongside; its deltas never reach the dispatcher.
+        self.feed(self._btw_turn_started())
+        self._btw_delta("旁路文本")
+        self.assertEqual(self.dispatcher.submitted, [])
+
+        # The main stream still flows and carries ONLY the main text.
+        self.delta(0, "主流文本")
+        self.assertEqual(len(self.dispatcher.submitted), 1)
+        self.dispatcher.flush()
+        applied = self.dispatcher.applied_to(message_id)
+        self.assertTrue(applied)
+        self.assertIn("主流文本", rendered(applied[-1]))
+        self.assertNotIn("旁路文本", rendered(applied[-1]))
+
+    def test_btw_stream_accumulates_into_the_plain_text_answer(self) -> None:
+        self.bind()
+        self.ownership.record("p-b1", CHAT_ID, sender_open_id=ADMIN_OPEN_ID)
+        self.pipeline.note_btw_prompt(SESSION_ID, self.BTW_AGENT, "p-b1")
+        self.feed(self._btw_turn_started())
+
+        self._btw_delta("第一段")
+        self._btw_delta("第二段")
+
+        self.feed(
+            kap_event(
+                "turn.ended",
+                {
+                    "type": "turn.ended",
+                    "turnId": 7,
+                    "reason": "completed",
+                    "agentId": self.BTW_AGENT,
+                    "sessionId": SESSION_ID,
+                },
+            )
+        )
+        # Arrival-order accumulation (no offsets upstream for side agents).
+        self.assertEqual(self.transport.texts_to(CHAT_ID), ["旁路回复：第一段第二段"])
+        self.assertEqual(self.transport.sent, [])
 
 
 class GapRebuildTests(StreamingPipelineTestCase):

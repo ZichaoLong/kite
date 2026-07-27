@@ -22,6 +22,7 @@ from kite import cards
 from kite.message_patch_result import MessagePatchResult
 from kite.adapters.kap_server import (
     ApprovalRequestView,
+    AssistantDelta,
     KapError,
     KapErrorFrame,
     KapEvent,
@@ -230,6 +231,12 @@ class FakeInteractionRest:
                 {"session_id": match.group(1), "question_id": match.group(2), "body": body}
             )
             return {"resolved": True, "resolved_at": "2026-01-01T00:00:00Z"}
+        match = re.fullmatch(r"/sessions/([^/]+):btw", path)
+        if method == "POST" and match:
+            session = self.sessions.get(match.group(1))
+            if session is None:
+                raise KapError(40401, "session not found")
+            return {"agent_id": f"btw-{match.group(1)}"}
         match = re.fullmatch(r"/sessions/([^/]+)/prompts", path)
         if method == "POST" and match:
             self._prompt_counter += 1
@@ -2113,6 +2120,282 @@ class ErrorFrameTests(PipelineTestCase):
         self.flush()
         self.assertEqual(self.transport.cards_to(CHAT_ID), [])
         self.assertEqual(self.transport.texts_to(CHAT_ID), [])
+
+
+# ---------------------------------------------------------------------------
+# /btw side-channel agent routing (audit N3-HIGH-1, mvp-scope aligned item 13)
+# ---------------------------------------------------------------------------
+
+
+class BtwRoutingTests(PipelineTestCase):
+    """Events whose agent_id is not the main agent take the lightweight path:
+    no card, no main-stream pollution, plain-text answer on turn.ended."""
+
+    BTW_AGENT = "btw-s-1"
+
+    def _btw_event(self, type_: str, payload: dict) -> KapEvent:
+        # The real wire stamps agentId/sessionId on every agent-event payload.
+        return kap_event(
+            type_,
+            {"type": type_, "agentId": self.BTW_AGENT, "sessionId": SESSION_ID, **payload},
+        )
+
+    def _btw_turn_started(self, *, turn_id: int = 7) -> KapEvent:
+        return self._btw_event(
+            "turn.started",
+            {"turnId": turn_id, "origin": {"kind": "user"}, "prompt": "旁路问题"},
+        )
+
+    def _btw_turn_ended(
+        self, *, turn_id: int = 7, reason: str = "completed", error: str = ""
+    ) -> KapEvent:
+        payload: dict = {"turnId": turn_id, "reason": reason}
+        if error:
+            payload["error"] = {"message": error}
+        return self._btw_event("turn.ended", payload)
+
+    def _btw_delta(self, text: str) -> None:
+        # Upstream stamps no offsets for non-main agents (inFlightTurnTracker
+        # is main-only): the side stream accumulates in arrival order.
+        self.pipeline.handle_volatile(
+            AssistantDelta(
+                session_id=SESSION_ID, offset=None, text_delta=text, agent_id=self.BTW_AGENT
+            )
+        )
+        self.flush()
+
+    def _submit_btw(self, prompt_id: str = "p-b1", chat_id: str = CHAT_ID) -> None:
+        """The AppHandler side of a /btw submit: ownership + the FIFO seam."""
+        self.ownership.record(prompt_id, chat_id, sender_open_id=ADMIN_OPEN_ID)
+        self.pipeline.note_btw_prompt(SESSION_ID, self.BTW_AGENT, prompt_id)
+
+    def test_btw_idle_turn_produces_no_card_and_delivers_text(self) -> None:
+        self.bind(CHAT_ID)
+        self.rest.set_prompts(SESSION_ID, active=None)  # main idle
+        self._submit_btw("p-b1")
+
+        self.feed(self._btw_turn_started())
+        # No execution card, and no queue fetch is needed for attribution.
+        self.assertEqual(self.transport.cards_to(CHAT_ID), [])
+
+        self._btw_delta("旁路")
+        self._btw_delta("答案")
+        self.assertEqual(self.transport.cards_to(CHAT_ID), [])
+        self.assertEqual(self.transport.patches, [])
+
+        self.feed(self._btw_turn_ended())
+        self.assertEqual(self.transport.cards_to(CHAT_ID), [])  # still no card
+        self.assertEqual(self.transport.texts_to(CHAT_ID), ["旁路回复：旁路答案"])
+        # The btw prompt's ownership is retired with the delivery.
+        self.assertIsNone(self.ownership.owner_of("p-b1"))
+
+    def test_btw_empty_stream_delivers_completion_note(self) -> None:
+        self.bind(CHAT_ID)
+        self._submit_btw()
+        self.feed(self._btw_turn_started())
+
+        self.feed(self._btw_turn_ended())
+
+        self.assertEqual(self.transport.cards_to(CHAT_ID), [])
+        self.assertEqual(self.transport.texts_to(CHAT_ID), ["旁路 prompt 已完成（没有文本输出）。"])
+
+    def test_btw_answer_broadcasts_when_owner_unknown(self) -> None:
+        self.bind(CHAT_ID)
+        self.bind(CHAT_ID_2)
+        # No note_btw_prompt (e.g. the /btw predates a kited restart).
+        self.feed(self._btw_turn_started())
+        self._btw_delta("答案")
+
+        self.feed(self._btw_turn_ended())
+
+        self.assertEqual(self.transport.texts_to(CHAT_ID), ["旁路回复：答案"])
+        self.assertEqual(self.transport.texts_to(CHAT_ID_2), ["旁路回复：答案"])
+
+    def test_btw_busy_never_touches_main_card_and_main_terminal_lands(self) -> None:
+        self.bind(CHAT_ID)
+        self.ownership.record("p-1", CHAT_ID, sender_open_id=ADMIN_OPEN_ID)
+        message_id = self.start_prompt()  # main busy with a live execution card
+
+        self._submit_btw("p-b1")
+        self.feed(self._btw_turn_started())
+        # No second card, and the live card is untouched.
+        self.assertEqual(len(self.transport.cards_to(CHAT_ID)), 1)
+        self.assertEqual(self.transport.patches_to(message_id), [])
+
+        self._btw_delta("旁路答复")
+        self.feed(
+            self._btw_event(
+                "tool.call.started",
+                {"turnId": 7, "toolCallId": "tc-b1", "name": "Bash"},
+            )
+        )
+        self.assertEqual(self.transport.patches_to(message_id), [])
+
+        self.feed(self._btw_turn_ended())
+        # The btw answer arrives as plain text; no terminal card hijack, no
+        # freeze of the main execution card.
+        self.assertEqual(len(self.transport.cards_to(CHAT_ID)), 1)
+        self.assertEqual(self.transport.texts_to(CHAT_ID), ["旁路回复：旁路答复"])
+        self.assertEqual(self.transport.patches_to(message_id), [])
+
+        # The main turn's real terminal still lands (not deduped away by the
+        # btw delivery) and carries the main reply, not the btw text.
+        self.feed(kap_event("turn.ended", {"turnId": 1, "reason": "completed"}))
+        sent = self.transport.cards_to(CHAT_ID)
+        self.assertEqual(len(sent), 2)  # execution card + main terminal card
+        rendered = json.dumps(sent[-1]["content"], ensure_ascii=False)
+        self.assertIn("最终答复文本", rendered)
+        self.assertNotIn("旁路答复", rendered)
+        patches = self.transport.patches_to(message_id)
+        self.assertEqual(len(patches), 1)  # the freeze patch, exactly once
+        self.assertNotIn("旁路答复", json.dumps(patches[-1], ensure_ascii=False))
+
+    def test_btw_error_frame_leaves_main_prompt_untouched(self) -> None:
+        self.bind(CHAT_ID)
+        self.ownership.record("p-1", CHAT_ID, sender_open_id=ADMIN_OPEN_ID)
+        message_id = self.start_prompt()  # main busy
+        self._submit_btw("p-b1")
+        self.feed(self._btw_turn_started())
+
+        self.pipeline.handle_error_frame(
+            KapErrorFrame(
+                code="model.not_configured",
+                message="Model not set",
+                session_id=SESSION_ID,
+                agent_id=self.BTW_AGENT,
+                retryable=False,
+            )
+        )
+        self.flush()
+
+        # Main: no failed terminal, no freeze, ownership intact.
+        self.assertEqual(len(self.transport.cards_to(CHAT_ID)), 1)
+        self.assertEqual(self.transport.patches_to(message_id), [])
+        self.assertEqual(self.ownership.owner_of("p-1"), CHAT_ID)
+        # btw: the initiating chat gets an explicit failure note, and the
+        # side turn's own tracking (incl. its ownership) is closed.
+        self.assertEqual(
+            self.transport.texts_to(CHAT_ID),
+            ["⚠️ 旁路 prompt 失败：上游错误 model.not_configured: Model not set"],
+        )
+        self.assertIsNone(self.ownership.owner_of("p-b1"))
+        # A later btw turn.ended is a no-op (no double notice).
+        self.feed(self._btw_turn_ended(reason="failed", error="Model not set"))
+        self.assertEqual(len(self.transport.texts_to(CHAT_ID)), 1)
+        # And the main prompt still finishes normally afterwards.
+        self.feed(kap_event("turn.ended", {"turnId": 1, "reason": "completed"}))
+        self.assertEqual(len(self.transport.cards_to(CHAT_ID)), 2)
+
+    def test_btw_error_frame_before_turn_start_retires_the_submission(self) -> None:
+        self.bind(CHAT_ID)
+        self._submit_btw("p-b1")
+        # The side prompt dies before any turn.started (dead-on-arrival).
+
+        self.pipeline.handle_error_frame(
+            KapErrorFrame(
+                code="model.not_configured",
+                message="Model not set",
+                session_id=SESSION_ID,
+                agent_id=self.BTW_AGENT,
+                retryable=False,
+            )
+        )
+        self.flush()
+
+        # The initiating chat is still told, and the queued submission is the
+        # one retired (its ownership forgotten).
+        self.assertEqual(
+            self.transport.texts_to(CHAT_ID),
+            ["⚠️ 旁路 prompt 失败：上游错误 model.not_configured: Model not set"],
+        )
+        self.assertIsNone(self.ownership.owner_of("p-b1"))
+        # A subsequent /btw turn starts clean: its submission attributes to
+        # ITS OWN prompt, not the retired one.
+        self._submit_btw("p-b2")
+        self.feed(self._btw_turn_started(turn_id=8))
+        self._btw_delta("新答案")
+        self.feed(self._btw_turn_ended(turn_id=8))
+        self.assertEqual(self.transport.texts_to(CHAT_ID)[-1], "旁路回复：新答案")
+
+    def test_error_frame_without_agent_id_takes_main_path(self) -> None:
+        self.bind(CHAT_ID)
+        self.ownership.record("p-1", CHAT_ID, sender_open_id=ADMIN_OPEN_ID)
+        self.start_prompt()
+
+        self.pipeline.handle_error_frame(
+            KapErrorFrame(
+                code="model.not_configured",
+                message="Model not set",
+                session_id=SESSION_ID,
+                agent_id=None,  # missing -> main path (defensive)
+                retryable=False,
+            )
+        )
+        self.flush()
+
+        sent = self.transport.cards_to(CHAT_ID)
+        self.assertEqual(len(sent), 2)  # execution card + failed terminal card
+        self.assertIn("model.not_configured", json.dumps(sent[-1]["content"], ensure_ascii=False))
+
+    def test_btw_interaction_events_are_inert(self) -> None:
+        self.bind(CHAT_ID)
+        self._submit_btw()
+        self.feed(self._btw_turn_started())
+
+        # The upstream btw agent has every tool call vetoed, so these can
+        # never occur; if one ever arrives it must still not route a card or
+        # touch upstream (lightweight path).
+        self.feed(
+            self._btw_event(
+                "event.approval.requested",
+                {
+                    "approval_id": "a-b1",
+                    "session_id": SESSION_ID,
+                    "turn_id": 7,
+                    "tool_call_id": "tc-1",
+                    "tool_name": "Bash",
+                    "action": "execute",
+                    "tool_input_display": {"kind": "command", "command": "rm -rf build/"},
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "expires_at": "2026-01-02T00:00:00Z",
+                },
+            )
+        )
+        self.assertEqual(self.transport.cards_to(CHAT_ID), [])
+        self.assertEqual(self.rest.approval_resolutions, [])
+
+    def test_btw_work_changed_does_not_move_main_work_state(self) -> None:
+        self.bind(CHAT_ID)
+        self.feed(kap_event("event.session.work_changed", {"busy": True, "agentId": "main"}))
+        busy, _ = self.loop.call(self.pipeline.work_state_of, SESSION_ID)
+        self.assertTrue(busy)
+
+        self.feed(
+            self._btw_event("event.session.work_changed", {"busy": False})
+        )
+        busy, _ = self.loop.call(self.pipeline.work_state_of, SESSION_ID)
+        self.assertTrue(busy)  # work state tracks the main agent only
+
+    def test_cmd_btw_seam_attributes_the_answer_to_the_initiating_chat(self) -> None:
+        """End to end through OutboundAppHandler: the /btw submit feeds the
+        pipeline FIFO, so the side turn's events find the owner chat."""
+        self.bind(CHAT_ID)
+
+        self.handler.on_message(make_message("/btw 旁路问题"))
+
+        self.assertIn("已发给旁路 agent", self.transport.texts_to(CHAT_ID)[-1])
+        submissions = [s for s in self.rest.submissions if s["session_id"] == SESSION_ID]
+        self.assertEqual(len(submissions), 1)
+        self.assertEqual(submissions[0]["body"]["agent_id"], "btw-s-1")
+        prompt_id = submissions[0]["prompt_id"]
+
+        self.feed(self._btw_turn_started())
+        self._btw_delta("旁路答案")
+        self.feed(self._btw_turn_ended())
+
+        texts = self.transport.texts_to(CHAT_ID)
+        self.assertIn("旁路回复：旁路答案", texts)
+        self.assertIsNone(self.ownership.owner_of(prompt_id))
 
 
 # ---------------------------------------------------------------------------

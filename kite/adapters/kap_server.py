@@ -280,6 +280,11 @@ class ResyncRequest:
 # - approval/question events are synthesized from the interaction kernel and
 #   use the REST wire projections (snake_case: approval_id / question_id /
 #   turn_id / tool_call_id);
+# - every agent-event payload carries the broadcaster-stamped ``agentId``
+#   (``{...event, agentId, sessionId}`` in sessionEventBroadcaster.ts): the
+#   main agent is ``"main"``, a `/btw` side-channel agent carries its forked
+#   id; the field is normalized onto every typed event as ``agent_id`` (""
+#   when absent) so the pipeline can route by agent (audit N3-HIGH-1);
 # - turn.started carries NO prompt id — prompt attribution is the receiver's
 #   job (kap prompt FIFO: the turn belongs to the active prompt);
 # - question resolution arrives as event.question.answered or
@@ -292,6 +297,7 @@ class TurnStarted:
     turn_id: int
     prompt_text: str
     origin_kind: str
+    agent_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -300,6 +306,7 @@ class TurnEnded:
     turn_id: int
     reason: str  # completed | cancelled | failed | blocked
     error_message: str
+    agent_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -310,6 +317,7 @@ class ToolCallStarted:
     name: str
     description: str
     detail: str  # salient field from the display payload, kind-prefixed
+    agent_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -318,12 +326,14 @@ class ToolCallResult:
     turn_id: int
     tool_call_id: str
     is_error: bool
+    agent_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
 class PromptAborted:
     session_id: str
     prompt_id: str
+    agent_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -331,6 +341,7 @@ class PromptSteered:
     session_id: str
     active_prompt_id: str
     prompt_ids: tuple[str, ...]
+    agent_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -342,6 +353,7 @@ class ApprovalRequested:
     tool_name: str
     action: str
     detail: str
+    agent_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -350,6 +362,7 @@ class ApprovalResolved:
     approval_id: str
     decision: str  # approved | rejected | cancelled
     feedback: str
+    agent_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -358,6 +371,7 @@ class QuestionRequested:
     question_id: str
     turn_id: int | None
     items: tuple[QuestionItemView, ...]
+    agent_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -365,6 +379,7 @@ class QuestionResolved:
     session_id: str
     question_id: str
     dismissed: bool
+    agent_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -373,6 +388,7 @@ class SessionWorkChanged:
     busy: bool
     pending_interaction: str | None
     last_turn_reason: str | None
+    agent_id: str = ""
 
 
 DurableEvent = (
@@ -405,6 +421,9 @@ def normalize_durable_event(event: KapEvent) -> DurableEvent | None:
             logger.warning("durable event %s with non-dict payload dropped", event.type)
         return None
     session_id = event.session_id
+    # Broadcaster-stamped emitting agent ("main" or a forked side-channel id);
+    # "" when the frame predates/omits it — routed as the main agent.
+    agent_id = _optional_str(payload.get("agentId")) or ""
     try:
         if event.type == "turn.started":
             turn_id = _optional_non_negative_int(payload.get("turnId"))
@@ -416,6 +435,7 @@ def normalize_durable_event(event: KapEvent) -> DurableEvent | None:
                 turn_id=turn_id,
                 prompt_text=str(payload.get("prompt") or ""),
                 origin_kind=str(origin.get("kind") or ""),
+                agent_id=agent_id,
             )
         if event.type == "turn.ended":
             turn_id = _optional_non_negative_int(payload.get("turnId"))
@@ -427,6 +447,7 @@ def normalize_durable_event(event: KapEvent) -> DurableEvent | None:
                 turn_id=turn_id,
                 reason=str(payload.get("reason") or ""),
                 error_message=str(error.get("message") or ""),
+                agent_id=agent_id,
             )
         if event.type == "tool.call.started":
             turn_id = _optional_non_negative_int(payload.get("turnId"))
@@ -440,6 +461,7 @@ def normalize_durable_event(event: KapEvent) -> DurableEvent | None:
                 name=str(payload.get("name") or ""),
                 description=str(payload.get("description") or ""),
                 detail=_tool_display_detail(payload.get("display")),
+                agent_id=agent_id,
             )
         if event.type == "tool.result":
             turn_id = _optional_non_negative_int(payload.get("turnId"))
@@ -451,12 +473,13 @@ def normalize_durable_event(event: KapEvent) -> DurableEvent | None:
                 turn_id=turn_id,
                 tool_call_id=tool_call_id,
                 is_error=bool(payload.get("isError")),
+                agent_id=agent_id,
             )
         if event.type == "prompt.aborted":
             prompt_id = _optional_str(payload.get("promptId"))
             if not prompt_id:
                 raise ValueError("promptId missing")
-            return PromptAborted(session_id=session_id, prompt_id=prompt_id)
+            return PromptAborted(session_id=session_id, prompt_id=prompt_id, agent_id=agent_id)
         if event.type == "prompt.steered":
             prompt_ids = tuple(
                 pid for pid in (_optional_str(item) for item in _as_list(payload.get("promptIds"))) if pid
@@ -465,6 +488,7 @@ def normalize_durable_event(event: KapEvent) -> DurableEvent | None:
                 session_id=session_id,
                 active_prompt_id=str(payload.get("activePromptId") or ""),
                 prompt_ids=prompt_ids,
+                agent_id=agent_id,
             )
         if event.type == "event.approval.requested":
             view = _parse_approval_request(payload)
@@ -478,6 +502,7 @@ def normalize_durable_event(event: KapEvent) -> DurableEvent | None:
                 tool_name=view.tool_name,
                 action=view.action,
                 detail=view.detail,
+                agent_id=agent_id,
             )
         if event.type == "event.approval.resolved":
             approval_id = _optional_str(payload.get("approval_id"))
@@ -488,6 +513,7 @@ def normalize_durable_event(event: KapEvent) -> DurableEvent | None:
                 approval_id=approval_id,
                 decision=str(payload.get("decision") or ""),
                 feedback=str(payload.get("feedback") or ""),
+                agent_id=agent_id,
             )
         if event.type == "event.question.requested":
             view = _parse_question_request(payload)
@@ -498,6 +524,7 @@ def normalize_durable_event(event: KapEvent) -> DurableEvent | None:
                 question_id=view.question_id,
                 turn_id=view.turn_id,
                 items=view.items,
+                agent_id=agent_id,
             )
         if event.type in ("event.question.answered", "event.question.dismissed"):
             question_id = _optional_str(payload.get("question_id"))
@@ -507,6 +534,7 @@ def normalize_durable_event(event: KapEvent) -> DurableEvent | None:
                 session_id=session_id,
                 question_id=question_id,
                 dismissed=event.type == "event.question.dismissed",
+                agent_id=agent_id,
             )
         if event.type == "event.session.work_changed":
             return SessionWorkChanged(
@@ -514,6 +542,7 @@ def normalize_durable_event(event: KapEvent) -> DurableEvent | None:
                 busy=bool(payload.get("busy")),
                 pending_interaction=_optional_pending_interaction(payload.get("pending_interaction")),
                 last_turn_reason=_optional_str(payload.get("last_turn_reason")),
+                agent_id=agent_id,
             )
     except ValueError as exc:
         logger.warning("durable event %s dropped: %s", event.type, exc)
@@ -553,11 +582,19 @@ class AssistantDelta:
     current step, stamped by the server's in-flight tracker (it resets at
     every ``turn.step.started``); it is the gap-detection input for the
     streaming transcript. Volatile frames never advance the durable cursor.
+
+    ``agent_id`` is the broadcaster-stamped emitting agent ("" when absent —
+    routed as the main agent). The tracker only annotates MAIN-agent turns
+    (inFlightTurnTracker.ts: subagent deltas share the session id but
+    describe a different stream), so a side-channel (`/btw`) agent's deltas
+    arrive WITHOUT an offset and accumulate in arrival order instead
+    (``offset`` is None for them).
     """
 
     session_id: str
-    offset: int
+    offset: int | None
     text_delta: str
+    agent_id: str = ""
 
 
 def normalize_volatile_event(event: KapEvent) -> AssistantDelta | None:
@@ -565,9 +602,12 @@ def normalize_volatile_event(event: KapEvent) -> AssistantDelta | None:
 
     Only ``assistant.delta`` is in scope (streaming-cards contract §2:
     thinking/tool/shell/status deltas are explicit non-goals); everything
-    else normalizes to None. A delta without a usable offset or payload is
-    dropped — the missing text must never be guessed at (the durable path
-    still produces correct cards without it, §4.3).
+    else normalizes to None. A main-agent delta without a usable offset or
+    payload is dropped — the missing text must never be guessed at (the
+    durable path still produces correct cards without it, §4.3). A
+    side-channel agent's delta is kept without an offset (upstream never
+    stamps one for non-main agents; the btw path accumulates in arrival
+    order, audit N3-HIGH-1).
     """
     if not event.volatile or not event.session_id or event.type != "assistant.delta":
         return None
@@ -578,13 +618,15 @@ def normalize_volatile_event(event: KapEvent) -> AssistantDelta | None:
     delta = payload.get("delta")
     if not isinstance(delta, str) or not delta:
         return None
-    if event.offset is None:
+    agent_id = _optional_str(payload.get("agentId")) or ""
+    if event.offset is None and agent_id in ("", "main"):
         logger.warning("assistant.delta without an offset dropped (cannot gap-check)")
         return None
     return AssistantDelta(
         session_id=event.session_id,
         offset=event.offset,
         text_delta=delta,
+        agent_id=agent_id,
     )
 
 
