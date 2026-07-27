@@ -159,7 +159,15 @@
    旁路 turn）发降级通知（"已结束，内容无法取回"）而非静默，同一旁路
    通道在短窗口内去重；快照重建对本 session 的在飞 btw 跟踪做
    fail-closed 清理并显式通知；他端 abort 的 btw prompt 退役其归因
-   条目。
+   条目。**已知近似（2026-07-27 登记，复审 C-btw LOW-1)**:error 帧"夭
+   折"判定（"无 tracked turn + 刚结束标记过期 + 有排队头 ⇒ 该头从未
+   启动"）对 turn 级失败是精确的，对 agent 级非 turn 错误（如
+   compaction/MCP 失败）是近似：若恰落在 submit → turn.started 窗口
+   内、或距上次 turn 结束超过标记窗口，这样的帧可能误退役**活着的**
+   排队头（该提交随后 fail-closed，答复不投递而非泄漏）。命中窗口极
+   窄——btw 工具上游全部 veto，排队头亚 tick 即被 pump；真出问题
+   时，修复方向为 error.code 白名单，或删除夭折分支交给 abort/sweep
+   兜底。
 14. `/goal` 重接线（2026-07-27，复审 N2-HIGH-1):prompt 提交路由解析但
    静默丢弃 `goal_*` 字段——上游真实 goal 路径为
    `POST .../profile {agent_config.goal_objective|goal_control}` 与

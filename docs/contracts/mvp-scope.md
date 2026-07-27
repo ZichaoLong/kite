@@ -199,7 +199,17 @@ explicitly; "best-effort" silent degradation is forbidden:
     silence, deduped per side channel within a short window; a snapshot
     rebuild fail-closes the session's in-flight btw tracking with an
     explicit notice; a btw prompt aborted from another client retires its
-    attribution entry.
+    attribution entry. **Known approximation (registered 2026-07-27, audit
+    C-btw LOW-1)**: the error-frame stillborn rule ("no tracked turn +
+    just-ended mark expired + a queued head ⇒ the head never started") is
+    exact for turn-scoped failures but approximate for agent-level non-turn
+    errors (e.g. compaction/MCP failure): landing inside the submit →
+    turn.started window, or more than the mark window after the last turn
+    end, such a frame could retire a LIVE head (the submission then fails
+    closed with its answer undelivered rather than leaking). The window is
+    very narrow — btw tools are all vetoed upstream and a queued head is
+    pumped sub-tick; if it ever bites, the fix direction is an error-code
+    whitelist or dropping the stillborn branch in favor of abort/sweep.
 14. `/goal` rewired (2026-07-27, audit N2-HIGH-1): the prompt-submit route
     parses but silently drops `goal_*` fields — the real upstream goal path
     is `POST .../profile {agent_config.goal_objective|goal_control}` plus

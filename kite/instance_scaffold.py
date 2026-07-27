@@ -55,7 +55,12 @@ def scaffold_instance(name: str) -> ScaffoldReport:
         else validate_instance_name(normalized)
     )
     paths = resolve(instance_name)
-    for directory in (paths.config_dir, paths.data_dir, paths.kap_home):
+    directories = [paths.config_dir, paths.data_dir]
+    if instance_name is not None:
+        # The default instance's kap home is ~/.kimi-code (decision §2);
+        # <data>/kap-home is only ever used by NAMED instances (audit R5).
+        directories.append(paths.kap_home)
+    for directory in directories:
         directory.mkdir(parents=True, exist_ok=True)
 
     template = install_templates.load_template(SYSTEM_YAML_EXAMPLE_NAME)

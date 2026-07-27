@@ -536,6 +536,10 @@ class InstanceCreateTests(MultiInstanceTestCase):
         self.assertTrue((self.config_root / "system.yaml").is_file())
         self.assertTrue((self.config_root / "system.yaml.example").is_file())
         self.assertTrue((self.config_root / ENV_FILE_NAME).is_file())
+        # The default instance's kap home is ~/.kimi-code (decision §2):
+        # <data>/kap-home is never created for it (audit R5-LOW-1).
+        self.assertFalse((self.data_root / "kap-home").exists())
+        self.assertNotIn("kap home", out)
         # The default instance's next steps carry no --instance flag.
         self.assertIn("kitectl service install", out)
         self.assertNotIn("--instance", out)
@@ -557,6 +561,57 @@ class InstanceCreateTests(MultiInstanceTestCase):
 
         self.assertEqual(code, 0, err)
         self.assertIn("corp-b", out)
+
+    def _run_cli_with_env(self, extra_env: dict[str, str], *argv: str) -> tuple[int, str, str]:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with _saved_env(), patch.dict(os.environ, {**self._roots_env(), **extra_env}):
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = kitectl.main(list(argv))
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_create_ignores_kite_instance_env_and_targets_the_named_dir(self) -> None:
+        # Audit R5-HIGH-1: rung-1's env publication used to send the scaffold
+        # into the RESOLVED instance's directories while reporting success.
+        self._run_cli("instance", "create", "main")
+        main_yaml = self.config_root / "instances" / "main" / "system.yaml"
+        main_yaml.write_text('app_id: "cli_main"\n', encoding="utf-8")
+
+        code, out, err = self._run_cli_with_env(
+            {"KITE_INSTANCE": "main"}, "instance", "create", "new"
+        )
+
+        self.assertEqual(code, 0, err)
+        # The NEW instance is scaffolded; main is untouched.
+        self.assertTrue(
+            (self.config_root / "instances" / "new" / "system.yaml").is_file()
+        )
+        self.assertTrue((self.data_root / "instances" / "new" / "kap-home").is_dir())
+        self.assertEqual(main_yaml.read_text(encoding="utf-8"), 'app_id: "cli_main"\n')
+        self.assertIn("instances/new", out)
+        # And the new instance is immediately usable (fail-close passes).
+        code, _, err = self._run_cli("--instance", "new", "binding", "list")
+        self.assertEqual(code, 0, err)
+
+    def test_create_ignores_the_instance_flag_too(self) -> None:
+        self._run_cli("instance", "create", "main")
+
+        code, out, err = self._run_cli("--instance", "main", "instance", "create", "new")
+
+        self.assertEqual(code, 0, err)
+        self.assertTrue(
+            (self.config_root / "instances" / "new" / "system.yaml").is_file()
+        )
+
+    def test_completion_is_not_blocked_by_a_bad_kite_instance(self) -> None:
+        # Audit R5-MED-1: the existence gate collateral-blocked instance-
+        # agnostic commands.
+        code, out, err = self._run_cli_with_env(
+            {"KITE_INSTANCE": "typo-ghost"}, "completion", "bash"
+        )
+
+        self.assertEqual(code, 0, err)
+        self.assertIn("kitectl", out)
 
 
 class FailClosedUncreatedInstanceTests(MultiInstanceTestCase):

@@ -472,3 +472,69 @@ EN:172-176 / zh-CN:140-144 仍写 "goal_objective persist in the binding store",
 
 - btw×/goal 正交(goal 限 main agent)、btw×/archive 预检完好、btw×多实例无共享面,均无回归。
 - 全量 **1346 passed**(代理分片 347/474/167 另跑全绿);独立验证脚本(V1a-V5)覆盖两 chat 定向、广播兜底、零 attached、sweep、abort retire。
+
+---
+
+# 第五轮复审(2026-07-26,基线 7bc29cc → HEAD 84d8592)
+
+> 范围:复核第四轮清单的修复(84d8592 btw 归因等)+ 审查新功能 `kitectl instance create` 与未创建实例 fail-closed(8bc83cc、109d3cc、ed98cd2、4d72d73)。
+> 方法:3 个并行复审代理(C-btw/C-instance/C-docs-misc);主审查人直接读码确认 R5-HIGH-1。测试基线:**1371 passed 全绿**。
+
+## 〇、总体结论
+
+第四轮清单**全部 FIXED-CORRECT**:R4-HIGH-1(FIFO pop-on-start + just-ended 去重)、R4-MED-1(未归因 turn 不碰 FIFO)、freeze 序号守卫、tool-line 走 dispatcher、合同 item 13 四句新登记、README 四处、/goal 注释、测试残留、上轮 LOW 中的 sweep 重复计数/双通知/ImmediateDispatcher 逼真度。**btw 事件归因链至此闭合,本轮无新 HIGH/MED**。但新功能 `instance create` 引入 **1 个新 HIGH**(脚手架写错实例目录)与 1 个 MED(同根因)。
+
+## 一、新发现
+
+### R5-HIGH-1 `instance create` 在 `--instance`/`KITE_INSTANCE` 存在时把脚手架写进错误实例的目录,并谎报成功(主审查人已读码确认)
+
+- 位置:`kite/kitectl.py:1273-1303`(`_apply_instance_environment`)
+- 根因:`instance` 子命令只豁免了 rung-2(single-running),rung-1(--instance flag / KITE_INSTANCE)仍解析并把**那个**实例的 config/data 目录发布进 KITE_CONFIG_DIR/KITE_DATA_ROOT;随后 `scaffold_instance(args.name)` → `instance_layout.resolve(name)` 把已发布的变量当"显式目录轴优先" → 写进被解析实例的目录。
+- 实证(代理,HOME 重定位):`KITE_INSTANCE=main kitectl instance create new` → 实际写进 `instances/main`,`instances/new` 根本没创建,exit=0 报成功;随后 `--instance new service install` 被 fail-closed 拒绝,死循环困惑。KITE_INSTANCE 是文档推荐的免打字方式,导出在 shell profile 是现实场景 → **每次** create 都打偏。install.sh 路径免疫(install.py 不发布实例 env)。
+- 修复方向:`instance`(与 `completion`)作为实例无关命令整体跳过实例解析/目录发布/存在性检查(提前 return);补两条测试(KITE_INSTANCE=已存在实例时 create 的目标目录;KITE_INSTANCE=typo 时 completion/instance create 不被闸门拦截)。
+
+### R5-MED-1 存在性检查殃及实例无关命令(同根因)
+
+`KITE_INSTANCE=typo kitectl completion bash` → exit 2;`instance create` 想创建别的实例也被堵。`completion` 只打印静态脚本,代码注释自己写明"ambiguity 错误是 pure collateral"——存在性错误是同类 collateral,且与 docstring/decision §3 声称的"instance-agnostic"矛盾。与 R5-HIGH-1 同一补丁覆盖。
+
+### R5-LOW-1/2
+
+- `instance create default` 会 mkdir 默认实例永不使用的 `<data>/kap-home`(默认实例 kap home 走 `~/.kimi-code`,decision §2)。
+- `_cmd_instance_create` 输出把 system.yaml 行也打成 `config :`(标签重复,cosmetic)。
+
+### C-btw LOW-1(error 帧夭折路径的近似等价,先于本批存在)
+
+`_btw_error_frame` 的"无 tracked turn + 标记过期 + 有 FIFO 头 ⇒ 夭折"对 agent 级非 turn 错误(compaction/MCP 失败)为近似:若恰好落在 submit→turn.started 窗口或距上次结束 >60s,会误杀活头。现实命中极窄(btw 工具全 veto、排队头亚 tick 即被 pump)。方向:error.code 白名单,或删夭折分支交给 abort/sweep,或在 item 13 登记该近似。
+
+## 二、复核结论(第四轮清单逐项)
+
+- **R4-HIGH-1 — FIXED-CORRECT**:pop-on-start 后全部 FIFO 路径重查(note 接缝/turn.ended/abort retire/夭折路径/rebuild sweep/两 chat);"无 tracked turn + 无标记 + 有 FIFO 头"现在严格等价夭折;just-ended 标记 (session,agent) 键控、60s 懒过期、纯内存重启安全;复现场景逐帧验证(p-b1 正常通知、p-b2 存活、error 命中标记静默);"压掉下一笔真实夭折"的窗口因上游对未启动 prompt 不发 error 而不可达。
+- **R4-MED-1 — FIXED-CORRECT**:未归因 turn 结束不碰 FIFO;他端提交+KITE 在排 S2 场景有测试。
+- **freeze 序号守卫 — FIXED-CORRECT**:两种交错均安全(守卫拦旧 minimal;latest-wins + 回调串行保证 FROZEN_UNKNOWN 赢);闭包捕获不串味。
+- **tool-line 走 dispatcher — FIXED-CORRECT**:230020 重排;渲染在 patch 时刻做(全快照);阻塞 RTT 移出 RuntimeLoop;四个调用方无同步依赖;改名无残留。
+- **合同 item 13 — FIXED-CORRECT**:四句新登记(广播兜底/降级通知+去重/rebuild sweep+通知/远端 abort retire)双语与代码逐句对齐;降级文案"重启或事件重连"已改正。
+- **README 四处 — FIXED-CORRECT**:powershell→fish;system.yaml 模板声明由 8bc83cc 让代码兑现(install  scaffold 默认实例,0600);quick start 改为先配置后 start;"文件"措辞改为"其他文件类型暂不支持"。quick start × instance create 自洽(默认实例无需 create,安装器已搭建)。
+- **/goal 注释、test 死参数、test 错注释 — FIXED-CORRECT**。
+- **上轮 LOW 中的 sweep 重复计数、双降级通知、ImmediateDispatcher 逼真度 — FIXED**;R3 LOW install --instance env 模板也经 scaffold 修复。
+
+## 三、instance create 新功能已核对一致(除 R5-HIGH-1/MED-1 外)
+
+- create 全流程:模板即最终 system.yaml(无变量替换)、0600、目录布局与 instance_layout 一致、幂等重跑保留用户 system.yaml/env 只刷新 example、坏名字全 fail-closed(`..`/保留名/大写/空格/前导符号/65 字符)、`default` 正确落根实例;与 FOCUS 的名字语义差异已登记。
+- fail-closed:kitectl 尾部闸门 + kited 在 lease mkdir **之前**拒绝(盘上零目录);effective-dirs 语义正确(显式轴先发布再判定);默认实例不误拒;FOCUS `require_instance_exists` 语义一致。
+- package-data:wheel 与 sdist 均含模板(本地构建实证);脱离源码树 `load_template` 回退包数据正常;双副本同步有测试锁。
+- install.sh 接线、shell completion 三脚本覆盖 instance create、文档(decision §1/§3、README)与行为一致、既有 instance 测试 200 全绿、rung-2 阶梯行为无变化。
+
+## 四、遗留 LOW 登记(8 项,均未升级)
+
+btw work_changed 合同句、btw 48k 截断提示、/goal replace、/goal 英文错误、升级窗口 lease 双文件、显式 --data-dir schedule create、claim mode 复查、/archive queued 登记。
+
+## 五、下一轮修复优先级
+
+1. **R5-HIGH-1 + R5-MED-1**(同一补丁:实例无关命令整体跳过实例解析与存在性闸门)+ 两条回归测试。
+2. R5-LOW-1/2( trivial)、C-btw LOW-1(item 13 登记近似即可)。
+3. 遗留 LOW 登记项维持。
+
+## 六、趋势与测试
+
+- 五轮 HIGH 数:5 → 2 → 1 → 1 → 1(本轮的在新功能 instance create,btw 链已闭合)。
+- 全量 **1371 passed**(代理分片 370/165/264 另跑全绿);check-docs OK;双语对偶抽查通过。

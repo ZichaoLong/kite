@@ -79,13 +79,17 @@ The check runs after explicit directory axes are published, so
 `--instance <name> --data-dir <custom>` judges the effective dirs.
 
 Rung 2 is skipped wherever it cannot be meant (audit N1-LOW): besides
-`service`, instance-agnostic commands (`completion`, `instance create`)
-never consult it, and any invocation carrying an explicit directory axis —
+`service`, any invocation carrying an explicit directory axis —
 `--config-dir` / `--data-dir`, or pre-set `KITE_CONFIG_DIR` /
 `KITE_DATA_ROOT` — also skips it, because the caller already named the
 directories and a running instance's name must not be mixed in. kited
 itself never uses rung 2: the daemon IS an instance, spelled via
-`--instance` / `KITE_INSTANCE` or the default.
+`--instance` / `KITE_INSTANCE` or the default. Instance-agnostic commands
+(`completion`, `instance`) skip the WHOLE machinery — no resolution, no
+layout-derived env publication, no existence gate (audit R5): rung-1's env
+publication used to send `instance create <new>` into the resolved
+instance's directories, and the gate collateral-blocked
+`KITE_INSTANCE=typo kitectl completion bash`.
 
 ### 4. Daemon instance lease (the real cross-instance guard)
 

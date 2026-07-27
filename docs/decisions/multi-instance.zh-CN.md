@@ -68,12 +68,15 @@ FOCUS 的 `require_existing_instance`):kitectl 与 kited 对未创建的实
 `--instance <名称> --data-dir <自定义>` 按生效目录判定。
 
 阶梯第 2 级在"绝不可能是这个意思"的场景一律跳过（审查 N1-LOW)：除
-`service` 外，实例无关命令（`completion`、`instance create`）不查
-它；任何携带显式目录轴的调用——`--config-dir`/`--data-dir`，或预设
-的 `KITE_CONFIG_DIR`/`KITE_DATA_ROOT`——同样跳过，因为调用者已经点
-名了目录，不能再混入某个在跑实例的名字。kited 自身也从不走第 2
-级：daemon 本身就是实例，经 `--instance`/`KITE_INSTANCE` 或默认实例
-点名。
+`service` 外，任何携带显式目录轴的调用——`--config-dir`/
+`--data-dir`，或预设的 `KITE_CONFIG_DIR`/`KITE_DATA_ROOT`——同样跳
+过，因为调用者已经点名了目录，不能再混入某个在跑实例的名字。kited
+自身也从不走第 2 级：daemon 本身就是实例，经 `--instance`/
+`KITE_INSTANCE` 或默认实例点名。实例无关命令（`completion`、
+`instance`）跳过**整套**机制——不解析、不发布布局目录 env、不过存
+在性闸门（审查 R5)：此前 rung-1 的 env 发布会把 `instance create
+<新实例>` 的脚手架写进被解析实例的目录，存在性闸门还曾误伤
+`KITE_INSTANCE=typo kitectl completion bash`。
 
 ### 4. daemon 实例租约（真正需要的跨实例守卫）
 

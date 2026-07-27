@@ -196,7 +196,7 @@ def _install_instance(name: str) -> None:
     print(f"  config  : {report.config_dir}")
     print(f"  data    : {report.data_dir}")
     print(f"  kap home: {report.kap_home}")
-    print(f"  config  : {report.system_yaml}")
+    print(f"  system.yaml: {report.system_yaml}")
     print(f"  env     : {report.env_path} (0600 template; fill in provider credentials)")
     print()
     print("Next steps:")

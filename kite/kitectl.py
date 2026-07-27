@@ -9,10 +9,11 @@ control_plane.json discovery, stale pids filtered; ambiguity exits 2 with
 the candidate list), otherwise the default instance. An explicit named
 instance must exist on disk — uncreated names exit 2 pointing at
 `kitectl instance create` (FOCUS parity; a typo never silently scaffolds
-an empty instance). `service` commands,
-`completion` and `instance` (instance-agnostic), and any invocation with
-explicit --config-dir/--data-dir (or KITE_CONFIG_DIR/KITE_DATA_ROOT set)
-skip the single-running rung. Explicit --config-dir/--data-dir always win
+an empty instance). `service` commands and any invocation with explicit
+--config-dir/--data-dir (or KITE_CONFIG_DIR/KITE_DATA_ROOT set) skip the
+single-running rung; `completion` and `instance` are instance-agnostic and
+skip the whole machinery (no resolution, no layout env publication, no
+existence gate — audit R5). Explicit --config-dir/--data-dir always win
 over the instance layout.
 
 Implemented slice (docs/contracts/mvp-scope.md §2 kitectl row, §6):
@@ -952,9 +953,12 @@ def _cmd_instance_create(args: argparse.Namespace) -> int:
     print(f"instance '{report.instance_name}' scaffold ready:")
     print(f"  config  : {report.config_dir}")
     print(f"  data    : {report.data_dir}")
-    print(f"  kap home: {report.kap_home}")
+    if named:
+        # The default instance's kap home is ~/.kimi-code (decision §2);
+        # <data>/kap-home exists only for named instances (audit R5).
+        print(f"  kap home: {report.kap_home}")
     print(
-        f"  config  : {report.system_yaml} "
+        f"  system.yaml: {report.system_yaml} "
         f"({'created from template — fill in real values' if report.system_yaml_created else 'kept existing'})"
     )
     print(f"  example : {report.example_path} (reference copy, refreshed)")
@@ -1250,13 +1254,16 @@ def _apply_instance_environment(args: argparse.Namespace) -> None:
     single-running rung is skipped when it cannot be meant:
     - `service` commands (explicit-or-default only, no convenience for
       destructive ops),
-    - instance-agnostic commands (`completion` prints a static script;
-      `instance create` scaffolds a name given positionally — an ambiguity
-      error there would be pure collateral, audit N1),
     - any explicit directory axis (--config-dir/--data-dir or pre-set
       KITE_CONFIG_DIR/KITE_DATA_ROOT): the user already said WHICH
       directories; resolving a running instance would mix its name (kap
       home, unit name) with the explicit dirs (audit N1).
+    Instance-agnostic commands (`completion`, `instance`) skip the WHOLE
+    machinery — no resolution, no layout-derived env publication, no
+    existence gate (audit R5): rung-1's env publication used to send
+    `instance create <new>` into the resolved instance's directories, and
+    the existence gate collateral-blocked `KITE_INSTANCE=typo kitectl
+    completion bash`.
 
     Explicit directories win over the instance layout per axis:
     --config-dir/--data-dir (or pre-set KITE_CONFIG_DIR / KITE_DATA_ROOT)
@@ -1264,15 +1271,29 @@ def _apply_instance_environment(args: argparse.Namespace) -> None:
     kite_config.config_dir() / default_data_root(), which now point at the
     resolved instance.
     """
+    if args.command in ("completion", "instance"):
+        # Instance-agnostic commands skip the WHOLE instance machinery
+        # (audit R5-HIGH-1/MED-1): no resolution, no layout-derived env
+        # publication, no existence gate. Publishing rung-1's instance dirs
+        # here used to send `instance create <new>` into the RESOLVED
+        # instance's directories (scaffold then treated the published vars
+        # as explicit axes) while reporting success; and the existence gate
+        # blocked `KITE_INSTANCE=typo kitectl completion bash` — pure
+        # collateral for a command that prints a static script. User-explicit
+        # directory axes still apply: they are the caller naming directories
+        # directly (scaffold resolves against them).
+        if args.config_dir:
+            os.environ["KITE_CONFIG_DIR"] = args.config_dir
+        if args.data_dir:
+            os.environ["KITE_DATA_ROOT"] = args.data_dir
+        return
     explicit_dirs = bool(
         args.config_dir
         or args.data_dir
         or os.environ.get("KITE_CONFIG_DIR", "").strip()
         or os.environ.get("KITE_DATA_ROOT", "").strip()
     )
-    allow_single_running = (
-        args.command not in ("service", "completion", "instance") and not explicit_dirs
-    )
+    allow_single_running = args.command != "service" and not explicit_dirs
     instance_name = instance_resolution.resolve_instance_name(
         args.instance,
         allow_single_running=allow_single_running,
