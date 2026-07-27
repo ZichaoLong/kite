@@ -81,6 +81,15 @@ are namespaced per instance (docs/decisions/multi-instance.md):
   instance's schedules: a bare hash resolves inside the current namespace,
   and a full name from another namespace is rejected fail-closed.
 
+Migration note: units created before namespacing shipped use the bare
+`kite-schedule-<hash>` shape and are therefore managed as the *default*
+instance's schedules (visible to and removable by the default instance).
+If such a unit was actually meant for a named instance, remove it from the
+default instance and recreate it with `--instance <name>` — keeping both
+would fire the same prompt twice. `kitectl schedule list` notes how many
+timers sit outside the current instance's namespace so their existence is
+visible instead of silently double-firing.
+
 ## 4. Behavior and Safety Contract
 
 1. A scheduled task is only "start one new prompt at a future time"; it may

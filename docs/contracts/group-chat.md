@@ -147,6 +147,16 @@ group log as context material, never a trigger; `all` → aggregated and
 processed like a member text message. The 2s aggregation window and the
 recursive expansion are shared with the p2p path.
 
+Claim-merge semantics (also shared with p2p; audit M12): a buffered
+transcript waits out its ~2s window for the sender's next plain text,
+which *claims* the stash — the two merge into ONE prompt, transcript first
+(`<forwarded_messages>` block, then the comment), so the instruction never
+runs ahead of the content it refers to. The claim is keyed on
+(sender, chat), so it never leaks across members or chats. Only an
+unclaimed window flushes the transcript as its own prompt. Slash commands
+never claim, and interaction replies (approval/question answers) take
+claim precedence by design.
+
 ### 3.8 All-mode reverse exclusivity
 
 The exclusivity rule applies in both directions: any other chat

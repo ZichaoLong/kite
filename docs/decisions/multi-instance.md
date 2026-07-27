@@ -58,6 +58,15 @@ Ambiguity (multiple running, none explicit) fails closed with the list of
 candidates. `kitectl service` commands always take an explicit-or-default
 instance (no "single running" convenience for destructive ops).
 
+Rung 2 is skipped wherever it cannot be meant (audit N1-LOW): besides
+`service`, instance-agnostic commands (`completion`) never consult it, and
+any invocation carrying an explicit directory axis — `--config-dir` /
+`--data-dir`, or pre-set `KITE_CONFIG_DIR` / `KITE_DATA_ROOT` — also skips
+it, because the caller already named the directories and a running
+instance's name must not be mixed in. kited itself never uses rung 2: the
+daemon IS an instance, spelled via `--instance` / `KITE_INSTANCE` or the
+default.
+
 ### 4. Daemon instance lease (the real cross-instance guard)
 
 Two kited processes must never drive the same instance (Feishu would

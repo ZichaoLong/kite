@@ -34,7 +34,7 @@
 | `/plan [on\|off]` | 查看/切换 binding 级 plan mode（kap `plan_mode`，与 permission mode 正交）；每个 prompt 显式携带 |
 | `/effort <off\|low\|medium\|high\|xhigh\|max>` | 读写 binding 级 thinking effort(kap `thinking`)；与 permission mode 同样持久化，每个 prompt 显式携带 |
 | `/goal [文本\|pause\|resume\|cancel\|off]` | session 的上游目标：文本经 `POST .../profile {agent_config.goal_objective}` 创建（已有活跃目标时透出 40913);`pause`/`resume`/`cancel` 经 `{agent_config.goal_control}`;`off` 即 cancel；无参经 `GET .../goal` 读回。本地不持久化（2026-07-27 修正，复审 N2-HIGH-1:prompt 提交路由静默丢弃 goal_* 字段） |
-| `/compact` | 压缩绑定 session 的上下文（kap `:compact` 透传）；确认完成或回显上游错误文本 |
+| `/compact` | 压缩绑定 session 的上下文（kap `:compact` 透传）；上游路由为 fire-and-forget，回执为"已请求压缩"（受理），非完成确认；KapError 时原样回显上游错误文本 |
 | `/rename 〈title〉` | 重命名绑定 session 的标题（kap `:profile` 透传） |
 | `/archive` / `/restore` | 归档/恢复绑定 session(kap `:archive` / `:restore` 透传）；已归档绑定按 §4.7 行为（下一条消息报错并提示 `/sessions`，不隐式重建） |
 | `/status` | 展示 binding、session、work state、排队情况 |
@@ -138,10 +138,11 @@
    `/new`（对齐项 7）同理由：在途执行卡、终态结果与审批路由会失去可见
    性）(2026-07-25)。
 12. 准入 `/effort`、`/goal`、`/compact`、`/rename`、`/archive`、`/restore`
-   (2026-07-25):binding 级 `effort`(thinking）与 `goal_objective` 与
-   permission mode 同样落 binding store；生命周期动作为 kap 透传。
-   `kitectl`/`kited` 的 shell 补全随安装提供（bash/zsh/fish 生成器，
-   仿 FOCUS 的 `shell_completion.py` 形态）。
+   (2026-07-25):binding 级 `effort`(thinking）与 permission mode 同样落
+   binding store；生命周期动作为 kap 透传。`kitectl`/`kited` 的 shell
+   补全随安装提供（bash/zsh/fish 生成器，仿 FOCUS 的
+   `shell_completion.py` 形态）。(`/goal` 的持久化模型一天后被修正——
+   见第 14 条。)
 13. 准入 `/btw`(2026-07-26)：旁路面。上游 `:btw` 启动的是旁路
    **agent**（而非插入便签）;`/btw 〈文本〉` 按需启动（每 session 内存
    缓存）并以该 `agent_id` 提交。**事件路由（2026-07-27 修正，复审

@@ -144,16 +144,19 @@ gate。登记在 `docs/decisions/concurrency-model.md`，等产品证明需要�
   使用劝告式文件锁。原子 rename 使跨进程读（如 `kitectl`）无需锁也
   安全。
 - stores:binding store(chat ↔ session、attached、permission mode、plan
-  mode)、终态结果 store、事件 cursor store（每 session 的 `{seq, epoch}`)、
+  mode、effort)、终态结果 store、事件 cursor store（每 session 的 `{seq, epoch}`)、
   附件 staging store（后期）。
 - binding 级 **permission mode**（对应 kap `permission_mode`:auto/manual/yolo)
   与 **plan mode**（kap `plan_mode`，独立的布尔字段）持久化，落盘后
   **不随实例默认漂移**，每个 prompt 显式携带（kap 的
   per-prompt override 原生支持，正好落实 FOCUS"每 turn 显式重新应用"
-  的合同）。**模型**同样在每个 prompt 上显式携带——REST 创建的 session
-  既不继承 env 覆盖层也不继承 `config.toml` 的 `default_model`（见
-  spike-results §0)；解析顺序：`kap.model` 配置 → `config.toml`
-  `default_model`。
+  的合同）。binding 级 **effort**(kap per-prompt `thinking`）遵循同一
+  规则：持久化在 binding 中、每个 prompt 显式携带；`""` 表示未设置
+  （提交时省略）。**goal** 不同——它保存在上游会话侧（profile/goal
+  路由），不 mirror 进 binding。**模型**同样在每个 prompt 上显式携带
+  ——REST 创建的 session 既不继承 env 覆盖层也不继承 `config.toml` 的
+  `default_model`（见 spike-results §0)；解析顺序：`kap.model` 配置 →
+  `config.toml` `default_model`。
 - kimi-code 侧的 session 元数据（id、cwd、title、历史）以
   `~/.kimi-code` 为单一事实源；KITE 不复制、不 mirror。
 

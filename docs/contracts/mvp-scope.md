@@ -39,7 +39,7 @@ If it cannot answer, cut the requirement. No exceptions.
 | `/plan [on\|off]` | read/toggle the binding-level plan mode (kap `plan_mode`, orthogonal to permission mode); carried explicitly on every prompt |
 | `/effort <off\|low\|medium\|high\|xhigh\|max>` | read/write the binding-level thinking effort (kap `thinking`); persisted like permission mode and carried explicitly on every prompt |
 | `/goal [text\|pause\|resume\|cancel\|off]` | the session's upstream goal: text creates it via `POST .../profile {agent_config.goal_objective}` (40913 surfaces when one is already active); `pause`/`resume`/`cancel` via `{agent_config.goal_control}`; `off` = cancel; no arg reads it back via `GET .../goal`. Nothing persisted locally (corrected 2026-07-27, audit N2-HIGH-1: the prompt-submit route silently drops goal_* fields) |
-| `/compact` | compact the bound session's context (kap `:compact` pass-through); confirms completion or reports the upstream error text |
+| `/compact` | compact the bound session's context (kap `:compact` pass-through); the upstream route is fire-and-forget, so the ack is "compact requested" (acceptance), not completion; a KapError reports the upstream error text verbatim |
 | `/rename <title>` | rename the bound session's title (kap `:profile` pass-through) |
 | `/archive` / `/restore` | archive / restore the bound session (kap `:archive` / `:restore` pass-through); an archived binding behaves per §4.7 (next message errors and suggests `/sessions`; no implicit recreation) |
 | `/status` | show binding, session, work state, queue status |
@@ -170,10 +170,11 @@ explicitly; "best-effort" silent degradation is forbidden:
     (aligned item 7): the in-flight execution card, terminal result and
     approval routing would lose visibility (2026-07-25).
 12. `/effort`, `/goal`, `/compact`, `/rename`, `/archive`, `/restore` admitted
-    (2026-07-25): binding-level `effort` (thinking) and `goal_objective`
-    persist in the binding store like permission mode; lifecycle actions are
-    kap pass-throughs. Shell completion for `kitectl`/`kited` ships with the
-    install (bash/zsh/fish generators, FOCUS's `shell_completion.py` shape).
+    (2026-07-25): binding-level `effort` (thinking) persists in the binding
+    store like permission mode; lifecycle actions are kap pass-throughs.
+    Shell completion for `kitectl`/`kited` ships with the install
+    (bash/zsh/fish generators, FOCUS's `shell_completion.py` shape).
+    (`/goal`'s persistence model was corrected a day later — see item 14.)
 13. `/btw` admitted (2026-07-26): the side-channel surface. Upstream's
     `:btw` starts a side-channel AGENT (not note injection); `/btw 〈text〉`
     starts it on demand (cached in-memory per session) and submits with that

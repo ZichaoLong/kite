@@ -318,3 +318,88 @@
 5. **N2-MED-1**(/archive busy 预检)、**N3-MED-2/3/4**(/btw 生命周期与预检,随 N3-HIGH-1 一并做)。
 6. **R-1**(/status 的 'none')、**R-4/R-5/R-6**(ack 泄漏收割、auth 告警可达性、日志/docstring 收尾)。
 7. LOW 批:N4 fish guard、N1 LOW 组、R-3、文档 gap(concurrency-model.md / kite-design §1 / mvp-scope Non-goals 与 §2 矛盾项)。
+
+---
+
+# 第三轮复审(2026-07-26,基线 1e49754 → HEAD 46297f3)
+
+> 范围:复核第二轮清单的修复(9d5eb57 /btw 合同、07ed153 /goal 重接线、fdc42a4 /btw 事件路由、46297f3 P3 批次),并猎捕修复引入的新问题。
+> 方法:5 个并行复审代理(A-goal/A-btw/A-instance/A-p3misc/A-regress),全部对照当前代码;主审查人直接读码确认新 HIGH。测试基线:**1327 passed 全绿**(无 flake)。
+
+## 〇、总体结论
+
+第二轮清单的修复**全部落地且方向正确**(R-1/R-2/R-4/R-5/R-6、N1-MED-1/2、N2-HIGH-1、N2-MED-1、N3-MED-2/3/4、N4-MED-1、N1-LOW 组、doc gaps)。但 /btw 修复自身引入 **1 个新 HIGH**(投递目标次序 bug,两个代理独立发现),另有 4 个 MED。/goal 重接线代码正确,留下 1 个 MED 文档矛盾与若干过时文本。
+
+## 一、新发现(本轮修复引入或新暴露)
+
+### R3-HIGH-1 btw 答复从未定向到发起 chat——所有权在投递前被先行销毁(两个代理独立发现+实证)
+
+- 位置:`kite/event_pipeline.py:682`(`_btw_turn_ended`)与 `:748`(`_btw_error_frame`)
+- 事实:两处都先调 `_end_btw_turn(key)`(`:718-719` 执行 `_ownership.forget(prompt_id)`),后调 `_btw_target_chats(...)`(`:727` 读 `entry_of(prompt_id)`)——恒为 None → 落入"广播给全部 attached chat"分支。合同 item 13 承诺的 "delivered to the initiating chat" 在多 chat 绑同一 session 时**永远不成立**,旁路答复(可能含敏感内容)泄漏给全部 attached chat。实证:两 chat 绑定、ownership certain,CHAT_ID_2 同样收到"旁路回复:机密答案"。测试盲区:所有归属用例只绑一个 chat(广播=定点)。
+- 修复方向:先算 targets 再 retire(或 `_end_btw_turn` 返回归属后再 forget);补"两 chat + known owner → 只投发起方"测试。
+
+### R3-MED-1 失败的 btw turn 双重失败通知
+
+上游固定顺序 `turn.ended(failed)` → `error` 事件(loopService.ts:410-418):`_btw_turn_ended` 已发"执行失败",`_btw_error_frame` 再发"⚠️ 上游错误"。主路径靠 `_terminal_delivered` 去重,btw 无等价物;且第二条还会触发 R3-HIGH-1 的广播。修复:`_btw_error_frame` 只在"turn.started 前夭折"(无 tracked turn 且有 FIFO 头)时通知。
+
+### R3-MED-2 btw turn.ended 丢失(resync 间隙/kap 重启)→ FIFO 永久错位一格
+
+`_rebuild_session` 不动 `_btw_turns`/`_btw_prompts`;丢帧后陈旧 FIFO 头使下一笔归到上一笔的 owner(实证:chat2 的答复发到 chat1)。`_dispatch_btw` 把 PromptAborted 当 debug 忽略,他端 abort 同样漏 FIFO。修复:rebuild 时对 btw FIFO fail-closed 清理/通知;处理 PromptAborted 退役 FIFO 项。
+
+### R3-MED-3 kited 重启跨越在飞 btw turn → 答复静默丢失(非 fail-closed)
+
+`_btw_turns` 纯内存,重启后 turn.ended 到达仅 debug 日志,用户零反馈(snapshot in_flight_turn 是 main-only 无法重建)。合同只登记"agent 按需重建"未覆盖在飞 prompt。修复:untracked 的 btw turn.ended 给 attached chats 发降级通知。
+
+### R3-MED-4 /goal 重接线后缺 §4.7 归档预检(与 /btw 本轮内部不一致)
+
+`_cmd_goal`(app_handler.py:1946-2011)的 set/control/get 路由都会 `lifecycle.resume()` → 归档会话被静默物化且回"已设置目标"假阳性。本轮 /btw 已加 `_preflight_session_for_submit`,/goal 没有。修复:复用同款预检。(附注:/rename 同样无预检,先于本轮。)
+
+### R3-MED-5 schedule unit 命名空间化使既有 timer 孤儿化,同名重建双触发
+
+P3 前创建的 `kite-schedule-<hash>`(无前缀、不带 --instance):升级后对命名实例不可见、remove 被拒为"belongs to default",但**仍在触发**;用户重建会生成第二个 unit → 同一 prompt 双发。合同 §3.1 只登记新命名,无迁移/清扫。窗口约 1 天、大概率仅开发机,但需一次性迁移说明或收养路径。
+
+### R3-MED-6 mvp-scope aligned item 12 未改(文档矛盾)
+
+EN:172-176 / zh-CN:140-144 仍写 "goal_objective persist in the binding store",与同文件 item 14 及当前代码直接矛盾(第三轮修复清单明确要求改,漏了)。
+
+## 二、修复复核结论(第二轮清单逐项)
+
+- **N2-HIGH-1 /goal 重接线 — FIXED-CORRECT(代码)**:`POST profile {agent_config:{goal_objective|goal_control}}` + `GET goal` 与上游逐字段一致;40913 透出;submit 不再携带 goal_*;binding 字段与 `_pending_goal_controls` 删净;旧 bindings.json 兼容(未知键丢弃);测试按新 wire 合同重写;研究文档错误结论已改正。残留:R3-MED-6(item 12)+ 过时文本(见 LOW)。
+- **N3-HIGH-1 /btw 事件路由 — FIXED-PARTIAL**:agentId 透传链完整(12 类 durable + volatile),三个复现场景全部修复(主闲独立投递、主忙不劫持、error 按 agent 归因),主流/旁路隔离有测试;但投递目标有 R3-HIGH-1。N3-MED-2(40401 清缓存重试一次)、N3-MED-3(archived 预检)、N3-MED-4(detached 拒绝)均 FIXED-CORRECT。
+- **N1-MED-1 lease 迁 data dir — FIXED-CORRECT**:锁 `<data>/kited.lock`,取锁点在实例环境发布之后;两 config 共 data 正确互斥(有测试);决策 §4 同步;与 FOCUS 同轴。
+- **N1-MED-2 schedule 实例感知 — FIXED-CORRECT**:`ScheduleSpec.instance`、三后端 argv 携带 `--instance`(真 parser 验证)、unit 名 `kite-schedule-<instance>-<hash>` 两形不相交、list 过滤、show/remove 跨实例 fail-closed;"same KITE instance" 承诺经 §3.1 兑现(默认实例走解析阶梯是登记取舍)。
+- **N1-LOW 组 — 全部 FIXED**:rung-2 显式目录跳过、completion 跳过、实例名 ≤64(FOCUS 一致)、install --instance env 模板(0600)。doc gap(concurrency-model.md、kite-design §1)已补齐。
+- **R-1 /status 'none' — FIXED-CORRECT**(`_parse_session` 统一走 `_optional_pending_interaction`,有测试)。
+- **R-2 /switch 捷径 — FIXED-CORRECT**(双探针与一般路径同序同语义,路径 C 走查拒绝,3 测试)。
+- **R-4 ack 泄漏 — FIXED-CORRECT**(register-before-send + finally 兜底 + 迟到/未等 ack 丢弃;迟到场景有测试直接锁定)。
+- **R-5 auth 告警 — FIXED-CORRECT**(InvalidHandshake 入分类、401 词边界不误判 40401、warmup 401 上抛、连续 ≥3 次 ERROR 日志有测试)。
+- **N2-MED-1 /archive 预检 — FIXED-CORRECT**(check_new 同款三分支,合同 item 15 登记,3 测试)。
+- **N4-MED-1 fish guard — FIXED-CORRECT**(after-value-flag 只挂 word 条目,生成物静态验证)。
+- **L34/D1 — FIXED-CORRECT**(docstring 按 13 个 kind 对齐上游;rebuild 日志含 chat_id,§6 覆盖)。
+- **文档项**:Non-goals compact 矛盾删除、/compact 合同行改写,均 FIXED。
+- **kite-design §7 thinking 登记 — NOT-FIXED(LOW)**:effort 持久化于 binding + 逐 prompt 携带,但 §7 枚举与携带清单双语未登记(§4 轴定义无需改)。
+
+## 三、LOW 清单(本轮记录)
+
+- /archive 预检 queued 放行 vs 上游 drainAgents 连 queued 一起取消(窗口小;item 15 补登记或预检升级)。
+- /compact 合同行 "confirms completion" 仍略过实(上游 fire-and-forget,busy 静默 no-op;代码回执"已请求压缩"反而准确,改合同措辞)。
+- /goal 过时文本:/help(command_surface.py:100)与 :24-26 仍描述旧的"随 prompt 携带"模型;binding_store.py:12-15 docstring 与 :57 孤儿注释;app_handler.py:1731;test 死参数(test_app_handler.py:526,537)与错误注释(test_binding_store.py:90)。
+- /goal UX:无 goal 时 off/pause/resume 透出英文上游错误(旧版回中文提示);无 replace 路径(profile 路由无 replace 字段,只能先 off 再设——与上游 TUI 的 /goal replace 差异)。
+- btw 边角:turn.ended 时零 attached chat → 答复静默丢弃(与 docstring "never dropped silently" 不符);/switch//new//archive 预检只看主队列(btw turn 不可见——已被 40401 重试与归档预检兜住);升级窗口内新旧 lease 文件不同互不互斥(旧二进制持 config 锁 + 新二进制取 data 锁 → 短暂双 daemon)。
+- 多实例:决策 §3 未登记 rung-2 新跳过规则;显式 --data-dir + schedule create 生成打向默认 root 的定时器(建议拒绝或把目录轴写进 unit);旧 config 侧锁文件无清理。
+- R-3 三项(上轮 LOW)维持 NOT-FIXED:freeze/极简重试 patch 不过 dispatcher(230020 不重排)、claim 路径无 mode 复查、group-chat §3.7 未写认领-合并语义(test_group_chat.py:1341 引用了不存在的条款)。
+- btw work_changed 合同句与测试描述虚构行为(上游恒盖 'main',busy 聚合全部 agent;今日无生产消费方,无实际影响);btw 超 48k 答复静默截断无提示。
+- 多实例旧 schedule 迁移见 R3-MED-5。
+
+## 四、下一轮修复优先级
+
+1. **R3-HIGH-1**(btw 投递目标次序):一行次序问题 + 两 chat 回归测试,本轮就该修。
+2. **R3-MED-1/2/3**(btw 双重通知、FIFO 错位、重启静默):btw 事件模型的收尾三件,建议一起做(都触碰 `_btw_*` 同一片代码)。
+3. **R3-MED-4**(/goal 归档预检,一行复用)、**R3-MED-6**(item 12 文档矛盾)。
+4. **R3-MED-5**(schedule 旧 timer 迁移说明/收养路径)。
+5. LOW 批:goal 过时文本清理、kite-design §7 thinking 登记、group-chat §3.7 补写、决策 §3 rung-2 登记、/compact 措辞、R-3 残留。
+
+## 五、交叉特性已核对(无问题)
+
+- btw×goal 正交(submit 不再带 goal;goal 是 main-agent 作用域);btw FIFO 与 RuntimeLoop 串行一致(命令 loop.call、事件 loop.submit,note_btw_prompt 先于 turn.started);/archive×btw 缓存一致性(归档预检 + 40401 重试兜住);btw 不产生 approval/question(上游工具全 veto);/abort 不见 btw(合同已登记);升级窗口 lease 双文件已记录。
+- 测试:全量 **1327 passed**(各代理分片另跑 366/476/223/212 等,全绿)。

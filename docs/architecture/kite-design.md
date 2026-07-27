@@ -175,17 +175,21 @@ Carry over FOCUS experience, rewritten to kap event semantics:
   processes. Atomic rename makes cross-process reads (e.g., `kitectl`) safe
   without locks.
 - stores: binding store (chat ↔ session, attached, permission mode, plan
-  mode), terminal result store, event cursor store (per-session
+  mode, effort), terminal result store, event cursor store (per-session
   `{seq, epoch}`), attachment staging store (later).
 - Binding-level **permission mode** (mapping to kap `permission_mode`:
   auto/manual/yolo) and **plan mode** (kap `plan_mode`, a separate boolean)
   are persisted; once written to disk they **do not drift with
   the instance default**, and every prompt carries them explicitly (kap natively
   supports per-prompt override, which happens to implement FOCUS's "reapply
-  explicitly every turn" contract). The **model** is likewise carried
-  explicitly on every prompt — REST-created sessions inherit neither the env
-  overlay nor `config.toml`'s `default_model` (spike-results §0); it resolves
-  from `kap.model` config → `config.toml` `default_model`.
+  explicitly every turn" contract). Binding-level **effort** (kap per-prompt
+  `thinking`) follows the same rule: persisted in the binding and carried
+  explicitly on every prompt; `""` means unset (omitted on submit). The
+  **goal** is different — it lives upstream in the session (profile/goal
+  routes) and is not mirrored into the binding. The **model** is likewise
+  carried explicitly on every prompt — REST-created sessions inherit neither
+  the env overlay nor `config.toml`'s `default_model` (spike-results §0); it
+  resolves from `kap.model` config → `config.toml` `default_model`.
 - Session metadata on the kimi-code side (id, cwd, title, history) has
   `~/.kimi-code` as its single source of truth; KITE does not copy or mirror it.
 
