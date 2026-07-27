@@ -57,7 +57,7 @@ commit)，无稳定性承诺，需要版本跟随（不钉死，见 `docs/archit
 | archive / restore | `POST /sessions/{id}:archive` / `:restore` | `routes/sessions.ts:747-773` |
 | delete | **无**（全 server 仅 workspaces/files/oauth 有 DELETE) | grep 确认 |
 | 其他 action | `:fork` `:compact` `:undo` `:abort` `:btw`（侧 channel)、children | `routes/sessions.ts:604-916` |
-| 发起 turn | `POST /sessions/{id}/prompts`(content: text/image/video/file；可携带 per-request `model`/`thinking`/`permission_mode`/`plan_mode`/`goal_*` override) | `routes/prompts.ts:163-229`、`protocol/rest-prompt.ts:31-42` |
+| 发起 turn | `POST /sessions/{id}/prompts`(content: text/image/video/file；可携带 per-request `model`/`thinking`/`permission_mode`/`plan_mode` override) | `routes/prompts.ts:163-229`、`protocol/rest-prompt.ts:31-42` |
 | 队列查询 | `GET /sessions/{id}/prompts`(active + queued) | `routes/prompts.ts:140-161` |
 | 中断 | `POST .../prompts/{pid}:abort`;`POST /sessions/{id}:abort` | `routes/prompts.ts:260-302`、`routes/sessions.ts:721-728` |
 | steer | `POST /sessions/{id}/prompts::steer`——**只能把已排队 prompt 注入活动 turn**;engine 的 `inject()` 未暴露 REST | `routes/prompts.ts:231-258`、`agent-core-v2/.../promptService.ts:115-137` |
@@ -246,3 +246,10 @@ commit)，无稳定性承诺，需要版本跟随（不钉死，见 `docs/archit
    `KIMI_MODEL_API_KEY` / `KIMI_MODEL_BASE_URL` env 覆盖层，且经 REST
    创建的 session 不继承覆盖层 `defaultModel`——每个 prompt 显式传
    `model`。
+9. prompt 提交路由解析但静默丢弃 `goal_*` 字段（2026-07-27 对照
+   `routes/prompts.ts` 验证：无 goal 消费者；§2 旧行中的 `goal_*` 论断
+   有误）。真实 goal 路径为
+   `POST /sessions/{id}/profile` 携带
+   `agent_config.goal_objective` / `agent_config.goal_control`（触发
+   createGoal/pause/resume/cancel）与 `GET /sessions/{id}/goal`。相对
+   地，`thinking` 确实被提交路由消费（`routes/prompts.ts:154-173`)。

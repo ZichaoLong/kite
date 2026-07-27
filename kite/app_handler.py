@@ -8,7 +8,6 @@ Implements the MVP inbound contract (docs/contracts/mvp-scope.md):
 - plain text -> resolve the chat's binding (first use creates a session with
   cwd=default_working_dir and binds it) -> submit the prompt carrying the
   binding's permission_mode + plan_mode + effort (thinking) +
-  goal_objective explicitly, plus any pending one-shot goal_control ->
   record prompt ownership -> minimal ack;
 - attachment messages (images, docs/contracts/images.md §2): staged into
   the bound session's cwd by AttachmentDomain with a TTL'd pending record;
@@ -136,7 +135,6 @@ from kite.runtime_loop import RuntimeLoop, RuntimeLoopClosedError
 from kite.stores.binding_store import (
     DEFAULT_ATTACHED,
     DEFAULT_EFFORT,
-    DEFAULT_GOAL_OBJECTIVE,
     DEFAULT_PERMISSION_MODE,
     DEFAULT_PLAN_MODE,
     PERMISSION_MODE_YOLO,
@@ -270,8 +268,6 @@ class KapSessionOps:
         permission_mode: str,
         plan_mode: bool,
         thinking: str = "",
-        goal_objective: str = "",
-        goal_control: str = "",
         agent_id: str = "",
     ) -> SubmitPromptResult:
         return self.submit_prompt_content(
@@ -280,8 +276,6 @@ class KapSessionOps:
             permission_mode=permission_mode,
             plan_mode=plan_mode,
             thinking=thinking,
-            goal_objective=goal_objective,
-            goal_control=goal_control,
             agent_id=agent_id,
         )
 
@@ -293,15 +287,12 @@ class KapSessionOps:
         permission_mode: str,
         plan_mode: bool,
         thinking: str = "",
-        goal_objective: str = "",
-        goal_control: str = "",
         agent_id: str = "",
     ) -> SubmitPromptResult:
         # permission_mode / plan_mode / model are carried explicitly on every
         # prompt (kite-design.md §7; spike-results §0 for the model part);
-        # thinking (binding effort), goal_objective and the one-shot
-        # goal_control ride the same per-prompt explicit discipline
-        # (mvp-scope §2 /effort /goal rows) and are omitted when unset.
+        # thinking (binding effort) rides the same per-prompt explicit
+        # discipline and is omitted when unset.
         # The content-part wire shape is the upstream promptSubmissionSchema:
         # text parts and native image parts with a base64 source
         # (packages/protocol/src/rest/prompt.ts + message.ts
@@ -316,10 +307,6 @@ class KapSessionOps:
             payload["model"] = self._model
         if thinking:
             payload["thinking"] = thinking
-        if goal_objective:
-            payload["goal_objective"] = goal_objective
-        if goal_control:
-            payload["goal_control"] = goal_control
         if agent_id:
             payload["agent_id"] = agent_id
         data = self._rest.call(
@@ -336,6 +323,34 @@ class KapSessionOps:
         if not isinstance(status, str) or not status:
             raise KapTransportError("submit prompt: unexpected data shape")
         return SubmitPromptResult(prompt_id=prompt_id, status=status)
+
+    def set_goal(self, session_id: str, objective: str) -> None:
+        # The real upstream goal path (routes/sessions.ts profile →
+        # sessionLegacyService.createGoal); the prompt-submit route parses
+        # goal_objective/goal_control but silently DROPS them (verified:
+        # routes/prompts.ts has no goal consumer — audit N2-HIGH-1).
+        data = self._rest.call(
+            "POST",
+            f"/sessions/{_quote(session_id)}/profile",
+            {"agent_config": {"goal_objective": objective}},
+        )
+        if not isinstance(data, dict):
+            raise KapTransportError("set goal: unexpected data shape")
+
+    def control_goal(self, session_id: str, control: str) -> None:
+        # goal_control ∈ {pause, resume, cancel} via the same profile route.
+        data = self._rest.call(
+            "POST",
+            f"/sessions/{_quote(session_id)}/profile",
+            {"agent_config": {"goal_control": control}},
+        )
+        if not isinstance(data, dict):
+            raise KapTransportError("control goal: unexpected data shape")
+
+    def get_goal(self, session_id: str) -> dict[str, Any] | None:
+        # GET /sessions/{id}/goal returns the current goal or null.
+        data = self._rest.get(f"/sessions/{_quote(session_id)}/goal")
+        return data if isinstance(data, dict) else None
 
     def start_btw(self, session_id: str) -> str:
         # kap pass-through (mvp-scope §2 /btw row): POST :btw starts the
@@ -509,13 +524,6 @@ class AppHandler(TransportHandler):
         )
         self._on_session_bound = on_session_bound
         self._persist_admins = persist_admins or _persist_admins_to_config
-        # One-shot goal controls (/goal pause|resume|cancel): the pending
-        # kap ``goal_control`` per chat, attached to that chat's next prompt
-        # and consumed on a successful submit. In-memory only by design
-        # (mvp-scope §2 /goal row): a restart simply loses a pending one-shot
-        # control, which is acceptable — it is never part of the binding
-        # store's persisted state.
-        self._pending_goal_controls: dict[str, str] = {}
         # Side-channel agent per session for /btw (in-memory; a restart just
         # starts a fresh one — mvp-scope aligned item 13).
         self._btw_agents: dict[str, str] = {}
@@ -1251,12 +1259,6 @@ class AppHandler(TransportHandler):
             }
             for image in prepared.images
         )
-        # The pending one-shot goal control (/goal pause|resume|cancel) rides
-        # this prompt. It is consumed only after a successful submit: a
-        # failed or blocked submit leaves it pending for the next prompt —
-        # the same consume-once + restore-on-failure discipline as the
-        # staged attachments above.
-        goal_control = self._pending_goal_controls.get(chat_id, "")
         try:
             result = self._ops.submit_prompt_content(
                 session_id,
@@ -1264,8 +1266,6 @@ class AppHandler(TransportHandler):
                 permission_mode=binding["permission_mode"],
                 plan_mode=binding["plan_mode"],
                 thinking=binding["effort"],
-                goal_objective=binding["goal_objective"],
-                goal_control=goal_control,
             )
         except KapTransportError:
             # Submit failed: restore the consumed records so a retry still
@@ -1284,9 +1284,6 @@ class AppHandler(TransportHandler):
             self._attachment_domain.restore_consumed(prepared.consumed)
             self._reply_to(message, "提交被 kap-server 拒绝（blocked），该 prompt 未执行。")
             return None
-        if goal_control:
-            # The one-shot control reached kap with this prompt: consumed.
-            self._pending_goal_controls.pop(chat_id, None)
         if prepared.consumed:
             # Successful submit: consumption deletes the staged files
             # (contract §2.5); the image bytes live in the kap message.
@@ -1348,7 +1345,6 @@ class AppHandler(TransportHandler):
             "permission_mode": DEFAULT_PERMISSION_MODE,
             "plan_mode": DEFAULT_PLAN_MODE,
             "effort": DEFAULT_EFFORT,
-            "goal_objective": DEFAULT_GOAL_OBJECTIVE,
         }
         self._binding_store.save(chat_id, binding)
         self._notify_session_bound(info.session_id)
@@ -1416,7 +1412,6 @@ class AppHandler(TransportHandler):
 
         owner_chat_id = ""
         effort = DEFAULT_EFFORT
-        goal_objective = DEFAULT_GOAL_OBJECTIVE
         if chat_id:
             binding = self._binding_store.load(chat_id)
             if binding is None:
@@ -1438,13 +1433,9 @@ class AppHandler(TransportHandler):
                 permission_mode = binding["permission_mode"]
             if plan_mode is None:
                 plan_mode = binding["plan_mode"]
-            # Effort and the goal objective are binding-level settings too
-            # (mvp-scope §2 /effort /goal rows): carried explicitly like the
-            # modes. The pending one-shot goal_control is NOT consumed here —
-            # it attaches to the next prompt FROM THE CHAT, and a
-            # control-plane prompt is not one.
+            # Effort is a binding-level setting too (mvp-scope §2 /effort
+            # row): carried explicitly like the modes.
             effort = binding["effort"]
-            goal_objective = binding["goal_objective"]
             owner_chat_id = chat_id
         else:
             # No binding to inherit from and no owner to record: approvals
@@ -1479,7 +1470,6 @@ class AppHandler(TransportHandler):
                 permission_mode=permission_mode,
                 plan_mode=plan_mode,
                 thinking=effort,
-                goal_objective=goal_objective,
             )
         except KapTransportError as exc:
             raise ControlError(f"cannot reach kap-server: {exc}", code="kap_unreachable") from exc
@@ -1727,9 +1717,6 @@ class AppHandler(TransportHandler):
             ),
             "plan_mode": current["plan_mode"] if current else DEFAULT_PLAN_MODE,
             "effort": current["effort"] if current else DEFAULT_EFFORT,
-            "goal_objective": (
-                current["goal_objective"] if current else DEFAULT_GOAL_OBJECTIVE
-            ),
         }
         self._binding_store.save(chat_id, binding)
         self._notify_session_bound(info.session_id)
@@ -1939,66 +1926,68 @@ class AppHandler(TransportHandler):
         self._reply_to(message, f"思考强度已切换为 {effort}，后续每条 prompt 都会携带。")
 
     def _cmd_goal(self, message: InboundMessage, arg: str) -> None:
-        """/goal [text|pause|resume|cancel|off]: binding-level goal state.
+        """/goal [text|pause|resume|cancel|off]: the session's upstream goal.
 
-        No arg shows the current objective; text persists it on the binding
-        (kap ``goal_objective``, carried on every prompt until ``off``
-        clears it); pause/resume/cancel stage a one-shot kap
-        ``goal_control`` attached to this chat's next prompt.
+        The real upstream path is the profile route (`agent_config.
+        goal_objective` → createGoal, `agent_config.goal_control` →
+        pause/resume/cancel); the prompt-submit route silently drops goal_*
+        fields (audit N2-HIGH-1). Nothing is persisted locally: the goal
+        lives upstream and is read back via `GET .../goal`.
         """
         binding = self._load_binding_or_reply(message)
         if binding is None:
             return
+        session_id = binding["session_id"]
         text = arg.strip()
         if not text:
-            objective = binding["goal_objective"] or "未设置"
-            shown = f"当前目标：{objective}"
-            pending = self._pending_goal_controls.get(message.chat_id)
-            if pending:
-                shown += f"\n待生效控制：{pending}（将随下一条 prompt 发送一次）。"
-            self._reply_to(message, shown)
+            try:
+                goal = self._ops.get_goal(session_id)
+            except KapTransportError:
+                self._reply_to(message, _KAP_UNREACHABLE_TEXT)
+                return
+            except KapError as exc:
+                self._reply_to(message, f"查询目标失败：{exc.msg}")
+                return
+            if not goal:
+                self._reply_to(message, "当前没有进行中的目标。可用 /goal 〈目标文本〉 设置。")
+                return
+            objective = str(goal.get("objective") or "").strip()
+            status = str(goal.get("status") or "").strip()
+            suffix = f"（{status}）" if status else ""
+            self._reply_to(message, f"当前目标：{objective}{suffix}")
             return
         keyword = parse_goal_keyword_arg(text)
-        if keyword == "off":
-            if not binding["goal_objective"]:
-                self._reply_to(message, "当前没有设置目标。")
+        try:
+            if keyword == "off":
+                self._ops.control_goal(session_id, "cancel")
+                logger.info(
+                    "goal cancelled chat_id=%s operator=%s",
+                    message.chat_id,
+                    message.sender_open_id,
+                )
+                self._reply_to(message, "已取消当前目标。")
                 return
-            binding["goal_objective"] = ""
-            self._binding_store.save(message.chat_id, binding)
+            if keyword is not None:
+                self._ops.control_goal(session_id, keyword)
+                logger.info(
+                    "goal control chat_id=%s control=%s operator=%s",
+                    message.chat_id,
+                    keyword,
+                    message.sender_open_id,
+                )
+                self._reply_to(message, f"已执行 goal {keyword}。")
+                return
+            self._ops.set_goal(session_id, text)
             logger.info(
-                "goal objective cleared chat_id=%s operator=%s",
+                "goal set chat_id=%s operator=%s",
                 message.chat_id,
                 message.sender_open_id,
             )
-            self._reply_to(message, "已清除当前目标，后续 prompt 不再携带。")
-            return
-        if keyword is not None:
-            # One-shot control (kap goal_control pause/resume/cancel):
-            # staged in the in-memory per-chat slot and consumed by the next
-            # successful submit from this chat (latest keyword wins).
-            self._pending_goal_controls[message.chat_id] = keyword
-            logger.info(
-                "goal control staged chat_id=%s control=%s operator=%s",
-                message.chat_id,
-                keyword,
-                message.sender_open_id,
-            )
-            self._reply_to(
-                message,
-                f"已记录目标控制 {keyword}，将随本聊天的下一条 prompt 发送（仅生效一次）。",
-            )
-            return
-        binding["goal_objective"] = text
-        self._binding_store.save(message.chat_id, binding)
-        logger.info(
-            "goal objective set chat_id=%s operator=%s",
-            message.chat_id,
-            message.sender_open_id,
-        )
-        self._reply_to(
-            message,
-            "已设置目标，后续每条 prompt 都会携带；发送 /goal off 清除。",
-        )
+            self._reply_to(message, f"已设置目标：{text}")
+        except KapTransportError:
+            self._reply_to(message, _KAP_UNREACHABLE_TEXT)
+        except KapError as exc:
+            self._reply_to(message, f"goal 操作失败：{exc.msg}")
 
     def _cmd_compact(self, message: InboundMessage, arg: str) -> None:
         """/compact: kap :compact pass-through (mvp-scope §2)."""
@@ -2420,7 +2409,6 @@ class AppHandler(TransportHandler):
                 permission_mode=binding["permission_mode"],
                 plan_mode=binding["plan_mode"],
                 thinking=binding["effort"],
-                goal_objective=binding["goal_objective"],
                 agent_id=agent_id,
             )
         except KapTransportError:
@@ -2595,9 +2583,6 @@ class AppHandler(TransportHandler):
             ),
             "plan_mode": current["plan_mode"] if current else DEFAULT_PLAN_MODE,
             "effort": current["effort"] if current else DEFAULT_EFFORT,
-            "goal_objective": (
-                current["goal_objective"] if current else DEFAULT_GOAL_OBJECTIVE
-            ),
         }
         self._binding_store.save(chat_id, binding)
         self._notify_session_bound(session_id)

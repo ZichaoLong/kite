@@ -57,7 +57,7 @@ All routes are mounted under `/api/v1` (`routes/registerApiV1Routes.ts`), with a
 | archive / restore | `POST /sessions/{id}:archive` / `:restore` | `routes/sessions.ts:747-773` |
 | delete | **None** (server-wide only workspaces/files/oauth have DELETE) | confirmed by grep |
 | other actions | `:fork` `:compact` `:undo` `:abort` `:btw` (side channel), children | `routes/sessions.ts:604-916` |
-| start a turn | `POST /sessions/{id}/prompts` (content: text/image/video/file; may carry per-request `model`/`thinking`/`permission_mode`/`plan_mode`/`goal_*` overrides) | `routes/prompts.ts:163-229`, `protocol/rest-prompt.ts:31-42` |
+| start a turn | `POST /sessions/{id}/prompts` (content: text/image/video/file; may carry per-request `model`/`thinking`/`permission_mode`/`plan_mode` overrides) | `routes/prompts.ts:163-229`, `protocol/rest-prompt.ts:31-42` |
 | queue query | `GET /sessions/{id}/prompts` (active + queued) | `routes/prompts.ts:140-161` |
 | interrupt | `POST .../prompts/{pid}:abort`; `POST /sessions/{id}:abort` | `routes/prompts.ts:260-302`, `routes/sessions.ts:721-728` |
 | steer | `POST /sessions/{id}/prompts::steer` — **can only inject an already-queued prompt into the active turn**; the engine's `inject()` is not exposed over REST | `routes/prompts.ts:231-258`, `agent-core-v2/.../promptService.ts:115-137` |
@@ -253,3 +253,10 @@ body above, this section wins.
    `KIMI_MODEL_NAME` / `KIMI_MODEL_API_KEY` / `KIMI_MODEL_BASE_URL` env
    overlay, and REST-created sessions do not inherit the overlay
    `defaultModel` — pass `model` explicitly per prompt.
+9. The prompt-submit route parses but silently drops `goal_*` fields
+   (verified 2026-07-27 against `routes/prompts.ts`: no goal consumer; the
+   earlier §2 row's `goal_*` claim was wrong). The real goal path is
+   `POST /sessions/{id}/profile` with `agent_config.goal_objective` /
+   `agent_config.goal_control` (→ createGoal/pause/resume/cancel) and
+   `GET /sessions/{id}/goal`. `thinking`, by contrast, IS consumed by the
+   submit route (`routes/prompts.ts:154-173`).

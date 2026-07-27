@@ -168,6 +168,9 @@ class FakeKapRestClient:
         self.profile_error: Exception | None = None
         self.list_error: Exception | None = None
         self.prompts_error: Exception | None = None
+        # Upstream goal state per session (profile agent_config goal_objective
+        # / goal_control semantics).
+        self.goals: dict[str, dict] = {}
         self._prompt_counter = 0
 
     # -- scripting helpers ---------------------------------------------------
@@ -229,6 +232,12 @@ class FakeKapRestClient:
             if session is None:
                 raise KapError(40401, f"session {match.group(1)} does not exist")
             return session
+        match = re.fullmatch(r"/sessions/([^/]+)/goal", path)
+        if method == "GET" and match:
+            session = self.sessions.get(match.group(1))
+            if session is None:
+                raise KapError(40401, f"session {match.group(1)} does not exist")
+            return self.goals.get(match.group(1))
         match = re.fullmatch(r"/sessions/([^/]+)/prompts", path)
         if method == "POST" and match:
             if self.submit_error is not None:
@@ -264,6 +273,21 @@ class FakeKapRestClient:
             self.profile_updates.append((match.group(1), body))
             if isinstance(body, dict) and body.get("title") is not None:
                 session["title"] = str(body["title"])
+            if isinstance(body, dict) and isinstance(body.get("agent_config"), dict):
+                agent_config = body["agent_config"]
+                objective = agent_config.get("goal_objective")
+                if isinstance(objective, str) and objective:
+                    self.goals[match.group(1)] = {
+                        "objective": objective,
+                        "status": "active",
+                    }
+                control = agent_config.get("goal_control")
+                if control == "cancel":
+                    self.goals.pop(match.group(1), None)
+                elif control == "pause" and match.group(1) in self.goals:
+                    self.goals[match.group(1)]["status"] = "paused"
+                elif control == "resume" and match.group(1) in self.goals:
+                    self.goals[match.group(1)]["status"] = "active"
             return session
         match = re.fullmatch(r"/sessions/([^/]+):btw", path)
         if method == "POST" and match:
@@ -1339,105 +1363,94 @@ class EffortCommandTests(AppHandlerTestCase):
 class GoalCommandTests(AppHandlerTestCase):
     def test_goal_without_arg_shows_unset(self) -> None:
         self.bind("s-1")
-        self.send("/goal")
-        self.assertIn("当前目标：未设置", self.transport.last_text())
+        self.rest.add_session("s-1")
 
-    def test_goal_set_persists_and_show_displays_it(self) -> None:
+        self.send("/goal")
+
+        self.assertIn("当前没有进行中的目标", self.transport.last_text())
+
+    def test_goal_set_posts_profile_and_show_reads_back(self) -> None:
         self.bind("s-1")
+        self.rest.add_session("s-1")
+
         self.send("/goal 修复登录页的崩溃")
+
+        self.assertEqual(
+            self.rest.profile_updates,
+            [("s-1", {"agent_config": {"goal_objective": "修复登录页的崩溃"}})],
+        )
+        self.assertIn("已设置目标：修复登录页的崩溃", self.transport.last_text())
+
+        self.send("/goal")
+        self.assertIn("当前目标：修复登录页的崩溃（active）", self.transport.last_text())
+
+    def test_goal_off_cancels_via_goal_control(self) -> None:
+        self.bind("s-1")
+        self.rest.add_session("s-1")
+        self.send("/goal 旧目标")
+
+        self.send("/goal off")
+
+        self.assertEqual(
+            self.rest.profile_updates[-1],
+            ("s-1", {"agent_config": {"goal_control": "cancel"}}),
+        )
+        self.assertIn("已取消当前目标", self.transport.last_text())
+        self.send("/goal")
+        self.assertIn("当前没有进行中的目标", self.transport.last_text())
+
+    def test_goal_pause_resume_map_to_goal_control(self) -> None:
+        self.bind("s-1")
+        self.rest.add_session("s-1")
+        self.send("/goal 迁移")
+
+        self.send("/goal pause")
+        self.send("/goal resume")
+
+        self.assertEqual(
+            [update[1] for update in self.rest.profile_updates],
+            [
+                {"agent_config": {"goal_objective": "迁移"}},
+                {"agent_config": {"goal_control": "pause"}},
+                {"agent_config": {"goal_control": "resume"}},
+            ],
+        )
+        self.assertIn("已执行 goal resume", self.transport.last_text())
+
+    def test_goal_upstream_error_surfaces(self) -> None:
+        self.bind("s-1")
+        self.rest.add_session("s-1")
+        self.rest.profile_error = KapError(40913, "a goal is already active")
+
+        self.send("/goal 第二个目标")
+
+        self.assertIn("goal 操作失败：a goal is already active", self.transport.last_text())
+
+    def test_goal_unbound_replies_with_binding_guidance(self) -> None:
+        self.send("/goal 文本")
+
+        self.assertEqual(self.rest.profile_updates, [])
+
+    def test_goal_is_not_persisted_on_the_binding(self) -> None:
+        self.bind("s-1")
+        self.rest.add_session("s-1")
+
+        self.send("/goal 修复")
+
         binding = self.store.load(CHAT_ID)
         assert binding is not None
-        self.assertEqual(binding["goal_objective"], "修复登录页的崩溃")
-        self.assertIn("已设置目标", self.transport.last_text())
-        self.send("/goal")
-        self.assertIn("当前目标：修复登录页的崩溃", self.transport.last_text())
+        self.assertNotIn("goal_objective", binding)
 
-    def test_goal_objective_flows_into_every_prompt(self) -> None:
-        self.bind("s-1", goal_objective="保持向后兼容")
+    def test_submit_body_does_not_carry_goal_fields(self) -> None:
+        self.bind("s-1", effort="high")
         self.rest.add_session("s-1")
-        self.send("one")
-        self.send("two")
-        self.assertEqual(
-            self.rest.submissions[0]["body"]["goal_objective"], "保持向后兼容"
-        )
-        self.assertEqual(
-            self.rest.submissions[1]["body"]["goal_objective"], "保持向后兼容"
-        )
 
-    def test_goal_off_clears_objective(self) -> None:
-        self.bind("s-1", goal_objective="旧目标")
-        self.rest.add_session("s-1")
-        self.send("/goal off")
-        binding = self.store.load(CHAT_ID)
-        assert binding is not None
-        self.assertEqual(binding["goal_objective"], "")
-        self.assertIn("已清除", self.transport.last_text())
         self.send("hello")
-        self.assertNotIn("goal_objective", self.rest.submissions[0]["body"])
 
-    def test_goal_off_without_objective(self) -> None:
-        self.bind("s-1")
-        self.send("/goal off")
-        self.assertIn("当前没有设置目标", self.transport.last_text())
-
-    def test_goal_without_binding_shows_hint(self) -> None:
-        self.send("/goal pause")
-        self.assertIn("尚未绑定会话", self.transport.last_text())
-        self.assertEqual(self.rest.calls, [])
-
-    def test_goal_control_consumed_exactly_once(self) -> None:
-        self.bind("s-1")
-        self.rest.add_session("s-1")
-        self.send("/goal pause")
-        self.assertIn("仅生效一次", self.transport.last_text())
-        self.send("first")
-        self.assertEqual(self.rest.submissions[0]["body"]["goal_control"], "pause")
-        # The second prompt must NOT carry the one-shot control.
-        self.send("second")
-        self.assertNotIn("goal_control", self.rest.submissions[1]["body"])
-
-    def test_goal_control_keywords_map_to_wire_values(self) -> None:
-        for keyword in ("pause", "resume", "cancel"):
-            with self.subTest(keyword=keyword):
-                self.bind("s-1")
-                self.rest.add_session("s-1")
-                self.send(f"/goal {keyword}")
-                self.send("go")
-                body = self.rest.submissions[-1]["body"]
-                self.assertEqual(body["goal_control"], keyword)
-
-    def test_goal_control_survives_failed_submit(self) -> None:
-        # A failed submit never reached kap, so the one-shot control stays
-        # pending for the next prompt (consume-once on success).
-        self.bind("s-1")
-        self.rest.add_session("s-1")
-        self.send("/goal cancel")
-        self.rest.submit_error = KapError(40901, "session is busy")
-        self.send("first")
-        self.assertIn("提交失败", self.transport.last_text())
-        self.rest.submit_error = None
-        self.send("second")
-        self.assertEqual(self.rest.submissions[-1]["body"]["goal_control"], "cancel")
-        self.send("third")
-        self.assertNotIn("goal_control", self.rest.submissions[-1]["body"])
-
-    def test_goal_show_mentions_pending_control(self) -> None:
-        self.bind("s-1")
-        self.send("/goal resume")
-        self.send("/goal")
-        self.assertIn("待生效控制：resume", self.transport.last_text())
-
-    def test_submit_body_carries_thinking_goal_and_control_together(self) -> None:
-        self.bind("s-1", effort="high", goal_objective="完成迁移")
-        self.rest.add_session("s-1")
-        self.send("/goal resume")
-        self.send("hello")
         body = self.rest.submissions[0]["body"]
         self.assertEqual(body["thinking"], "high")
-        self.assertEqual(body["goal_objective"], "完成迁移")
-        self.assertEqual(body["goal_control"], "resume")
-        self.assertEqual(body["permission_mode"], "auto")
-        self.assertIs(body["plan_mode"], False)
+        self.assertNotIn("goal_objective", body)
+        self.assertNotIn("goal_control", body)
 
 
 class SessionLifecycleCommandTests(AppHandlerTestCase):

@@ -38,8 +38,8 @@ If it cannot answer, cut the requirement. No exceptions.
 | `/mode <auto\|manual\|yolo>` | read/write the binding-level permission mode (kap `permission_mode`); carried explicitly on every prompt |
 | `/plan [on\|off]` | read/toggle the binding-level plan mode (kap `plan_mode`, orthogonal to permission mode); carried explicitly on every prompt |
 | `/effort <off\|low\|medium\|high\|xhigh\|max>` | read/write the binding-level thinking effort (kap `thinking`); persisted like permission mode and carried explicitly on every prompt |
-| `/goal [text\|pause\|resume\|cancel\|off]` | binding-level goal state: with text, the objective (kap `goal_objective`) is persisted and carried on every prompt until cleared with `off`; `pause`/`resume`/`cancel` are one-shot controls (kap `goal_control`) attached to the next prompt from this chat; no arg shows the current goal |
-| `/compact` | compact the bound session's context (kap `:compact` pass-through); reports the upstream result text |
+| `/goal [text\|pause\|resume\|cancel\|off]` | the session's upstream goal: text creates it via `POST .../profile {agent_config.goal_objective}` (40913 surfaces when one is already active); `pause`/`resume`/`cancel` via `{agent_config.goal_control}`; `off` = cancel; no arg reads it back via `GET .../goal`. Nothing persisted locally (corrected 2026-07-27, audit N2-HIGH-1: the prompt-submit route silently drops goal_* fields) |
+| `/compact` | compact the bound session's context (kap `:compact` pass-through); confirms completion or reports the upstream error text |
 | `/rename <title>` | rename the bound session's title (kap `:profile` pass-through) |
 | `/archive` / `/restore` | archive / restore the bound session (kap `:archive` / `:restore` pass-through); an archived binding behaves per §4.7 (next message errors and suggests `/sessions`; no implicit recreation) |
 | `/status` | show binding, session, work state, queue status |
@@ -57,9 +57,8 @@ If it cannot answer, cut the requirement. No exceptions.
 - Volatile streaming cards (Phase 2)
 - Local TUI wrapper (`kite`/`kcode` commands)
 - Multi-instance, multi Feishu apps
-- Session delete, fork, compact, undo (upstream capabilities exist, but the
-  MVP does not expose them; exposing them requires their own contracts and
-  tests)
+- Session delete, fork, undo (upstream capabilities exist, but the MVP does
+  not expose them; exposing them requires their own contracts and tests)
 - Memory, voice, device control, MCP/Skills management (permanent non-goals)
 
 ## 3. Concurrency Behavior (cross-referenced with concurrency-model.md)
@@ -187,3 +186,9 @@ explicitly; "best-effort" silent degradation is forbidden:
     Error frames apply only to their own agent; work state tracks the main
     agent only. Ownership is recorded to the chat so approvals route as
     usual. No queue, no interrupt of the main turn.
+14. `/goal` rewired (2026-07-27, audit N2-HIGH-1): the prompt-submit route
+    parses but silently drops `goal_*` fields — the real upstream goal path
+    is `POST .../profile {agent_config.goal_objective|goal_control}` plus
+    `GET .../goal`. `/goal` now uses those routes with no local persistence
+    (the binding store's `goal_objective` field and the per-prompt carry
+    model were removed).

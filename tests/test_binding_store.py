@@ -16,7 +16,6 @@ def _binding(
     permission_mode: str = "auto",
     plan_mode: bool = False,
     effort: str = "",
-    goal_objective: str = "",
 ) -> dict:
     return {
         "session_id": session_id,
@@ -24,7 +23,6 @@ def _binding(
         "permission_mode": permission_mode,
         "plan_mode": plan_mode,
         "effort": effort,
-        "goal_objective": goal_objective,
     }
 
 
@@ -75,28 +73,25 @@ class BindingStoreTests(unittest.TestCase):
         self.assertEqual(reloaded["permission_mode"], "yolo")
         self.assertEqual(reloaded["plan_mode"], False)
 
-    def test_effort_and_goal_objective_persist_round_trip(self) -> None:
+    def test_effort_persists_round_trip(self) -> None:
         _, store, state_path = self._make_store()
 
         store.save(
             "oc_chat",
-            _binding("session-1", effort="xhigh", goal_objective="修复登录崩溃"),
+            _binding("session-1", effort="xhigh"),
         )
 
         loaded = store.load("oc_chat")
         assert loaded is not None
         self.assertEqual(loaded["effort"], "xhigh")
-        self.assertEqual(loaded["goal_objective"], "修复登录崩溃")
         raw = json.loads(state_path.read_text(encoding="utf-8"))
         self.assertEqual(raw["bindings"]["oc_chat"]["effort"], "xhigh")
-        self.assertEqual(raw["bindings"]["oc_chat"]["goal_objective"], "修复登录崩溃")
 
         # Rewriting only the goal fields keeps the rest of the binding.
-        store.save("oc_chat", _binding("session-1", effort="off", goal_objective=""))
+        store.save("oc_chat", _binding("session-1", effort="off"))
         reloaded = store.load("oc_chat")
         assert reloaded is not None
         self.assertEqual(reloaded["effort"], "off")
-        self.assertEqual(reloaded["goal_objective"], "")
 
     def test_defaults_applied_when_optional_fields_missing(self) -> None:
         _, store, state_path = self._make_store()
@@ -118,7 +113,6 @@ class BindingStoreTests(unittest.TestCase):
         self.assertEqual(loaded["permission_mode"], "auto")
         self.assertEqual(loaded["plan_mode"], False)
         self.assertEqual(loaded["effort"], "")
-        self.assertEqual(loaded["goal_objective"], "")
 
     def test_save_applies_default_permission_mode_and_normalizes(self) -> None:
         _, store, _ = self._make_store()
@@ -191,8 +185,6 @@ class BindingStoreTests(unittest.TestCase):
             store.save("oc_a", _binding("session-1", effort="turbo"))
         with self.assertRaisesRegex(ValueError, "effort must be a string"):
             store.save("oc_a", _binding("session-1", effort=3))
-        with self.assertRaisesRegex(ValueError, "goal_objective must be a string"):
-            store.save("oc_a", _binding("session-1", goal_objective=42))
 
     def test_load_rejects_corrupt_json(self) -> None:
         _, store, state_path = self._make_store()

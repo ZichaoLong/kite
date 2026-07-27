@@ -33,8 +33,8 @@
 | `/mode <auto\|manual\|yolo>` | 读写 binding 级 permission mode（kap `permission_mode`)；每个 prompt 显式携带 |
 | `/plan [on\|off]` | 查看/切换 binding 级 plan mode（kap `plan_mode`，与 permission mode 正交）；每个 prompt 显式携带 |
 | `/effort <off\|low\|medium\|high\|xhigh\|max>` | 读写 binding 级 thinking effort(kap `thinking`)；与 permission mode 同样持久化，每个 prompt 显式携带 |
-| `/goal [文本\|pause\|resume\|cancel\|off]` | binding 级 goal 状态：带文本时目标（kap `goal_objective`）持久化并随每个 prompt 携带，直到 `off` 清除；`pause`/`resume`/`cancel` 为一次性控制（kap `goal_control`)，附于本 chat 的下一条 prompt；无参显示当前 goal |
-| `/compact` | 压缩绑定 session 的上下文（kap `:compact` 透传）；回显上游结果文本 |
+| `/goal [文本\|pause\|resume\|cancel\|off]` | session 的上游目标：文本经 `POST .../profile {agent_config.goal_objective}` 创建（已有活跃目标时透出 40913);`pause`/`resume`/`cancel` 经 `{agent_config.goal_control}`;`off` 即 cancel；无参经 `GET .../goal` 读回。本地不持久化（2026-07-27 修正，复审 N2-HIGH-1:prompt 提交路由静默丢弃 goal_* 字段） |
+| `/compact` | 压缩绑定 session 的上下文（kap `:compact` 透传）；确认完成或回显上游错误文本 |
 | `/rename 〈title〉` | 重命名绑定 session 的标题（kap `:profile` 透传） |
 | `/archive` / `/restore` | 归档/恢复绑定 session(kap `:archive` / `:restore` 透传）；已归档绑定按 §4.7 行为（下一条消息报错并提示 `/sessions`，不隐式重建） |
 | `/status` | 展示 binding、session、work state、排队情况 |
@@ -52,7 +52,7 @@
 - volatile 流式卡片（Phase 2)
 - 本地 TUI wrapper(`kite`/`kcode` 命令）
 - 多实例、多飞书应用
-- session 删除、fork、compact、undo（上游能力存在，但 MVP 不暴露；
+- session 删除、fork、undo（上游能力存在，但 MVP 不暴露；
   暴露即需各自的合同与测试）
 - 记忆、语音、设备操控、MCP/Skills 管理（永久 Non-goal)
 
@@ -150,3 +150,8 @@
    其答复在 `turn.ended` 时以纯文本（自 volatile 流累积）发给发起
    chat。错误帧只作用于本 agent;work state 只跟踪主 agent。归属记到
    本 chat，审批路由不变。不排队、不打断主 turn。
+14. `/goal` 重接线（2026-07-27，复审 N2-HIGH-1):prompt 提交路由解析但
+   静默丢弃 `goal_*` 字段——上游真实 goal 路径为
+   `POST .../profile {agent_config.goal_objective|goal_control}` 与
+   `GET .../goal`。`/goal` 改用这些路由，本地不再持久化（binding store
+   的 `goal_objective` 字段与 per-prompt 携带模型已移除）。

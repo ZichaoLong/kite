@@ -8,7 +8,6 @@ Only local binding facts that must survive a kited restart live here:
 - the binding-level plan mode (kap ``plan_mode``)
 - the binding-level thinking effort (kap ``thinking``; "" = unset → omitted
   on submit)
-- the binding-level goal objective (kap ``goal_objective``; "" = none)
 
 One-shot goal controls (kap ``goal_control`` pause/resume/cancel) are
 deliberately NOT persisted: they attach to the next prompt only, so they
@@ -56,7 +55,6 @@ VALID_EFFORTS = frozenset(
 # "" = unset: no explicit thinking level is carried on prompts.
 DEFAULT_EFFORT = ""
 # "" = no goal objective carried on prompts.
-DEFAULT_GOAL_OBJECTIVE = ""
 
 
 class StoredBinding(TypedDict):
@@ -65,7 +63,6 @@ class StoredBinding(TypedDict):
     permission_mode: str
     plan_mode: bool
     effort: str
-    goal_objective: str
 
 
 class BindingStore:
@@ -216,9 +213,6 @@ class BindingStore:
                 f"effort must be one of {sorted(VALID_EFFORTS)}"
             )
 
-        goal_objective = raw_state.get("goal_objective", DEFAULT_GOAL_OBJECTIVE)
-        if not isinstance(goal_objective, str):
-            raise ValueError("invalid bindings.json: goal_objective must be a string")
 
         return {
             "session_id": session_id,
@@ -226,5 +220,4 @@ class BindingStore:
             "permission_mode": permission_mode,
             "plan_mode": plan_mode,
             "effort": effort,
-            "goal_objective": goal_objective,
         }
