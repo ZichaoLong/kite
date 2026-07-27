@@ -144,6 +144,9 @@
    仿 FOCUS 的 `shell_completion.py` 形态）。
 13. 准入 `/btw`(2026-07-26)：旁路面。上游 `:btw` 启动的是旁路
    **agent**（而非插入便签）;`/btw 〈文本〉` 按需启动（每 session 内存
-   缓存）并以该 `agent_id` 提交。btw prompt 的事件走正常管线（单锚点
-   卡片语义照旧——btw 启动会接管执行卡，主 prompt 的终态仍经独立路径
-   落地）；归属记到本 chat，审批路由不变。不排队、不打断主 turn。
+   缓存）并以该 `agent_id` 提交。**事件路由（2026-07-27 修正，复审
+   N3-HIGH-1)**：管线按 `agent_id` 分流——主 agent 驱动既有卡片管线;
+   btw agent 的事件走轻量路径：不创建/接管执行卡，不污染主卡流式文本,
+   其答复在 `turn.ended` 时以纯文本（自 volatile 流累积）发给发起
+   chat。错误帧只作用于本 agent;work state 只跟踪主 agent。归属记到
+   本 chat，审批路由不变。不排队、不打断主 turn。

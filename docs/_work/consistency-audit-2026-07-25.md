@@ -237,3 +237,84 @@
 - daemon/CLI/服务/控制面/安装:service_manager 三平台逐行一致;control_plane 与 decisions 文档完全对齐(1MB cap、hmac、空 token fail-closed、三段式错误分类);kitectl 读写纪律(写走控制面、读直连、interaction sweep 有合同背书);kited 监督循环(bounded backoff、pid 匹配注册表、crash 窗口 rest 置空、干净停机保留 rest 供清扫);KapServerProcess SIGTERM→SIGKILL 升级/端口冲突/环境白名单;install.sh 与 FOCUS 逐字节一致;install.py 受管 venv 纪律。
 - kap 适配器(对上游 0.29.1 真实代码+现场实验):REST 信封/request_id、`GET /meta`、`POST /shutdown`、sessions 分页、`last_seq` 硬编码 0 未被使用、`GET .../prompts` resume-backed 预热、prompt 提交 text/image part 与 permission_mode/plan_mode/model 字段、abort 40402、snapshot 全字段与 pending 投影(q_<i>/opt_<i>_<o> 合成 id)、approvals/questions REST 与 40902/40404/40405/40909 怪癖处理、messages 分页 role 过滤、WS 路径/Bearer/server_hello/client_hello/ack 载荷/replay 语义/resync 独立帧先于 ack、journal 跨重启保 epoch、volatile offset=pre-append 按 step 归零、durable 事件目录名与载荷全对齐、实例注册表 pid/port 解析、server.token 0600、版本 warn-don't-block 策略。
 - 契约端到端:mvp-scope §4 fail-closed 清单 1-10 条全部有落点(§4.5 措辞见 D2);§5 权限模型 OK;§3 并发行为 OK;design §4 七条状态轴各有 owner,未发现第八条轴;streaming-cards/images/group-chat/scheduled-prompts 各合同条款 OK(例外已列 L 系列)。
+
+---
+
+# 第二轮复审(2026-07-25,基线 7e1ffff → HEAD 1e49754)
+
+> 范围:(a) 逐条复核全部修复批次(abcbd13..14a4126);(b) 审查新功能(多实例、/effort /goal /compact /rename /archive /restore、/btw、shell completion);(c) 盘点仍未修项。
+> 方法:10 个并行复审代理(不信 commit message,一律对照当前代码 + `git show <sha>`),主审查人抽查两个新 HIGH 的证据。测试基线:1256 passed / 1 failed(见 T-NEW-1)。
+
+## 〇、总体结论
+
+- 第一批审计的 5 个 HIGH 全部修复正确(H1-H5);M1-M15 中 14 个修复正确或基本正确,唯一缺半的是 M5(第四个解析点遗漏,见 R-1)。
+- 旧 LOW 清单 30 余项中,仅 L3(终态文本归因)保留为已登记边界,其余全部修复或合同登记完毕;14a4126 遗留批次有 1 项 NOT-FIXED(R-4)与 3 项 PARTIAL。
+- **新功能引入 2 个新的 HIGH**:/goal 全链路空操作(N2-HIGH)、/btw 出站事件归因缺失(N3-HIGH);另有 4 个 MED(多实例 lease 位置、schedule 实例无感知、/switch 同会话捷径、/archive 无 busy 预检)。
+
+## 一、修复复核结果(逐条)
+
+### 已确认 FIXED-CORRECT(有测试锁定,无回归)
+
+- H1 /last 回退:`list_messages` 加 `card_msg_content_type`,`_last_text_from_history` 传 `user_card_content`(feishu_transport.py:1166/1193-1195;app_handler.py:2353),与 FOCUS 逐字同法;扁平形态 fail-closed 半边仍有测试。LOW 测试缺口:无 transport 级测试锁定"参数→queries 追加"分支(删掉 1193-1195 全套测试仍绿),建议补。
+- H2 UTF-16 offset:`_offset_len = len(text.encode("utf-16-le"))//2`(streaming_transcript.py:52-55),reseed/reconcile 同单位;代理级复算 'a😀bc' 逐字符流入 0 次 rebuild;2922832 的 gap-latch 断言归位正确。建议把非 BMP 场景提升为 test_streaming_pipeline.py 正式用例。
+- H3 systemd %:`_quote_unit_arg` 先 `%%` 再转义,全部用户标量过该函数;Description 另行转义;launchd/Windows 无此机制不需同款。
+- H4 service log:改 tail `<data>/kite.log`(三平台可达);多实例经 KITE_DATA_ROOT 兼容。注:follow 未补;测试名 test_log_tails_stdout_log 名不副实(LOW 洁癖)。
+- H5 ping 探测:真删非改名,recv 超时直接 stale;fake_kap pong 应答与旧测试同步删除;快照里的 ping/pong 是上游 schema 面,供漂移检测,非残留。
+- M1/M2/M3/M4/M6/M7(question/approval 生命周期、ack 游标守卫、error 帧游标、重建后补订阅):全部修复正确,含防 tight-loop 守卫与 rebuild spam 去重;旧 L11(epoch 检查顺序)顺带修复。
+- M8 /init p2p 限定(命令内第一条语句,文案带原因)、M11 mention_only app-sender 守卫(逐分支同构,所有可达路径枚举闭合)、M9 /switch 与 /new 共用 check_new(queued 放行;卡片按钮同覆盖;合同对齐项 11 已登记)。
+- M12 转发认领语义恢复(claim() 合成一条 prompt、转写在留言之前;slash 命令不认领、交互回复优先认领为有意收窄;旧 L15 顺带修复)、M13 launchd --at fail-closed(Year 键测试锁定已清除)、L1 HTML/XML 中和器(与 FOCUS 逐字节一致)、L2 230099 分类+极简终态重试。
+- M14 env 文件名统一为 `env`(docs/AGENTS/install 同步,ensure_env_template 已接线)、M15 示例键名 admin_open_ids。
+- 14a4126 中 L17(feedback toast 按模式)、L33(not_found 剔除)FIXED-CORRECT;旧 LOW 的 L4/L6/L7/L8/L9/L10/L12/L13/L14/L18/L20-L30、D2/D3/D4/D6、T4、U1 全部修复或合同登记;L5/L16/L19 经文档登记收口。
+
+### 修复不完整/未修(新残口)
+
+- **R-1(MED,M5 缺半)**:第四个解析点 `KapSessionOps._parse_session`(app_handler.py:405-415,审计未枚举)未归一化 `'none'` → `/status` 仍显示"待处理交互:none"(app_handler.py:2296)。适配层三处已修。修复:`_parse_session` 复用 `_optional_pending_interaction` + 补 /status 用例。
+- **R-2(MED,V3 新发现)**:`/switch` 同会话 re-attach 捷径(app_handler.py:2513-2518,detached→attached 直接保存)绕过 4fa4f6a 给 `/attach` 补的双独占探针 → 路径 C 反例已实证:G(all 群)/detach → A /switch S → G /switch S → all 群与 A 共享 S;/sessions 卡片按钮同达。与同状态下的 `/attach` 行为不对称即证据。修复:捷径翻转前跑 `all_mode_session_exclusive`+`all_mode_session_occupied`。
+- **R-3(LOW,M13 残留+新发现)**:(a) freeze/极简重试 patch 走同步直调不过 dispatcher,230020 不重排(L2 症状在 rate-limit 通道仍开着;先于本批的架构差异);(b) claim 路径缺 flush 路径的 mode 复查(2s 窗口内管理员翻 mode,暴露极小);(c) group-chat §3.7 未写认领-合并语义本身。
+- **R-4(LOW,L32 NOT-FIXED)**:迟到 ack(超时后到达)仍经 `_dispatch_frame` 无条件入 `_pending_acks` 永久泄漏;本次只修了"截止前最后一瞬到达"的边界竞态,实证可复现。
+- **R-5(LOW,L31 缺半)**:指数退避本身正确(封顶 60s,有测试);但"连续 N 次 auth 失败转告警"不可达——WS upgrade 401 抛 `InvalidStatus`(MRO 不落入被分类的 except 元组),进通用 Exception 分支,`auth_failures` 永不递增;warmup REST 401 也被吞。
+- **R-6(LOW,L34/D1 缺半)**:todo_list docstring 仍写 `"<kind>: <field>"` 与实现不符;snapshot 重建日志仍无 chat_id、resync 日志三元组皆无(mvp-scope §6 字面要求)。
+- **T-NEW-1(测试)**:全量 1256 passed + 1 failed(`test_kap_server_process.py::test_start_waits_for_readiness_and_resolves_port_and_token`)。单跑/单文件跑均过;失败发生在与 10 个复审代理并发满载的同机全量跑中;**空闲复跑 1257 passed 全绿,确认为负载型 flake 而非回归**(该测试注释显示已因同类问题把 grace 10s→30s,对机器负载仍敏感,记录在案)。
+
+## 二、新功能审查结果
+
+### N1 多实例(637b4d0+a526730)
+
+- **N1-MED-1 daemon lease 锁 config dir 而非 data dir**(kited.py:83-128;FOCUS 锁 data dir,bot/stores/service_instance_lease.py:99)。可变共享面全在 data dir(control_plane.json、stores、runtime_status.json、`<data>/kap-home`);per-axis 显式覆盖可打破 config:data 1:1。已复现:两 kited 不同 config + 同一 data → 双锁都拿到,互踩控制面与 kap-home。修复:租约放 data dir(或双锁),决策 §4 同步修订。
+- **N1-MED-2 scheduled prompts 对实例完全无感知**:unit ExecStart 不带 `--instance`(schedule_units.py:504-516,launchd/Windows 同形)→ 触发时歧义 exit 2(静默丢)或打到错误实例;unit 名 `kite-schedule-<hash(chat+calendar+text)>` 共享 OS 命名空间 → 跨实例互见/互删/同名覆盖;scheduled-prompts.md:28 自称 "executed by the same KITE instance" 不成立。修复:ScheduleSpec 加 instance 字段、ExecStart 携带、unit 名加实例前缀、list/show/remove 按实例过滤。
+- LOW:rung-2 解析与显式 `--data-dir` 混用错配(显式目录时应跳过 rung-2);`completion` 等实例无关命令被歧义拒绝误伤;实例名无长度上限(FOCUS 限 64);install.py --instance 不生成 env 模板。
+- **doc gap**:concurrency-model.md 未修订(仍以单实例为前提、"Phase 3 candidate"措辞过期);kite-design.md §1 Non-goals 仍列 multi-instance(§9 已改 §1 漏改)。
+- 已核对一致:布局/解析阶梯/歧义拒绝、kap home 隔离(KIMI_CODE_HOME 钉死、token/registry 不串)、lease 获取/释放/崩溃回收(OS 释放、子进程不继承 fd)、控制面端口、三平台 unit 带 --instance、默认路径向后兼容。54+91 测试绿。
+
+### N2 新斜杠命令(fca5253+f89c306)
+
+- **N2-HIGH-1 /goal 全链路空操作**:kap-server submit 路由根本不消费 per-prompt 的 `goal_objective`/`goal_control`(routes/prompts.ts 全文 grep 无 goal;字段仅存在于 schema,zod 过后静默丢弃)。上游真实路径:`POST /sessions/{id}/profile {agent_config:{goal_objective|goal_control}}`(sessionLegacyService.ts:118-125 → createGoal/pause/resume/cancel)与 `GET /sessions/{id}/goal`(sessions.ts:949-966)。且上游 goal 是 create-once 状态机(已有活跃 goal 报 40913),"每条 prompt 携带"模型即使被消费也必然报错。现状:用户得到"已设置目标"假阳性;根源是 research/kap-server-usability.md:60 的错误结论(引用区间无 goal 消费代码,已抽查证实)。修复:/goal → profile 路由立即生效(透出 40913 等),/goal 无参 → GET goal;删除 binding 持久化与 submit 携带;改写 mvp-scope 与 research 文档。注意 goal 相关测试锁定的是错误 wire 合同,修复时重写。
+- **N2-MED-1 /archive 无 busy 预检**:与 aligned item 11 /switch 的拦截理由自相矛盾;上游 archive 会 drainAgents+cancel 全部 pending turns。建议 check_new 同款预检或合同登记。
+- LOW:mvp-scope Non-goals 仍列 compact(§2 已准入,双语自相矛盾);/compact 合同行承诺"上游结果文本"不存在(上游 data 恒 {});kite-design §4/§7 未登记 thinking/goal 新状态(若按 N2-HIGH-1 修复大多随之删除)。
+- 已核对一致:六个命令的路由/载荷/错误码与上游逐条匹配;门槛矩阵与现有命令一致;归档 fail-closed 闭环(预检/控制面//switch//sessions//status);binding 新字段持久化纪律;/effort 收紧 enum 是合同明示。156+44 测试绿。
+
+### N3 /btw side-channel(ea5353f+1e49754)
+
+- 上游核对:side-channel API 真实存在(`POST /sessions/{id}:btw` → fork agent + veto 工具;`POST /prompts` 支持 agent_id 直投不经 main FIFO);"cached per session" 是 KITE 自己的决策(合同已登记)。
+- **N3-HIGH-1 event_pipeline 对 btw 零感知(已实证三种场景)**:normalize_durable_event 不透传 agentId;turn 归因全靠 GET prompts(main 队列)。主闲时 btw 答案彻底丢失(0 卡 0 文本,/last 也救不了);主忙时 btw turn.ended 劫持主 prompt 的终态卡、主 prompt 真实结果被去重吞掉;volatile delta 污染主卡正文;error 帧误判主 prompt(KapErrorFrame.agent_id 已解析却被忽略)。**修复前 /btw 应视为不可用**:不只是答案丢失,还会破坏主 prompt 的结果投递。修复方向:归一化层透传 agentId,pipeline 按 agent 分流;aligned item 13 的"接管执行卡"语义与 FIFO 归因模型冲突,合同需重写可实现的行为。
+- **N3-MED-2** `_btw_agents` 缓存无失效:submit 撞 agent.not_found 后每次 /btw 都撞死 id 直到 kited 重启。修复:识别 40401 后清缓存重试一次。
+- **N3-MED-3** /btw 无 archived/消失会话预检 → 静默复活归档会话(§4.7)。修复:复用主路径预检。
+- **N3-MED-4** /btw 不检查 binding.attached → /detach 状态下跑隐形工作。修复:与主路径同款拒绝。
+- LOW:重启后 fork agent 累积无清理面;btw prompt 无法 /abort(合同未要求);_btw_agents 无界;concurrency-model.md 无 btw 内容(mvp-scope §3 自称 cross-referenced)。
+- 已核对一致:入站半边(解析/权限/缓存/提交/错误面)正确且有测试。296 测试绿(现状绿是因为 bug 不在已锁定行为里)。
+
+### N4 shell completion(994c686)
+
+- 重写而非移植(声明式 spec + 静态渲染 vs FOCUS 动态回调),实现质量高:注入面无、argparse drift 双向测试锁定(含 schedule/interaction/--instance)、bash 产物 24 探针实测。
+- **N4-MED-1** fish 下 `--display <TAB>`(空值那一刻)被自己的 guard 抑制,静默退化为文件补全(bash/zsh 正常;输入一个字符后恢复)。修复:`not __kitectl_after_value_flag` 只挂 word 条目。
+- LOW:fish 用已废弃 `commandline -o`(建议 -x);zsh 值标志后无路径回退(应调 _files,注释失实);bash/zsh 不支持 `--flag=value` 内联;README/AGENTS 无启用说明;mvp-scope 条目措辞与实现不符(非 FOCUS shape、无安装机制、放弃 PowerShell 未登记)。zsh/fish 产物只做了静态审查(本机无此两 shell)。
+
+## 三、本轮修复优先级
+
+1. **N3-HIGH-1**(/btw 事件归因):破坏主 prompt 结果投递,修复前 /btw 不可用;需要合同先重写可实现语义。
+2. **N2-HIGH-1**(/goal 空操作):假阳性确认;改走 profile/goal 路由,连带重写测试与文档。
+3. **R-2**(/switch 同会话捷径探针):all 独占残口,一行探针+回归测试。
+4. **N1-MED-1/2**(lease 位置、schedule 实例感知):多实例正确性,需先修决策文档。
+5. **N2-MED-1**(/archive busy 预检)、**N3-MED-2/3/4**(/btw 生命周期与预检,随 N3-HIGH-1 一并做)。
+6. **R-1**(/status 的 'none')、**R-4/R-5/R-6**(ack 泄漏收割、auth 告警可达性、日志/docstring 收尾)。
+7. LOW 批:N4 fish guard、N1 LOW 组、R-3、文档 gap(concurrency-model.md / kite-design §1 / mvp-scope Non-goals 与 §2 矛盾项)。

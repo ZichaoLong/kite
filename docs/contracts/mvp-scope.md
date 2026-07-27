@@ -178,8 +178,12 @@ explicitly; "best-effort" silent degradation is forbidden:
 13. `/btw` admitted (2026-07-26): the side-channel surface. Upstream's
     `:btw` starts a side-channel AGENT (not note injection); `/btw 〈text〉`
     starts it on demand (cached in-memory per session) and submits with that
-    `agent_id`. The btw prompt's events flow through the normal pipeline
-    (single-anchor card semantics apply — a btw start takes over the
-    execution card, and the main prompt's terminal still lands through the
-    standalone path); ownership is recorded to the chat so approvals route
-    as usual. No queue, no interrupt of the main turn.
+    `agent_id`. **Event routing (corrected 2026-07-27, audit N3-HIGH-1)**:
+    the pipeline attributes events by `agent_id` — the main agent drives the
+    existing card pipeline; btw-agent events take a lightweight path: no
+    execution card is created or taken over, main-card streaming is never
+    polluted, and the btw answer is delivered as plain text (accumulated
+    from its own volatile stream) to the initiating chat on `turn.ended`.
+    Error frames apply only to their own agent; work state tracks the main
+    agent only. Ownership is recorded to the chat so approvals route as
+    usual. No queue, no interrupt of the main turn.
