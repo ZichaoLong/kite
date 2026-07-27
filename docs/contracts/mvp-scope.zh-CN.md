@@ -40,6 +40,7 @@
 | `/status` | 展示 binding、session、work state、排队情况 |
 | `/last` | 重发当前会话最近一次终态答复文本（本地终态 store，超过 15000 字符截断） |
 | `/abort` | 中断 active prompt；仅该 prompt 发起者与管理员可用；对已完成 prompt 再 abort 得上游 40402(not pending)→ 提示"已结束"，执行卡不转失败（spike S2) |
+| `/btw 〈文本〉` | 旁路：将文本发给 session 的 `:btw` agent（按需启动，每 session 内存缓存），不排队、不打断主 turn；绑定模式照常携带，审批路由不变 |
 | `/help` | 命令导航 |
 | `/whoami` | 展示发送者身份（open_id、显示名、是否管理员）与 chat/绑定状态；非管理员可用 |
 | `kitectl` | config / service（启停、status、log)/ binding(list)/ session(list、status)/ prompt send |
@@ -58,8 +59,10 @@
 ## 3. 并发行为（与 concurrency-model.md 互为引用）
 
 - 同一会话连发多条消息：全部入 kap 的 prompt FIFO，执行卡展示 active
-  prompt，队列长度在卡片上可见；**不做"新消息打断"**(MVP 不暴露 steer
-  用户面）。`/abort` 进 MVP：仅 active prompt 的发起者与管理员可用。
+  prompt，队列长度在卡片上可见。`/abort` 进 MVP：仅 active prompt 的发起
+  者与管理员可用。`/btw 〈文本〉` 是获准的旁路：不排队、不打断主
+  turn——文本发给 session 的旁路（`:btw`)agent（按需启动），其答复经
+  独立 prompt 返回（已对齐 13)。
 - 多个 chat 绑定同一 session（管理员显式操作才可达）： prompt 都入队；
   普通输出广播给所有 attached chat；审批/表单卡只发给**发起该 prompt 的
   chat**，其他 chat 看到"等待 #N 号 prompt 的发起者处理审批"的只读提示。
@@ -139,8 +142,8 @@
    permission mode 同样落 binding store；生命周期动作为 kap 透传。
    `kitectl`/`kited` 的 shell 补全随安装提供（bash/zsh/fish 生成器，
    仿 FOCUS 的 `shell_completion.py` 形态）。
-12. 准入 `/effort`、`/goal`、`/compact`、`/rename`、`/archive`、`/restore`
-   (2026-07-25):binding 级 `effort`(thinking）与 `goal_objective` 与
-   permission mode 同样落 binding store；生命周期动作为 kap 透传。
-   `kitectl`/`kited` 的 shell 补全随安装提供（bash/zsh/fish 生成器，
-   仿 FOCUS 的 `shell_completion.py` 形态）。
+13. 准入 `/btw`(2026-07-26)：旁路面。上游 `:btw` 启动的是旁路
+   **agent**（而非插入便签）;`/btw 〈文本〉` 按需启动（每 session 内存
+   缓存）并以该 `agent_id` 提交。btw prompt 的事件走正常管线（单锚点
+   卡片语义照旧——btw 启动会接管执行卡，主 prompt 的终态仍经独立路径
+   落地）；归属记到本 chat，审批路由不变。不排队、不打断主 turn。

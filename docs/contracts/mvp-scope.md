@@ -45,6 +45,7 @@ If it cannot answer, cut the requirement. No exceptions.
 | `/status` | show binding, session, work state, queue status |
 | `/last` | reply with the bound session's most recent terminal result text from the local store (truncated past 15000 chars) |
 | `/abort` | abort the active prompt; only available to that prompt's initiator and admins; aborting an already-finished prompt gets upstream 40402 (not pending) → show "already finished", do not transition the card to failed (spike S2) |
+| `/btw 〈text〉` | side-channel: submit the text to the session's `:btw` agent (started on demand, cached in-memory per session) without queueing/interrupting the main turn; binding modes are carried as usual and approval routing is unchanged |
 | `/help` | command navigation |
 | `/whoami` | show the sender's identity (open_id, display name, admin status), chat/binding state; available to non-admins |
 | `kitectl` | config / service (start/stop, status, log) / binding (list) / session (list, status) / prompt send |
@@ -65,9 +66,11 @@ If it cannot answer, cut the requirement. No exceptions.
 
 - Multiple messages sent in a row in the same chat: all enter kap's prompt
   FIFO; the execution card shows the active prompt, and the queue length is
-  visible on the card; **no "new message interrupts"** (the MVP does not
-  expose a steer user surface). `/abort` is in the MVP: only available to the
-  active prompt's initiator and admins.
+  visible on the card. `/abort` is in the MVP: only available to the
+  active prompt's initiator and admins. `/btw 〈text〉` is the sanctioned
+  side-channel: it does NOT queue or interrupt the main turn — the text goes
+  to the session's side-channel (`:btw`) agent (started on demand), and its
+  answer comes back on its own prompt (aligned item 13).
 - Multiple chats bound to the same session (only reachable via explicit admin
   operation): prompts all enqueue; normal output is broadcast to all attached
   chats; approval/form cards are sent only to the **chat that initiated the
@@ -172,8 +175,11 @@ explicitly; "best-effort" silent degradation is forbidden:
     persist in the binding store like permission mode; lifecycle actions are
     kap pass-throughs. Shell completion for `kitectl`/`kited` ships with the
     install (bash/zsh/fish generators, FOCUS's `shell_completion.py` shape).
-12. `/effort`, `/goal`, `/compact`, `/rename`, `/archive`, `/restore` admitted
-   (2026-07-25): binding-level `effort` (thinking) and `goal_objective`
-   persist in the binding store like permission mode; lifecycle actions are
-   kap pass-throughs. Shell completion for `kitectl`/`kited` ships with the
-   install (bash/zsh/fish generators, FOCUS's `shell_completion.py` shape).
+13. `/btw` admitted (2026-07-26): the side-channel surface. Upstream's
+    `:btw` starts a side-channel AGENT (not note injection); `/btw 〈text〉`
+    starts it on demand (cached in-memory per session) and submits with that
+    `agent_id`. The btw prompt's events flow through the normal pipeline
+    (single-anchor card semantics apply — a btw start takes over the
+    execution card, and the main prompt's terminal still lands through the
+    standalone path); ownership is recorded to the chat so approvals route
+    as usual. No queue, no interrupt of the main turn.
