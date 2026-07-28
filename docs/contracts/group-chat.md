@@ -155,7 +155,10 @@ runs ahead of the content it refers to. The claim is keyed on
 (sender, chat), so it never leaks across members or chats. Only an
 unclaimed window flushes the transcript as its own prompt. Slash commands
 never claim, and interaction replies (approval/question answers) take
-claim precedence by design.
+claim precedence by design. A group claim re-checks the current mode first
+(fail-closed mirror of the window flush): only an activated all-mode group
+claims; after a mid-window mode flip the stash is left for the flush,
+which drops it explicitly.
 
 ### 3.8 All-mode reverse exclusivity
 

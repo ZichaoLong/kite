@@ -160,6 +160,9 @@ logger = logging.getLogger("kite.app")
 # 40402 re-abort behavior).
 KAP_ERROR_SESSION_NOT_FOUND = 40401
 KAP_ERROR_PROMPT_NOT_PENDING = 40402
+# /goal business codes (upstream packages/protocol/src/error-codes.ts:89-91).
+KAP_ERROR_GOAL_ALREADY_EXISTS = 40913
+KAP_ERROR_GOAL_NOT_FOUND = 40914
 
 # Card-action names owned by this module (the /sessions switch buttons).
 ACTION_SESSION_SWITCH = "session_switch"
@@ -1166,6 +1169,22 @@ class AppHandler(TransportHandler):
     # Prompt submission
     # ------------------------------------------------------------------
 
+    def _forward_stash_claim_allowed(self, message: InboundMessage) -> bool:
+        """Mode re-check before a text claims a buffered forward stash
+        (group-chat §3.7). Mirrors the aggregator flush's fail-closed
+        re-check: a group stash is claimed only while the group is still an
+        activated all-mode group; after a mid-window mode flip the stash is
+        left for the flush, which drops it explicitly instead of merging
+        stale content into the prompt."""
+        if message.chat_type != "group":
+            return True
+        group_config = self._group_config_store.load(message.chat_id)
+        return bool(
+            group_config is not None
+            and group_config["activated"]
+            and group_config["mode"] == GROUP_MODE_ALL
+        )
+
     def _handle_prompt(
         self, message: InboundMessage, *, submit_text: str | None = None
     ) -> Optional[SubmitPromptResult]:
@@ -1183,11 +1202,16 @@ class AppHandler(TransportHandler):
         comment) — the instruction never runs ahead of the content it refers
         to. The claim is keyed on (sender, chat), so it never leaks across
         users or chats, and it never fires for the aggregator's own flush
-        message or for submit_text overrides.
+        message or for submit_text overrides. A group claim first re-checks
+        the current mode (fail-closed mirror of the window flush, §3.7).
         """
         chat_id = message.chat_id
         text = message.text.strip()
-        if submit_text is None and message.msg_type != "merge_forward":
+        if (
+            submit_text is None
+            and message.msg_type != "merge_forward"
+            and self._forward_stash_claim_allowed(message)
+        ):
             stashed = self._forward_aggregator.claim(message.sender_open_id, chat_id)
             if stashed is not None:
                 text = f"{stashed.text}\n\n{text}" if text else stashed.text
@@ -2013,7 +2037,12 @@ class AppHandler(TransportHandler):
         except KapTransportError:
             self._reply_to(message, _KAP_UNREACHABLE_TEXT)
         except KapError as exc:
-            self._reply_to(message, f"goal 操作失败：{exc.msg}")
+            if exc.code == KAP_ERROR_GOAL_ALREADY_EXISTS:
+                self._reply_to(message, "已有进行中的目标，先 /goal off 清除再设置。")
+            elif exc.code == KAP_ERROR_GOAL_NOT_FOUND:
+                self._reply_to(message, "当前没有设置目标。")
+            else:
+                self._reply_to(message, f"goal 操作失败：{exc.msg}")
 
     def _cmd_compact(self, message: InboundMessage, arg: str) -> None:
         """/compact: kap :compact pass-through (mvp-scope §2)."""
@@ -2073,10 +2102,11 @@ class AppHandler(TransportHandler):
     def _cmd_archive(self, message: InboundMessage, arg: str) -> None:
         """/archive: kap :archive pass-through; the binding is kept, so the
         next message hits the §4.7 archived-session error path. Denied while
-        the bound session has an active prompt (mvp-scope aligned item 15):
-        upstream archive drains agents and cancels every pending turn, so the
-        in-flight execution card, terminal result and approval routing would
-        lose visibility — the same reasoning as /switch (aligned item 11)."""
+        the bound session has an active OR queued prompt (mvp-scope aligned
+        item 15): upstream archive drains agents and silently cancels queued
+        prompts, so the in-flight execution card, terminal result and
+        approval routing would lose visibility — stricter than /switch
+        (aligned item 11), whose queued prompts keep running."""
         if arg.strip():
             self._reply_to(message, build_usage_text("/archive"))
             return
@@ -2084,7 +2114,8 @@ class AppHandler(TransportHandler):
         if binding is None:
             return
         session_id = binding["session_id"]
-        # Preflight (fail-closed): same check_new denial as /new and /switch.
+        # Preflight (fail-closed): check_archive is stricter than the check_new
+        # denial used by /new and /switch — queued prompts refuse too.
         # Unverifiable queue state also refuses.
         try:
             queue = self._ops.get_prompts(session_id)
@@ -2094,7 +2125,7 @@ class AppHandler(TransportHandler):
         except KapError as exc:
             self._reply_to(message, f"查询会话状态失败：{exc.msg}")
             return
-        check = preflights.check_new(queue)
+        check = preflights.check_archive(queue)
         if not check.allowed:
             logger.info(
                 "/archive denied chat_id=%s reason_code=%s",

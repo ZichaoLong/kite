@@ -105,6 +105,15 @@ override can point two different config dirs at one data dir (FOCUS locks
 the data dir for the same reason). This replaces nothing else — it is the
 only cross-process coordination multi-instance actually needs.
 
+Upgrade compatibility: the lease originally lived at `<config>/kited.lock`
+and moved to the data dir in 46297f3. Inside the upgrade overlap window an
+old binary may still hold the config-dir lease while a new binary takes the
+data-dir one — two daemons on one instance. After taking the data-dir
+lease, kited therefore probes the legacy location once with a non-blocking
+flock: held → the start fails closed naming the old daemon (stop it
+first); acquirable → the file is stale and is released and best-effort
+deleted.
+
 ### 5. Interaction owner: still NOT implemented (deliberate)
 
 The user's direction included "interaction owner and other supporting

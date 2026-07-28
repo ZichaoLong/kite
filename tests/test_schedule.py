@@ -273,11 +273,20 @@ class ScheduleCliTests(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.root = pathlib.Path(self._tmp.name)
-        self.config_dir = self.root / "config"
-        self.data_dir = self.root / "data"
+        self.home = self.root / "home"
+        self.home.mkdir()
         self.unit_dir = self.root / "systemd"
-        self.config_dir.mkdir()
-        self.data_dir.mkdir()
+        # The CLI runs against the default-instance dirs derived from a
+        # patched HOME (the test_multi_instance.py pattern, portable);
+        # KITE_CONFIG_DIR/KITE_DATA_ROOT stay clear — an explicit directory
+        # axis makes schedule create fail closed (audit A4).
+        with patch.dict(os.environ, self._roots_env()):
+            from kite.platform_paths import default_config_root, default_data_root
+
+            self.config_dir = default_config_root()
+            self.data_dir = default_data_root()
+        self.config_dir.mkdir(parents=True)
+        self.data_dir.mkdir(parents=True)
         self.ctl_path = self.root / "bin" / "kitectl"
         self.ctl_path.parent.mkdir()
         self.ctl_path.write_text("#!/bin/sh\n", encoding="utf-8")
@@ -298,6 +307,17 @@ class ScheduleCliTests(unittest.TestCase):
         run_patcher.start()
         self.addCleanup(run_patcher.stop)
 
+    def _roots_env(self) -> dict[str, str]:
+        # Relocate the roots via HOME; the explicit-axis overrides must stay
+        # clear so the default/instance layout resolution applies (audit A4).
+        return {
+            "HOME": str(self.home),
+            "KITE_CONFIG_ROOT": "",
+            "KITE_DATA_ROOT": "",
+            "KITE_CONFIG_DIR": "",
+            "KITE_INSTANCE": "",
+        }
+
     def _fake_systemctl(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
         self.systemctl_calls.append(args)
         if args[0] == "list-timers":
@@ -309,14 +329,20 @@ class ScheduleCliTests(unittest.TestCase):
     def _run_cli(self, *argv: str) -> tuple[int, str, str]:
         stdout = io.StringIO()
         stderr = io.StringIO()
-        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-            code = kitectl.main(
-                ["--config-dir", str(self.config_dir), "--data-dir", str(self.data_dir), *argv]
-            )
+        # patch.dict restores the whole environ on exit, including the
+        # instance env kitectl.main publishes during resolution.
+        with patch.dict(os.environ, self._roots_env()):
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = kitectl.main(list(argv))
         return code, stdout.getvalue(), stderr.getvalue()
 
-    def _bind(self, chat_id: str = "chat-1", session_id: str = "s-1") -> None:
-        BindingStore(self.data_dir).save(
+    def _bind(
+        self,
+        chat_id: str = "chat-1",
+        session_id: str = "s-1",
+        data_dir: pathlib.Path | None = None,
+    ) -> None:
+        BindingStore(data_dir or self.data_dir).save(
             chat_id,
             {
                 "session_id": session_id,
@@ -467,6 +493,102 @@ class ScheduleCliTests(unittest.TestCase):
         self.assertIn("single line", err)
         self.assertEqual(self._unit_files(), [])
         self.assertEqual(self.systemctl_calls, [])
+
+    # -- explicit directory axes (audit A4) -----------------------------------
+
+    def test_create_explicit_dir_flags_are_rejected_before_writing(self) -> None:
+        # The generated timer fires plain `kitectl prompt send`, which resolves
+        # the DEFAULT dirs — explicit --config-dir/--data-dir would validate
+        # here but silently die at fire time. Fail closed instead.
+        self._bind()
+
+        code, _, err = self._run_cli(
+            "--config-dir",
+            str(self.config_dir),
+            "--data-dir",
+            str(self.data_dir),
+            "schedule",
+            "create",
+            "--chat",
+            "chat-1",
+            "--text",
+            "hello kite",
+            "--at",
+            self._future_at(),
+            "--ctl-path",
+            str(self.ctl_path),
+        )
+
+        self.assertEqual(code, 2)
+        self.assertIn("--config-dir/--data-dir", err)
+        self.assertIn("--instance", err)
+        self.assertEqual(self._unit_files(), [])
+        self.assertEqual(self.systemctl_calls, [])
+
+    def test_create_preset_dir_env_vars_are_rejected_before_writing(self) -> None:
+        # Same for pre-set KITE_CONFIG_DIR/KITE_DATA_ROOT (the OS timer does
+        # not inherit this shell's env either).
+        self._bind()
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        env = {
+            **self._roots_env(),
+            "KITE_CONFIG_DIR": str(self.config_dir),
+            "KITE_DATA_ROOT": str(self.data_dir),
+        }
+        with patch.dict(os.environ, env):
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = kitectl.main(
+                    [
+                        "schedule",
+                        "create",
+                        "--chat",
+                        "chat-1",
+                        "--text",
+                        "hello kite",
+                        "--at",
+                        self._future_at(),
+                        "--ctl-path",
+                        str(self.ctl_path),
+                    ]
+                )
+
+        self.assertEqual(code, 2)
+        self.assertIn("KITE_CONFIG_DIR/KITE_DATA_ROOT", stderr.getvalue())
+        self.assertEqual(self._unit_files(), [])
+        self.assertEqual(self.systemctl_calls, [])
+
+    def test_create_named_instance_is_not_an_explicit_axis(self) -> None:
+        # --instance stays open: the fired timer carries `--instance <name>`,
+        # so create and fire time resolve the same layout dirs.
+        config_dir = self.config_dir / "instances" / "acme"
+        data_dir = self.data_dir / "instances" / "acme"
+        config_dir.mkdir(parents=True)
+        data_dir.mkdir(parents=True)
+        self._bind(data_dir=data_dir)
+
+        code, out, err = self._run_cli(
+            "--instance",
+            "acme",
+            "schedule",
+            "create",
+            "--chat",
+            "chat-1",
+            "--text",
+            "hello kite",
+            "--at",
+            self._future_at(),
+            "--ctl-path",
+            str(self.ctl_path),
+        )
+
+        self.assertEqual(code, 0, err)
+        name = next(
+            line for line in out.splitlines() if line.startswith("name: ")
+        ).split(": ", 1)[1]
+        self.assertRegex(name, r"^kite-schedule-acme-[0-9a-f]{12}$")
+        service = (self.unit_dir / f"{name}.service").read_text(encoding="utf-8")
+        self.assertIn('"--instance" "acme" "prompt" "send"', service)
 
     def test_create_systemctl_failure_is_exit_1(self) -> None:
         self._bind()
@@ -1424,30 +1546,20 @@ class InstanceScheduleRenderTests(unittest.TestCase):
 class ScheduleInstanceCliTests(ScheduleCliTests):
     """kitectl schedule instance scoping over mocked systemctl (audit N1-MED-2)."""
 
-    def setUp(self) -> None:
-        super().setUp()
-        saved = {
-            key: os.environ.get(key)
-            for key in ("KITE_INSTANCE", "KITE_CONFIG_DIR", "KITE_DATA_ROOT")
-        }
-
-        def _restore() -> None:
-            for key, value in saved.items():
-                if value is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = value
-
-        self.addCleanup(_restore)
-
-    def _run_cli(self, *argv: str) -> tuple[int, str, str]:
-        # kitectl.main publishes the resolved instance via env; scrub it so
-        # every call in a test starts from a clean resolution.
-        for key in ("KITE_INSTANCE", "KITE_CONFIG_DIR", "KITE_DATA_ROOT"):
-            os.environ.pop(key, None)
-        return super()._run_cli(*argv)
+    def _instance_dirs(self, name: str) -> tuple[pathlib.Path, pathlib.Path]:
+        config_dir = self.config_dir / "instances" / name
+        data_dir = self.data_dir / "instances" / name
+        config_dir.mkdir(parents=True, exist_ok=True)
+        data_dir.mkdir(parents=True, exist_ok=True)
+        return config_dir, data_dir
 
     def _create_named(self, instance: str, *extra: str) -> tuple[int, str, str]:
+        # The named instance must exist on disk (fail-closed existence gate)
+        # and its OWN data dir carries the binding create validates against —
+        # explicit directory axes are rejected (audit A4), so the instance
+        # layout is the only way to target a named instance.
+        _, data_dir = self._instance_dirs(instance)
+        self._bind(data_dir=data_dir)
         return self._run_cli(
             "--instance",
             instance,
@@ -1463,7 +1575,6 @@ class ScheduleInstanceCliTests(ScheduleCliTests):
         )
 
     def test_create_for_named_instance_prefixes_unit_and_carries_flag(self) -> None:
-        self._bind()
         code, out, err = self._create_named("acme", "--at", self._future_at())
         self.assertEqual(code, 0, err)
         name = next(
@@ -1496,6 +1607,7 @@ class ScheduleInstanceCliTests(ScheduleCliTests):
         # Legacy (pre-namespace, hash-form) units are default-instance units;
         # on a named instance they show up only as a foreign note.
         self._bind()
+        self._instance_dirs("acme")
         code, _, err = self._create("--at", self._future_at())
         self.assertEqual(code, 0, err)
 
@@ -1511,6 +1623,7 @@ class ScheduleInstanceCliTests(ScheduleCliTests):
 
     def test_show_and_remove_are_fail_closed_across_instances(self) -> None:
         self._bind()
+        self._instance_dirs("acme")
         code, out, err = self._create("--at", self._future_at())
         self.assertEqual(code, 0, err)
         name = next(
@@ -1528,7 +1641,6 @@ class ScheduleInstanceCliTests(ScheduleCliTests):
         self.assertIn("OnCalendar", out)
 
     def test_bare_hash_resolves_inside_the_named_namespace(self) -> None:
-        self._bind()
         code, out, err = self._create_named("acme", "--at", self._future_at())
         self.assertEqual(code, 0, err)
         name = next(

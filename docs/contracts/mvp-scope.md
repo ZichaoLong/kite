@@ -38,7 +38,7 @@ If it cannot answer, cut the requirement. No exceptions.
 | `/mode <auto\|manual\|yolo>` | read/write the binding-level permission mode (kap `permission_mode`); carried explicitly on every prompt |
 | `/plan [on\|off]` | read/toggle the binding-level plan mode (kap `plan_mode`, orthogonal to permission mode); carried explicitly on every prompt |
 | `/effort <off\|low\|medium\|high\|xhigh\|max>` | read/write the binding-level thinking effort (kap `thinking`); persisted like permission mode and carried explicitly on every prompt |
-| `/goal [text\|pause\|resume\|cancel\|off]` | the session's upstream goal: text creates it via `POST .../profile {agent_config.goal_objective}` (40913 surfaces when one is already active); `pause`/`resume`/`cancel` via `{agent_config.goal_control}`; `off` = cancel; no arg reads it back via `GET .../goal`. Nothing persisted locally (corrected 2026-07-27, audit N2-HIGH-1: the prompt-submit route silently drops goal_* fields) |
+| `/goal [text\|pause\|resume\|cancel\|off]` | the session's upstream goal: text creates it via `POST .../profile {agent_config.goal_objective}`; `pause`/`resume`/`cancel` via `{agent_config.goal_control}`; `off` = cancel; no arg reads it back via `GET .../goal`. Business codes map to Chinese notices (40913 → "已有进行中的目标，先 /goal off 清除再设置。", 40914 → "当前没有设置目标。"); other codes surface verbatim. No `replace` (the upstream profile route has no replace field): clear with `/goal off` first, then set. Nothing persisted locally (corrected 2026-07-27, audit N2-HIGH-1: the prompt-submit route silently drops goal_* fields) |
 | `/compact` | compact the bound session's context (kap `:compact` pass-through); the upstream route is fire-and-forget, so the ack is "compact requested" (acceptance), not completion; a KapError reports the upstream error text verbatim |
 | `/rename <title>` | rename the bound session's title (kap `:profile` pass-through) |
 | `/archive` / `/restore` | archive / restore the bound session (kap `:archive` / `:restore` pass-through); an archived binding behaves per §4.7 (next message errors and suggests `/sessions`; no implicit recreation) |
@@ -184,8 +184,12 @@ explicitly; "best-effort" silent degradation is forbidden:
     execution card is created or taken over, main-card streaming is never
     polluted, and the btw answer is delivered as plain text (accumulated
     from its own volatile stream) to the initiating chat on `turn.ended`.
-    Error frames apply only to their own agent; work state tracks the main
-    agent only. Ownership is recorded to the chat so approvals route as
+    Error frames apply only to their own agent. Work state (corrected
+    2026-07-27): upstream's work_changed is always stamped `main`, but its
+    `busy` aggregates every agent in the session (side channel included);
+    KITE tracks it with main-agent semantics and currently has no
+    production consumer for it. Ownership is recorded to the chat so
+    approvals route as
     usual. No queue, no interrupt of the main turn. Boundaries in this cut:
     btw prompts cannot be `/abort`ed; after a restart the btw agent is
     re-created on demand and old ones are left to upstream hygiene
@@ -219,4 +223,7 @@ explicitly; "best-effort" silent degradation is forbidden:
 15. `/archive` is denied while the bound session has an active prompt — same
     reasoning as `/switch` (aligned item 11): upstream archive drains agents
     and cancels all pending turns, so the in-flight execution card, terminal
-    result and approval routing would lose visibility (2026-07-27).
+    result and approval routing would lose visibility (2026-07-27). Tightened
+    2026-07-27: a queued-only queue is denied too — stricter than `/switch`,
+    whose queued prompts keep running, because upstream archive's drainAgents
+    silently cancels the queued prompts.

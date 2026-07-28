@@ -51,6 +51,12 @@ through the normal prompt path.
   - `--at` produces a one-shot timer (`OnCalendar=<ts>`); `--cron` a
     recurring timer. A past timestamp and an unparseable cron are rejected
     before writing anything (fail-closed).
+  - Explicit directory axes are rejected before writing anything
+    (fail-closed): with `--config-dir`/`--data-dir` (or pre-set
+    `KITE_CONFIG_DIR`/`KITE_DATA_ROOT`) create would validate against those
+    dirs, but the fired timer runs plain `kitectl [--instance <name>]
+    prompt send`, which resolves the default/instance-layout dirs — a
+    silently dead timer. Target a named instance with `--instance` instead.
   - kitectl path resolution for the generated service unit: explicit
     `--ctl-path` > `KITE_BIN_DIR/kitectl` or `~/.local/bin/kitectl` >
     `<data root>/.venv/bin/kitectl`. The resolved path is stored in the unit.
@@ -117,6 +123,9 @@ visible instead of silently double-firing.
 - ctl-path resolution order (explicit > env/bin-dir > venv).
 - create validation: past `--at`, bad `--cron`, unknown chat (no binding) →
   rejected, nothing written.
+- create rejects an explicit directory axis (`--config-dir`/`--data-dir`
+  flags or pre-set env) before writing; `--instance <name>` is accepted and
+  carried into the fired command.
 - list/show/remove/run-now flows over a mocked systemctl (no real systemd
   calls in tests); remove requires `--yes`.
 - instance scoping (§3.1): a named instance's unit name carries the

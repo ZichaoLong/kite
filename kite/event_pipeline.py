@@ -622,7 +622,9 @@ class EventPipeline:
         construction — the upstream btw agent has every tool call vetoed
         (agent-core-v2 SessionBtwService), so it can never raise approvals,
         questions, or tool events, and KITE exposes no abort/steer surface
-        for side prompts itself. work_changed tracks the main agent only.
+        for side prompts itself. Upstream's work_changed is always stamped
+        main (its busy aggregates every agent, side channel included), so
+        it never reaches this path — and would be inert here if it did.
         """
         if isinstance(event, TurnStarted):
             self._btw_turn_started(event)
@@ -736,6 +738,11 @@ class EventPipeline:
         text = turn.transcript.full_text()
         if event.reason == "completed":
             body = f"旁路回复：{text}" if text else "旁路 prompt 已完成（没有文本输出）。"
+            if turn.transcript.gapped:
+                # The fail-closed overflow cap (streaming_transcript §4.1)
+                # stopped the runaway side stream mid-way; the delivered
+                # answer says so, same wording as /last's truncation note.
+                body += "\n\n（内容过长，已截断）"
         elif event.reason == "cancelled":
             body = "旁路 prompt 已取消。"
         else:

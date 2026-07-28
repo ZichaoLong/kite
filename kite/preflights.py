@@ -11,6 +11,9 @@ Covered here:
 - ``/new``: denied while the bound session has an active prompt (fail-closed:
   a rebind would orphan the in-flight prompt's card/approval visibility;
   mvp-scope aligned item 7).
+- ``/archive``: stricter than ``/new``/``/switch`` — denied on an active
+  prompt AND on queued prompts (upstream archive drains agents and silently
+  cancels the queue; mvp-scope aligned item 15).
 - ``/detach``: always allowed (it only pauses the Feishu push), but an active
   prompt earns an informational note — the work keeps running upstream.
 - ``kitectl service stop|restart``: destructive-op preview. Verified busy /
@@ -39,11 +42,16 @@ from kite.stores.group_config_store import GROUP_MODE_ALL, GroupConfigStore
 
 # Reason codes (stable identifiers for logs/tests; the text is for users).
 NEW_DENIED_BY_ACTIVE_PROMPT = "new_denied_by_active_prompt"
+ARCHIVE_DENIED_BY_ACTIVE_PROMPT = "archive_denied_by_active_prompt"
+ARCHIVE_DENIED_BY_QUEUED_PROMPT = "archive_denied_by_queued_prompt"
 DETACH_NOTE_ACTIVE_PROMPT = "detach_note_active_prompt"
 GROUP_ALL_MODE_SESSION_SHARED = "group_all_mode_session_shared"
 GROUP_ALL_MODE_SESSION_OCCUPIED = "group_all_mode_session_occupied"
 
 NEW_ACTIVE_PROMPT_REASON_TEXT = "当前有执行中的 prompt，请先 /abort 或等待完成。"
+ARCHIVE_QUEUED_PROMPT_REASON_TEXT = (
+    "当前有排队中的 prompt，归档会静默取消排队中的 prompt；请先 /abort 或等待完成。"
+)
 DETACH_ACTIVE_PROMPT_NOTE = "执行中的 prompt 仍在继续，推送已暂停。"
 
 
@@ -78,6 +86,24 @@ def check_new(queue: PromptQueueState) -> ReasonedCheck:
         return ReasonedCheck.deny(
             NEW_DENIED_BY_ACTIVE_PROMPT,
             NEW_ACTIVE_PROMPT_REASON_TEXT,
+        )
+    return ReasonedCheck.allow()
+
+
+def check_archive(queue: PromptQueueState) -> ReasonedCheck:
+    """`/archive` is stricter than `/new` and `/switch` (mvp-scope aligned
+    item 15): upstream archive drains agents, so beyond the active prompt a
+    QUEUED prompt is silently cancelled too (a `/switch` leaves the queue
+    running) — deny on both."""
+    if queue.active_prompt_id:
+        return ReasonedCheck.deny(
+            ARCHIVE_DENIED_BY_ACTIVE_PROMPT,
+            NEW_ACTIVE_PROMPT_REASON_TEXT,
+        )
+    if queue.queued_prompt_ids:
+        return ReasonedCheck.deny(
+            ARCHIVE_DENIED_BY_QUEUED_PROMPT,
+            ARCHIVE_QUEUED_PROMPT_REASON_TEXT,
         )
     return ReasonedCheck.allow()
 

@@ -58,6 +58,9 @@ Implemented slice (docs/contracts/mvp-scope.md §2 kitectl row, §6):
                                 Validation is fail-closed before anything is
                                 written (past --at, unparseable --cron,
                                 unknown chat); remove requires --yes.
+                                create rejects explicit --config-dir/--data-dir
+                                (or pre-set env): the fired timer would resolve
+                                the default dirs — use --instance instead.
                                 Schedules are namespaced per instance: a named
                                 instance's units are `kite-schedule-<instance>-<hash>`
                                 and fire with `--instance <name>`; list/show/
@@ -728,6 +731,17 @@ def _scoped_schedule_name(raw: str) -> str:
 
 
 def _cmd_schedule_create(args: argparse.Namespace) -> int:
+    # Audit A4: an explicit directory axis validates against THESE dirs, but
+    # the generated timer fires plain `kitectl [--instance <name>] prompt
+    # send`, which resolves the default/instance-layout dirs at fire time —
+    # a silently dead timer. Fail closed instead; --instance is the axis that
+    # stays consistent between create and fire time.
+    if getattr(args, "user_explicit_dirs", False):
+        _die(
+            "schedule create does not accept explicit --config-dir/--data-dir "
+            "(or pre-set KITE_CONFIG_DIR/KITE_DATA_ROOT): the fired timer would "
+            "resolve the default directories; use --instance to select the instance"
+        )
     backend = _schedule_backend()
     text = str(args.text or "").strip()
     if not text:
@@ -1293,6 +1307,12 @@ def _apply_instance_environment(args: argparse.Namespace) -> None:
         or os.environ.get("KITE_CONFIG_DIR", "").strip()
         or os.environ.get("KITE_DATA_ROOT", "").strip()
     )
+    # Captured BEFORE the layout dirs are published below (a named instance
+    # would overwrite the evidence): `schedule create` fails closed on a
+    # user-explicit directory axis (audit A4) — the fired timer resolves the
+    # default/instance dirs, not these. Unset on the completion/instance
+    # early return above; readers use getattr with a False default.
+    args.user_explicit_dirs = explicit_dirs
     allow_single_running = args.command != "service" and not explicit_dirs
     instance_name = instance_resolution.resolve_instance_name(
         args.instance,

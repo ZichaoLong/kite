@@ -538,3 +538,52 @@ btw work_changed 合同句、btw 48k 截断提示、/goal replace、/goal 英文
 
 - 五轮 HIGH 数:5 → 2 → 1 → 1 → 1(本轮的在新功能 instance create,btw 链已闭合)。
 - 全量 **1371 passed**(代理分片 370/165/264 另跑全绿);check-docs OK;双语对偶抽查通过。
+
+---
+
+# 第六轮复审(2026-07-27,基线 84d8592 → HEAD 4e93170)
+
+> 范围:复核第五轮清单的修复(单 commit 4e93170:R5-HIGH-1/MED-1、R5-LOW-1/2、C-btw LOW-1 登记)。delta 小(±197 行),由主审查人直接复核,未派代理。
+> 测试基线:**1374 passed 全绿**;check-docs OK。
+
+## 复核结论:全部 FIXED-CORRECT(含实演复现)
+
+- **R5-HIGH-1 — FIXED-CORRECT(实演)**:`_apply_instance_environment` 对 `completion`/`instance` 提前 return,跳过解析/目录发布/存在性闸门(显式 --config-dir/--data-dir 仍发布,scaffold 正确以其为轴)。实演(HOME 重定位):`KITE_INSTANCE=main kitectl instance create new` → 写进 `instances/new`(config+data+kap-home 齐全),`main` 不受影响,exit 0。
+- **R5-MED-1 — FIXED-CORRECT(实演)**:`KITE_INSTANCE=typo kitectl completion bash` → exit 0;同时存在性闸门对正常命令仍生效(`KITE_INSTANCE=typo kitectl binding list` → exit 2,报错指向 `instance create`)——闸门本身未被误伤。
+- **R5-LOW-1 — FIXED-CORRECT(实演)**:`instance create default` 不再 mkdir `<data>/kap-home`;命名实例仍创建。输出标签 `system.yaml:` 已修(kitectl 与 install.py 两处)。
+- **C-btw LOW-1 — FIXED(登记)**:mvp-scope item 13 新增 "Known approximation" 段(双语),如实登记 error 帧夭折规则对 agent 级非 turn 错误为近似、窗口极窄、失败方向为 fail-closed(答复不投递而非泄漏)、修复方向(error-code 白名单或删夭折分支)。
+- 决策文档 multi-instance.md(双语)已同步"实例无关命令跳过整套机制"的新规则,与代码一致。
+
+## 当前遗留(全部 LOW,均有登记)
+
+- 8 项既有登记:btw work_changed 合同句、btw 48k 截断提示、/goal replace、/goal 英文错误、升级窗口 lease 双文件、显式 --data-dir schedule create、claim mode 复查、/archive queued 登记。
+- 无 HIGH/MED 存量。
+
+## 六轮总结
+
+- HIGH 数逐轮:5 → 2 → 1 → 1 → 1 → **0**;MED 存量:0。修复流程健康(每轮 HIGH 均在当轮新增代码,旧债无复发)。
+- 测试规模:1016 → 1374(+358,全部为行为锁定);全量绿;check-docs 连续 OK。
+- 本报告使命基本完成:既有功能与 FOCUS 行为一致性、kap 适配器上游符合度、合同↔代码一致性均已达到"无 HIGH/MED 存量"状态。后续维护建议:(a) 新功能仍走承载力门槛四问,本轮 R5 即"动哪条状态轴"未答透的典型;(b) 遗留 LOW 可择期清理,其中 /goal replace、btw 48k 截断、claim mode 复查三项有真实用户面;(c) 上游漂移护栏(kap_snapshot_diff)保持定期跑。
+
+---
+
+# LOW 清理批次(2026-07-27,工作区未提交改动)
+
+> 范围:遗留 8 项 LOW 的处置(用户批准的方案)。实施:3 个并行代理按文件所有权隔离(app_handler / event_pipeline / kitectl+kited),主审查人抽查全部落点。
+> 验证:**1387 passed 全绿**(+13 新测试);check-docs OK。
+
+## 处置结果
+
+- **/goal 英文错误 → 中文文案(FIXED)**:app_handler.py:164-165 新增 KAP_ERROR_GOAL_ALREADY_EXISTS=40913 / KAP_ERROR_GOAL_NOT_FOUND=40914(注明上游出处);`_cmd_goal` 写路径按 code 映射中文提示,其余码仍透出;读路径不受影响(上游 GET 无目标返回 null)。3 个测试。
+- **btw 超长答复截断提示(FIXED)**:`_btw_turn_ended` completed 分支检查 `turn.transcript.gapped`,追加"（内容过长，已截断）"(与 /last 同款)。1 个测试。
+- **claim 路径 mode 复查(FIXED)**:新增 `_forward_stash_claim_allowed`(app_handler.py:1172),仅 p2p 或"已激活且当前 mode==all"才认领,镜像 flush 复查;不认领留给 fail-closed flush。group-chat §3.7 双语登记。1 个测试。
+- **schedule create 拒绝显式目录轴(FIXED)**:`_apply_instance_environment` 在发布布局目录**之前**把 explicit_dirs 存为 `args.user_explicit_dirs`(关键:命名实例发布的布局目录不会误判);`_cmd_schedule_create` 开头 _die(exit 2)并指向 --instance。scheduled-prompts.md 双语登记。3 个测试(显式 flag 拒、预设 env 拒、--instance 不误拒)。
+- **/archive 预检升级 active∨queued(FIXED)**:preflights.py 新增 `check_archive`(queued 文案明示"归档会静默取消排队中的 prompt",新 reason code);`_cmd_archive` 切用。mvp-scope item 15 双语登记"比 /switch 更严"的理由(/switch 的 queued 继续跑,/archive 的 queued 被上游 drainAgents 静默取消)。
+- **work_changed 合同句改写(FIXED)**:item 13 双语改为如实描述(上游恒 main-stamped、busy 聚合全部 agent、KITE 按主 agent 语义跟踪、无生产消费方);虚构测试重写为真实不变量(只喂 main-stamped 帧)。
+- **升级窗口旧锁探测(FIXED)**:kited.py 新增 `_probe_legacy_config_lock`——取 data 锁后非阻塞探测旧位置 `<config>/kited.lock`,被持则报冲突(指明先停旧 daemon),陈旧则释放并清理。multi-instance.md §4 双语登记。3 个测试。
+- **/goal replace(登记,方案 c)**:mvp-scope §2 /goal 行双语登记"不提供 replace(上游 profile 路由无该字段),先 /goal off 再设置";40913 中文提示已把用户引导到该操作。
+
+## 遗留
+
+- 8 项 LOW 全部处置完毕(7 修 + 1 登记),无存量。审计报告使命完成,可归档。
+- 配套测试改造说明:tests/test_schedule.py 的 ScheduleCliTests 环境装配改为 patched-HOME 模式(A4 拒绝与原"全部命令传显式目录"的装配冲突,属行为变化的必要配套)。

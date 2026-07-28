@@ -26,7 +26,11 @@ and an isolated kap home at `<data>/kap-home` (the default instance keeps
 an exclusive advisory lease on `<instance data>/kited.lock` (the mutable
 shared surfaces all live in the data dir, so that is the directory the lease
 must cover); a second kited on the same data dir exits 2 naming the holder
-pid, and a stale (dead) holder never blocks a restart.
+pid, and a stale (dead) holder never blocks a restart. The lease moved here
+from `<config>/kited.lock` (46297f3): after taking the data-dir lease kited
+probes that legacy location once, so a still-running old-version daemon in
+the upgrade window fails the new start closed instead of briefly running
+two daemons on one instance (a stale legacy file is cleaned up).
 """
 
 from __future__ import annotations
@@ -101,6 +105,49 @@ def _lock_holder_pid(lock_path: pathlib.Path) -> int | None:
     return pid if pid > 0 else None
 
 
+def _probe_legacy_config_lock(
+    lock_path: pathlib.Path, *, instance_name: str | None = None
+) -> None:
+    """Upgrade-window guard against a still-running OLD kited (decision §4).
+
+    The daemon lease moved from `<config>/kited.lock` to `<data>/kited.lock`
+    (46297f3). During the upgrade overlap an old binary may still hold the
+    CONFIG-dir lease while this new binary takes the data-dir one — two
+    daemons on one instance. Probe the legacy location non-blocking: held →
+    raise InstanceLeaseError pointing at the old daemon; acquirable → the
+    file is stale, release and best-effort delete it. The config dir comes
+    from kite_config.config_dir() — by the time the lease is taken the
+    instance environment is already published.
+    """
+    legacy_path = kite_config.config_dir() / KITED_LOCK_FILE_NAME
+    if legacy_path == lock_path or not legacy_path.exists():
+        # A one-dir setup shares a single lock file (that IS the lease we
+        # just took); no legacy file means no old daemon to guard against.
+        return
+    try:
+        handle = open(legacy_path, "r+b")
+    except FileNotFoundError:
+        return  # raced cleanup by another new daemon's probe
+    try:
+        file_lock.acquire_file_lock(handle, blocking=False)
+    except file_lock.FileLockBusyError as exc:
+        handle.close()
+        holder_pid = _lock_holder_pid(legacy_path)
+        label = instance_name or instance_layout.DEFAULT_INSTANCE_NAME
+        holder = f" (holder pid {holder_pid})" if holder_pid else ""
+        raise InstanceLeaseError(
+            f"an old-version kited is still running for instance '{label}'{holder} "
+            f"(legacy lease {legacy_path}); stop the old daemon first"
+        ) from exc
+    file_lock.release_file_lock(handle)
+    handle.close()
+    # The legacy lock was acquirable: a stale file from a dead old daemon.
+    try:
+        legacy_path.unlink()
+    except OSError:
+        pass
+
+
 def acquire_instance_lease(
     data_dir: pathlib.Path | str, *, instance_name: str | None = None
 ):
@@ -116,6 +163,11 @@ def acquire_instance_lease(
     releases the flock at exit, so a stale (dead) holder never blocks a
     restart. On conflict raises InstanceLeaseError naming the recorded
     holder pid.
+
+    After taking the data-dir lease, the legacy `<config>/kited.lock`
+    location (pre-46297f3) is probed once (_probe_legacy_config_lock): a
+    held legacy lock means an old-version daemon is still running in the
+    upgrade window and fails the start closed; a stale one is cleaned up.
     """
     data_dir = pathlib.Path(data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -138,6 +190,11 @@ def acquire_instance_lease(
     handle.truncate()
     handle.write(f"{os.getpid()}\n")
     handle.flush()
+    try:
+        _probe_legacy_config_lock(lock_path, instance_name=instance_name)
+    except InstanceLeaseError:
+        handle.close()
+        raise
     return handle
 
 

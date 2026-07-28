@@ -40,7 +40,12 @@ from kite.identity_names import IdentityNames
 from kite.prompt_ownership import CERTAINTY_BEST_EFFORT, PromptOwnership
 from kite.runtime_loop import RuntimeLoop
 from kite.stores.binding_store import BindingStore
-from kite.stores.group_config_store import GROUP_MODE_ASSISTANT, GroupConfigStore
+from kite.stores.group_config_store import (
+    GROUP_MODE_ALL,
+    GROUP_MODE_ASSISTANT,
+    GROUP_MODE_MENTION_ONLY,
+    GroupConfigStore,
+)
 from kite.stores.group_log_store import GroupLogStore
 from kite.stores.pending_attachment_store import PendingAttachmentStore
 from kite.stores.terminal_result_store import TerminalResultRecord, TerminalResultStore
@@ -1487,14 +1492,37 @@ class GoalCommandTests(AppHandlerTestCase):
         )
         self.assertIn("已执行 goal resume", self.transport.last_text())
 
-    def test_goal_upstream_error_surfaces(self) -> None:
+    def test_goal_already_active_maps_to_chinese_hint(self) -> None:
+        # 40913 (GOAL_ALREADY_EXISTS) maps to a Chinese notice instead of
+        # the upstream msg (mvp-scope §2 /goal row).
         self.bind("s-1")
         self.rest.add_session("s-1")
         self.rest.profile_error = KapError(40913, "a goal is already active")
 
         self.send("/goal 第二个目标")
 
-        self.assertIn("goal 操作失败：a goal is already active", self.transport.last_text())
+        self.assertIn("已有进行中的目标，先 /goal off 清除再设置。", self.transport.last_text())
+
+    def test_goal_control_without_goal_maps_to_chinese_hint(self) -> None:
+        # 40914 (GOAL_NOT_FOUND) maps the same way — e.g. /goal off with no
+        # goal set upstream.
+        self.bind("s-1")
+        self.rest.add_session("s-1")
+        self.rest.profile_error = KapError(40914, "goal not found")
+
+        self.send("/goal off")
+
+        self.assertIn("当前没有设置目标。", self.transport.last_text())
+
+    def test_goal_upstream_error_surfaces(self) -> None:
+        # Unmapped codes still surface the upstream msg verbatim.
+        self.bind("s-1")
+        self.rest.add_session("s-1")
+        self.rest.profile_error = KapError(40915, "goal status invalid")
+
+        self.send("/goal pause")
+
+        self.assertIn("goal 操作失败：goal status invalid", self.transport.last_text())
 
     def test_goal_archived_session_gets_preflight_error(self) -> None:
         self.bind("s-1")
@@ -1633,10 +1661,10 @@ class SessionLifecycleCommandTests(AppHandlerTestCase):
         self.assertIn("归档失败：session is busy", self.transport.last_text())
 
     def test_archive_denied_while_prompt_active(self) -> None:
-        # Audit N2-MED-1 (mvp-scope aligned item 15): same check_new denial
-        # as /switch (aligned item 11) — upstream archive drains agents and
-        # cancels every pending turn, so the in-flight prompt's execution
-        # card, terminal result and approval routing would lose visibility.
+        # Audit N2-MED-1 (mvp-scope aligned item 15): upstream archive drains
+        # agents and cancels every pending turn, so the in-flight prompt's
+        # execution card, terminal result and approval routing would lose
+        # visibility — check_archive denies on active.
         self.bind("s-1")
         self.rest.add_session("s-1")
         self.rest.set_prompts("s-1", active="p-1")
@@ -1652,15 +1680,16 @@ class SessionLifecycleCommandTests(AppHandlerTestCase):
         self.assertIn("无法连接 kap-server", self.transport.last_text())
         self.assertEqual(self.rest.session_actions, [])
 
-    def test_archive_allowed_with_queued_only(self) -> None:
-        # Same check_new semantics as /switch: a queued-but-not-active
-        # prompt does not block (audit M9: queued 放行).
+    def test_archive_denied_with_queued_prompt(self) -> None:
+        # Aligned item 15 (tightened 2026-07-27): /archive is stricter than
+        # /switch — upstream archive drains agents and silently cancels
+        # queued prompts, so a queued-only queue also refuses.
         self.bind("s-1")
         self.rest.add_session("s-1")
         self.rest.set_prompts("s-1", queued=("p-2",))
         self.send("/archive")
-        self.assertEqual(self.rest.session_actions, [("s-1", "archive", None)])
-        self.assertIn("已归档", self.transport.last_text())
+        self.assertIn("归档会静默取消排队中的 prompt", self.transport.last_text())
+        self.assertEqual(self.rest.session_actions, [])
 
     def test_restore_upstream_error_shows_msg(self) -> None:
         self.bind("s-1")
@@ -2345,6 +2374,50 @@ class MergeForwardTests(AppHandlerTestCase):
         self.assertEqual(self.forward_timers, [])
         self.assertEqual(self.rest.calls, [])
         self.assertEqual(self.transport.replies, [])
+
+    def test_group_claim_rechecks_mode_inside_window(self) -> None:
+        # §3.7 fail-closed mirror: an all-mode group buffers a forward, the
+        # mode flips to mention_only inside the window, and the member's
+        # @bot text must NOT claim the stash — it is left for the flush,
+        # which drops it explicitly.
+        self.group_config_store.activate("oc_group", activated_by=ADMIN_OPEN_ID)
+        self.group_config_store.set_mode("oc_group", GROUP_MODE_ALL)
+        self.rest.add_session("s-1")
+        self.bind("s-1", chat_id="oc_group")
+        self.transport.merge_forward_items = [make_forward_item("om_c1", text="转发的内容")]
+        self.handler.on_merge_forward(
+            make_merge_forward(
+                sender="ou_member",
+                chat_id="oc_group",
+                chat_type="group",
+                message_id="om_fwdg",
+            )
+        )
+        self.assertEqual(len(self.forward_timers), 1)
+
+        self.group_config_store.set_mode("oc_group", GROUP_MODE_MENTION_ONLY)
+        self.handler.on_message(
+            dataclasses.replace(
+                make_message(
+                    "看看这个", sender="ou_member", chat_id="oc_group", message_id="om_g1"
+                ),
+                chat_type="group",
+                bot_mentioned=True,
+            )
+        )
+
+        # The @ text submits on its own — no stashed transcript merged in.
+        self.assertEqual(len(self.rest.submissions), 1)
+        text = self.rest.submissions[0]["body"]["content"][0]["text"]
+        self.assertIn("看看这个", text)
+        self.assertNotIn("<forwarded_messages>", text)
+        # The window was never claimed: firing it hits the fail-closed drop —
+        # no second submission, no reply.
+        self.assertFalse(self.forward_timers[-1].cancelled)
+        replies_before = len(self.transport.replies)
+        self.forward_timers[-1].fire()
+        self.assertEqual(len(self.rest.submissions), 1)
+        self.assertEqual(len(self.transport.replies), replies_before)
 
     def test_non_admin_merge_forward_rejected(self) -> None:
         self.handler.on_merge_forward(make_merge_forward(sender="ou_stranger"))

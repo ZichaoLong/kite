@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import fake_kap
+from kite import file_lock
 from kite import kited
 from kite.adapters.kap_server import BackoffPolicy, KapError, KapTransportError
 from kite.app_handler import AppHandler
@@ -297,6 +298,67 @@ class KitedMainTests(unittest.TestCase):
                     else:
                         os.environ[key] = value
             self.assertEqual(rc, 2)
+
+
+class LegacyConfigLockProbeTests(unittest.TestCase):
+    """The lease moved from <config>/kited.lock to <data>/kited.lock
+    (46297f3): acquire_instance_lease probes the legacy location so an
+    old-version daemon still running in the upgrade window conflicts
+    instead of briefly double-driving the instance (audit B7)."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = pathlib.Path(self._tmp.name)
+        self.config_dir = self.root / "cfg"
+        self.data_dir = self.root / "data"
+        self.config_dir.mkdir()
+        self.data_dir.mkdir()
+        self.legacy_lock = self.config_dir / kited.KITED_LOCK_FILE_NAME
+        patcher = patch.dict(os.environ, {"KITE_CONFIG_DIR": str(self.config_dir)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _hold_legacy_lock(self):
+        handle = open(self.legacy_lock, "a+", encoding="utf-8")
+        file_lock.acquire_file_lock(handle, blocking=False)
+        self.addCleanup(handle.close)
+        return handle
+
+    def test_held_legacy_lock_fails_closed(self) -> None:
+        legacy = self._hold_legacy_lock()
+
+        with self.assertRaises(kited.InstanceLeaseError) as ctx:
+            kited.acquire_instance_lease(self.data_dir)
+
+        message = str(ctx.exception)
+        self.assertIn("old-version kited", message)
+        self.assertIn("stop the old daemon", message)
+        self.assertIn(str(self.legacy_lock), message)
+        # The failed probe closed its own data-dir lease handle: once the
+        # old daemon is gone, the start proceeds (and cleans up the file).
+        legacy.close()
+        handle = kited.acquire_instance_lease(self.data_dir)
+        self.addCleanup(handle.close)
+        self.assertFalse(self.legacy_lock.exists())
+
+    def test_stale_legacy_lock_is_acquired_and_cleaned_up(self) -> None:
+        self.legacy_lock.write_text("999999\n", encoding="utf-8")
+
+        handle = kited.acquire_instance_lease(self.data_dir)
+        self.addCleanup(handle.close)
+
+        self.assertFalse(self.legacy_lock.exists())
+        # The data-dir lease itself is held normally.
+        with self.assertRaises(kited.InstanceLeaseError):
+            kited.acquire_instance_lease(self.data_dir)
+
+    def test_no_legacy_lock_file_is_a_noop(self) -> None:
+        handle = kited.acquire_instance_lease(self.data_dir)
+        self.addCleanup(handle.close)
+
+        self.assertFalse(self.legacy_lock.exists())
+        self.assertTrue((self.data_dir / kited.KITED_LOCK_FILE_NAME).exists())
 
 
 CONTROL_TOKEN = "test-control-token"

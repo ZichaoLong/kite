@@ -43,6 +43,11 @@ KITE 实例经普通 prompt 路径执行。
     systemd)。
   - `--at` 生成一次性定时器（`OnCalendar=<ts>`);`--cron` 生成周期定
     时器。过去的时间戳与无法解析的 cron 在写入前拒绝（fail-closed)。
+  - 显式目录轴在写入前即被拒绝（fail-closed)：显式
+    `--config-dir`/`--data-dir`（或预设 `KITE_CONFIG_DIR`/`KITE_DATA_ROOT`)
+    时，create 用这些目录校验，但生成的定时器触发的是裸
+    `kitectl [--instance <名称>] prompt send`，解析到默认/实例布局目
+    录——静默失效。命名实例请改用 `--instance` 选择。
   - 生成 unit 中的 kitectl 路径解析顺序：显式 `--ctl-path` >
     `KITE_BIN_DIR/kitectl` 或 `~/.local/bin/kitectl` > `<数据根>/.venv/bin/kitectl`。
     解析结果写入 unit。
@@ -99,6 +104,8 @@ list` 会提示当前命名空间之外还存在多少个定时器，使其可�
 - ctl-path 解析顺序（显式 > env/bin 目录 > venv)。
 - create 校验：过去 `--at`、非法 `--cron`、无绑定的 chat → 拒绝且不写
   任何文件。
+- create 对显式目录轴（`--config-dir`/`--data-dir` 旗标或预设 env)
+  在写入前拒绝；`--instance <名称>` 被接受并写入触发命令。
 - list/show/remove/run-now 全流程（mock systemctl，不触真实 systemd);
   remove 需 `--yes`。
 - 实例作用域（§3.1)：命名实例的 unit 名携带实例段、ExecStart 携带

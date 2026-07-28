@@ -52,6 +52,7 @@ from kite.stores.event_cursor_store import EventCursorStore
 from kite.stores.group_config_store import GroupConfigStore
 from kite.stores.pending_attachment_store import PendingAttachmentStore
 from kite.stores.terminal_result_store import TerminalResultStore
+from kite.streaming_transcript import MAX_TRANSCRIPT_CHARS
 
 ADMIN_OPEN_ID = "ou_admin"
 OTHER_OPEN_ID = "ou_other_admin"
@@ -2248,6 +2249,23 @@ class BtwRoutingTests(PipelineTestCase):
         self.assertEqual(self.transport.cards_to(CHAT_ID), [])
         self.assertEqual(self.transport.texts_to(CHAT_ID), ["旁路 prompt 已完成（没有文本输出）。"])
 
+    def test_btw_overlong_answer_delivers_with_truncation_notice(self) -> None:
+        # Fail-closed overflow cap (streaming_transcript §4.1): a runaway
+        # side stream stops accumulating at MAX_TRANSCRIPT_CHARS, and the
+        # delivered answer says so — the same truncation note as /last.
+        self.bind(CHAT_ID)
+        self._submit_btw()
+        self.feed(self._btw_turn_started())
+        self._btw_delta("甲" * MAX_TRANSCRIPT_CHARS)
+        self._btw_delta("乙")  # crosses the cap: dropped, the gap latches
+
+        self.feed(self._btw_turn_ended())
+
+        (body,) = self.transport.texts_to(CHAT_ID)
+        self.assertTrue(body.startswith("旁路回复：" + "甲" * MAX_TRANSCRIPT_CHARS))
+        self.assertTrue(body.endswith("\n\n（内容过长，已截断）"))
+        self.assertNotIn("乙", body)
+
     def test_btw_answer_broadcasts_when_owner_unknown(self) -> None:
         self.bind(CHAT_ID)
         self.bind(CHAT_ID_2)
@@ -2681,17 +2699,28 @@ class BtwRoutingTests(PipelineTestCase):
         self.assertEqual(self.transport.cards_to(CHAT_ID), [])
         self.assertEqual(self.rest.approval_resolutions, [])
 
-    def test_btw_work_changed_does_not_move_main_work_state(self) -> None:
+    def test_btw_activity_does_not_corrupt_main_work_state_tracking(self) -> None:
+        # Real-wire invariant (mvp-scope item 13): upstream's work_changed
+        # is always main-stamped and its busy aggregates every agent in the
+        # session, so main-stamped frames keep tracking verbatim while a btw
+        # turn is live — the side turn neither emits nor disturbs them.
         self.bind(CHAT_ID)
         self.feed(kap_event("event.session.work_changed", {"busy": True, "agentId": "main"}))
         busy, _ = self.loop.call(self.pipeline.work_state_of, SESSION_ID)
         self.assertTrue(busy)
 
-        self.feed(
-            self._btw_event("event.session.work_changed", {"busy": False})
-        )
+        self._submit_btw()
+        self.feed(self._btw_turn_started())
+        self._btw_delta("旁路")
+
+        # A main-stamped frame mid-side-turn still lands verbatim...
+        self.feed(kap_event("event.session.work_changed", {"busy": False, "agentId": "main"}))
         busy, _ = self.loop.call(self.pipeline.work_state_of, SESSION_ID)
-        self.assertTrue(busy)  # work state tracks the main agent only
+        self.assertFalse(busy)
+
+        # ...and the live side turn is undisturbed, delivering as usual.
+        self.feed(self._btw_turn_ended())
+        self.assertEqual(self.transport.texts_to(CHAT_ID), ["旁路回复：旁路"])
 
     def test_cmd_btw_seam_attributes_the_answer_to_the_initiating_chat(self) -> None:
         """End to end through OutboundAppHandler: the /btw submit feeds the

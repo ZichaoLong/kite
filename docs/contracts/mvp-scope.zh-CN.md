@@ -33,7 +33,7 @@
 | `/mode <auto\|manual\|yolo>` | 读写 binding 级 permission mode（kap `permission_mode`)；每个 prompt 显式携带 |
 | `/plan [on\|off]` | 查看/切换 binding 级 plan mode（kap `plan_mode`，与 permission mode 正交）；每个 prompt 显式携带 |
 | `/effort <off\|low\|medium\|high\|xhigh\|max>` | 读写 binding 级 thinking effort(kap `thinking`)；与 permission mode 同样持久化，每个 prompt 显式携带 |
-| `/goal [文本\|pause\|resume\|cancel\|off]` | session 的上游目标：文本经 `POST .../profile {agent_config.goal_objective}` 创建（已有活跃目标时透出 40913);`pause`/`resume`/`cancel` 经 `{agent_config.goal_control}`;`off` 即 cancel；无参经 `GET .../goal` 读回。本地不持久化（2026-07-27 修正，复审 N2-HIGH-1:prompt 提交路由静默丢弃 goal_* 字段） |
+| `/goal [文本\|pause\|resume\|cancel\|off]` | session 的上游目标：文本经 `POST .../profile {agent_config.goal_objective}` 创建；`pause`/`resume`/`cancel` 经 `{agent_config.goal_control}`；`off` 即 cancel；无参经 `GET .../goal` 读回。业务码映射为中文提示（40913 →"已有进行中的目标，先 /goal off 清除再设置。",40914 →"当前没有设置目标。")，其余码原样透出。不提供 replace（上游 profile 路由无 replace 字段）：先 /goal off 清除再设置。本地不持久化（2026-07-27 修正，复审 N2-HIGH-1:prompt 提交路由静默丢弃 goal_* 字段） |
 | `/compact` | 压缩绑定 session 的上下文（kap `:compact` 透传）；上游路由为 fire-and-forget，回执为"已请求压缩"（受理），非完成确认；KapError 时原样回显上游错误文本 |
 | `/rename 〈title〉` | 重命名绑定 session 的标题（kap `:profile` 透传） |
 | `/archive` / `/restore` | 归档/恢复绑定 session(kap `:archive` / `:restore` 透传）；已归档绑定按 §4.7 行为（下一条消息报错并提示 `/sessions`，不隐式重建） |
@@ -149,7 +149,9 @@
    N3-HIGH-1)**：管线按 `agent_id` 分流——主 agent 驱动既有卡片管线;
    btw agent 的事件走轻量路径：不创建/接管执行卡，不污染主卡流式文本,
    其答复在 `turn.ended` 时以纯文本（自 volatile 流累积）发给发起
-   chat。错误帧只作用于本 agent;work state 只跟踪主 agent。归属记到
+   chat。错误帧只作用于本 agent;work state(2026-07-27 修正)：上游的
+   work_changed 恒以 `main` 标记发出，但其 `busy` 聚合 session 内全部
+   agent（含旁路）;KITE 按主 agent 语义跟踪，当前无生产消费方。归属记到
    本 chat，审批路由不变。不排队、不打断主 turn。本刀边界：btw prompt
    不支持 `/abort`；重启后 btw agent 按需重建，旧 agent 交由上游卫生
    机制处理（2026-07-27 登记）。
@@ -173,4 +175,7 @@
    `POST .../profile {agent_config.goal_objective|goal_control}` 与
    `GET .../goal`。`/goal` 改用这些路由，本地不再持久化（binding store
    的 `goal_objective` 字段与 per-prompt 携带模型已移除）。
-15. `/archive` 在有 active prompt 时拒绝（与 /switch 同理由）(2026-07-27)。
+15. `/archive` 在有 active prompt 时拒绝（与 /switch 同理由）(2026-07-27);
+   2026-07-27 加严：仅有排队中的 prompt 同样拒绝——比 /switch 更严
+   (/switch 的 queued 会照常继续），因为上游 archive 的 drainAgents 会
+   静默取消排队中的 prompt。

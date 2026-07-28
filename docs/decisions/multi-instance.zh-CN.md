@@ -89,6 +89,12 @@ FOCUS 的 `require_existing_instance`):kitectl 与 kited 对未创建的实
 一数据目录（FOCUS 同样锁数据目录）。这是多实例真正需要的唯一跨进程协
 调，不引入任何其他机制。
 
+升级兼容：租约最初位于 `<config>/kited.lock`,46297f3 迁到数据目录。
+升级重叠窗口内，旧二进制可能仍持有配置目录租约，而新二进制取数据目
+录租约——同一实例短暂双 daemon。因此 kited 取数据目录租约后，会对旧
+位置做一次非阻塞 flock 探测：被持有 → 启动 fail-closed 并指明旧
+daemon（先停旧 daemon)；可获取 → 文件已陈旧，释放并尽力删除。
+
 ### 5. interaction owner：仍不实现（有意）
 
 用户的方向包含"interaction owner 及其他配套"。分析记录于此，供日后重
